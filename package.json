@@ -1,0 +1,57 @@
+{
+  "name": "c-lantor",
+  "version": "0.1.0",
+  "description": "Local-first C-Lantor agent workspace for coordinating Codex and Claude CLI agents",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xxhZs/C-Lantor.git"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "test": "vitest run",
+    "build": "tsc && vite build",
+    "bench:composer": "node bench/composer-input-latency.mjs",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "dev:stop": "scripts/lantor-dev-control.sh stop",
+    "dev:status": "scripts/lantor-dev-control.sh status",
+    "dev:restart": "scripts/lantor-dev-control.sh restart",
+    "dev:debug": "scripts/lantor-dev-debug.sh",
+    "dev:keepalive": "scripts/lantor-dev-keepalive.sh",
+    "restart": "scripts/lantor-dev-control.sh restart"
+  },
+  "dependencies": {
+    "@dicebear/adventurer": "^9.4.2",
+    "@dicebear/bottts-neutral": "^9.4.2",
+    "@dicebear/core": "^9.4.2",
+    "@dicebear/dylan": "^9.4.2",
+    "@dicebear/identicon": "^9.4.2",
+    "@dicebear/initials": "^9.4.2",
+    "@dicebear/lorelei": "^9.4.2",
+    "@dicebear/notionists": "^9.4.2",
+    "@dicebear/personas": "^9.4.2",
+    "@dicebear/pixel-art": "^9.4.2",
+    "@dicebear/shapes": "^9.4.2",
+    "@tauri-apps/api": "^2.5.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "lucide-react": "^0.508.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/react-test-renderer": "^19.1.0",
+    "react-test-renderer": "^19.1.0",
+    "vitest": "^4.1.7"
+  }
+}

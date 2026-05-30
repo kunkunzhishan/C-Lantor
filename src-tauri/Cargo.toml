@@ -1,0 +1,31 @@
+[package]
+name = "c-lantor"
+version = "0.1.0"
+description = "Local-first C-Lantor agent workspace for coordinating Codex and Claude CLI agents"
+authors = ["Dylan"]
+license = "Apache-2.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }
+
+[dependencies]
+axum = "0.8.4"
+chrono = { version = "0.4.40", features = ["serde"] }
+async-stream = "0.3.6"
+mime_guess = "2.0.5"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+sqlx = { version = "0.8.5", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono"] }
+tauri = { version = "2.5.1", features = ["protocol-asset", "unstable"] }
+tower-http = { version = "0.6.2", features = ["compression-br", "compression-gzip", "fs"] }
+tokio = { version = "1.44.2", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1.16.0", features = ["serde", "v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSError", "NSLocale", "NSOperation", "NSString", "NSURL"] }
+objc2-speech = { version = "0.3.2", default-features = false, features = ["SFSpeechRecognitionRequest", "SFSpeechRecognitionResult", "SFSpeechRecognitionTask", "SFSpeechRecognizer", "SFTranscription", "block2"] }

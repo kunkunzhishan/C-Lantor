@@ -1,0 +1,110 @@
+import { Check, MessageSquare, X } from "lucide-react";
+import { useEffect } from "react";
+import { Channel, Message } from "../types";
+import { firstLines, formatTime } from "../ui-utils";
+
+type ThreadBrowserModalProps = {
+  open: boolean;
+  channels: Channel[];
+  threads: Message[];
+  activeThreadId: string | null;
+  replyCounts: Record<string, number>;
+  unreadCounts: Record<string, number>;
+  onOpenThread: (message: Message) => void;
+  onToggleFollow: (message: Message) => void | Promise<void>;
+  onClose: () => void;
+};
+
+function channelLabel(channels: Channel[], channelId: string) {
+  const channel = channels.find((item) => item.id === channelId);
+  if (!channel) return "Unknown";
+  if (channel.kind === "dm") return "Direct message";
+  return `#${channel.name}`;
+}
+
+export function ThreadBrowserModal({
+  open,
+  channels,
+  threads,
+  activeThreadId,
+  replyCounts,
+  unreadCounts,
+  onOpenThread,
+  onToggleFollow,
+  onClose,
+}: ThreadBrowserModalProps) {
+  useEffect(() => {
+    if (!open) return;
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div className="search-backdrop" onClick={onClose}>
+      <section className="thread-browser-panel" onClick={(event) => event.stopPropagation()}>
+        <header className="thread-browser-head">
+          <div className="search-input-icon"><MessageSquare size={24} /></div>
+          <div>
+            <h2>Threads</h2>
+            <p>{threads.length} active</p>
+          </div>
+          <button className="search-clear" onClick={onClose} aria-label="Close threads">
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="thread-browser-body">
+          {threads.length === 0 && (
+            <div className="search-empty">
+              <MessageSquare size={32} />
+              <h3>No active threads</h3>
+              <p>Threads appear here after a channel or DM message gets replies.</p>
+            </div>
+          )}
+
+          {threads.map((thread) => {
+            const unread = unreadCounts[thread.id] ?? 0;
+            const replies = replyCounts[thread.id] ?? 0;
+            return (
+              <article
+                key={thread.id}
+                className={`thread-browser-row ${thread.id === activeThreadId ? "selected" : ""} ${unread ? "has-unread" : ""}`}
+                onClick={() => onOpenThread(thread)}
+              >
+                <div className="thread-browser-content">
+                  <div className="meta">
+                    <span>{channelLabel(channels, thread.channel_id)}</span>
+                    <strong>{thread.sender_name}</strong>
+                    <time>{formatTime(thread.created_at)}</time>
+                  </div>
+                  <p>{firstLines(thread.body, 2)}</p>
+                  <small>
+                    {replies} {replies === 1 ? "reply" : "replies"}
+                    {unread > 0 ? ` · ${unread} new` : ""}
+                  </small>
+                </div>
+                {thread.thread_followed && (
+                  <button
+                    className="thread-browser-follow"
+                    title="Stop following this thread"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onToggleFollow(thread);
+                    }}
+                  >
+                    <Check size={18} />
+                  </button>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      </section>
+    </div>
+  );
+}
