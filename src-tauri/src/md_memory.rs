@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -343,6 +345,19 @@ pub(crate) async fn compact_ready_runs(
     )
 }
 
+pub(crate) async fn migrate_legacy(
+    pool: &SqlitePool,
+    agent_id: Uuid,
+    dry_run: bool,
+) -> CommandResult<Value> {
+    let root = memory_root(pool, agent_id).await?;
+    let workspace = root
+        .root
+        .parent()
+        .ok_or_else(|| "memory root has no workspace parent".to_owned())?;
+    migrate_legacy_workspace(workspace, &root.root, agent_id, dry_run)
+}
+
 async fn memory_root(pool: &SqlitePool, agent_id: Uuid) -> CommandResult<MemoryRoot> {
     let row = sqlx::query("select handle, working_directory from agents where id = $1")
         .bind(agent_id)
@@ -551,6 +566,128 @@ fn format_compacted_runs(root: &Path, runs: &[MemoryManifestItem]) -> CommandRes
         lines.push(String::new());
     }
     Ok(lines.join("\n").trim().to_owned())
+}
+
+fn migrate_legacy_workspace(
+    workspace: &Path,
+    root: &Path,
+    agent_id: Uuid,
+    dry_run: bool,
+) -> CommandResult<Value> {
+    let candidates = legacy_memory_candidates(workspace)?;
+    let mut manifest = read_manifest(root)?;
+    let mut existing_ids = manifest
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut planned = Vec::new();
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+    let now = Utc::now().to_rfc3339();
+
+    for source_path in candidates {
+        let body = fs::read_to_string(&source_path).map_err(to_string)?;
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let rel_source = source_path
+            .strip_prefix(workspace)
+            .map_err(to_string)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let id = format!("legacy_{}", stable_hash(&rel_source));
+        let rel_path = format!("summaries/agent/{id}.md");
+        let title = format!("Legacy {}", rel_source);
+        let entry = json!({
+            "id": id,
+            "source": rel_source,
+            "path": rel_path,
+            "title": title
+        });
+        if existing_ids.contains(&id) {
+            skipped.push(entry);
+            continue;
+        }
+        planned.push(entry.clone());
+        if dry_run {
+            continue;
+        }
+
+        let migrated_body = format!("## Migrated From\n`{rel_source}`\n\n## Content\n\n{body}");
+        let token_count = estimate_tokens(&migrated_body);
+        let content = format_memory_markdown(
+            &id,
+            "summary",
+            "agent",
+            &agent_id.to_string(),
+            &title,
+            &now,
+            token_count,
+            &[format!("legacy:{rel_source}")],
+            &[],
+            &migrated_body,
+        );
+        let path = root.join(&rel_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(to_string)?;
+        }
+        fs::write(&path, content).map_err(to_string)?;
+        manifest.items.push(MemoryManifestItem {
+            id: id.clone(),
+            kind: "summary".to_owned(),
+            scope_type: "agent".to_owned(),
+            scope_id: agent_id.to_string(),
+            title,
+            path: rel_path,
+            created_at: now.clone(),
+            token_count,
+            source_ids: vec![format!("legacy:{rel_source}")],
+            parent_ids: Vec::new(),
+        });
+        existing_ids.insert(id);
+        created.push(entry);
+    }
+
+    if !dry_run {
+        manifest
+            .items
+            .sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        write_manifest(root, &manifest)?;
+    }
+    Ok(json!({
+        "dry_run": dry_run,
+        "planned": planned,
+        "created": created,
+        "skipped": skipped
+    }))
+}
+
+fn legacy_memory_candidates(workspace: &Path) -> CommandResult<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    let memory = workspace.join("MEMORY.md");
+    if memory.is_file() {
+        candidates.push(memory);
+    }
+    let notes = workspace.join("notes");
+    if notes.is_dir() {
+        for entry in fs::read_dir(notes).map_err(to_string)? {
+            let entry = entry.map_err(to_string)?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("md") {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
+fn stable_hash(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn rebuild_manifest_from_markdown(root: &Path) -> CommandResult<Vec<MemoryManifestItem>> {
@@ -1117,6 +1254,47 @@ mod tests {
         let second = compact_ready_runs_in_root(&root, "thread", "thread_1", 2, 0, &[])
             .expect("second compact");
         assert!(second.is_none());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn migrate_legacy_workspace_supports_dry_run_apply_and_idempotency() {
+        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
+        let root = base.join("memory");
+        let notes = base.join("notes");
+        fs::create_dir_all(&notes).expect("create notes");
+        fs::write(base.join("MEMORY.md"), "# Memory\n\nStable fact").expect("write memory");
+        fs::write(notes.join("work-log.md"), "# Work Log\n\nFinished task").expect("write note");
+        let agent_id = Uuid::new_v4();
+
+        let dry_run =
+            migrate_legacy_workspace(&base, &root, agent_id, true).expect("dry-run migration");
+        assert_eq!(dry_run["dry_run"], true);
+        assert_eq!(dry_run["planned"].as_array().expect("planned").len(), 2);
+        assert!(!root.join("manifest.json").exists());
+
+        let applied =
+            migrate_legacy_workspace(&base, &root, agent_id, false).expect("apply migration");
+        assert_eq!(applied["created"].as_array().expect("created").len(), 2);
+        let manifest = read_manifest(&root).expect("read manifest");
+        assert_eq!(manifest.items.len(), 2);
+        assert!(manifest
+            .items
+            .iter()
+            .all(|item| item.kind == "summary" && item.scope_type == "agent"));
+        let memory_item = manifest
+            .items
+            .iter()
+            .find(|item| item.source_ids == vec!["legacy:MEMORY.md"])
+            .expect("memory item");
+        let memory_content = read_item_content(&root, &memory_item.path).expect("read migrated");
+        assert!(memory_content.contains("Stable fact"));
+
+        let reapplied =
+            migrate_legacy_workspace(&base, &root, agent_id, false).expect("reapply migration");
+        assert_eq!(reapplied["created"].as_array().expect("created").len(), 0);
+        assert_eq!(reapplied["skipped"].as_array().expect("skipped").len(), 2);
 
         let _ = fs::remove_dir_all(base);
     }

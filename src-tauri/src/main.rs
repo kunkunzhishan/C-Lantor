@@ -9674,6 +9674,36 @@ async fn handle_agent_event(
                 Ok("memory run summaries not compacted: below threshold".to_owned())
             }
         }
+        AgentEvent::MemoryMigrateLegacy { dry_run } => {
+            let result = md_memory::migrate_legacy(pool, agent_id, dry_run.unwrap_or(true)).await?;
+            let created = result
+                .get("created")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            let planned = result
+                .get("planned")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            record_agent_activity(
+                pool,
+                Some(agent_id),
+                Some(run_id),
+                "memory",
+                "Legacy memory migration checked",
+                json!({ "operation": "migrate_legacy", "result": result }).to_string(),
+            )
+            .await?;
+            Ok(format!(
+                "legacy memory migration {}: {created} created, {planned} planned",
+                if dry_run.unwrap_or(true) {
+                    "dry-run"
+                } else {
+                    "applied"
+                }
+            ))
+        }
         AgentEvent::ChannelCreate {
             name,
             description,
