@@ -9600,6 +9600,19 @@ async fn handle_agent_event(
             .await?;
             Ok("memory summary saved".to_owned())
         }
+        AgentEvent::MemoryRebuildManifest => {
+            let rebuilt = md_memory::rebuild_manifest(pool, agent_id).await?;
+            record_agent_activity(
+                pool,
+                Some(agent_id),
+                Some(run_id),
+                "memory",
+                "Memory manifest rebuilt",
+                json!({ "operation": "rebuild_manifest", "items": rebuilt }).to_string(),
+            )
+            .await?;
+            Ok(format!("memory manifest rebuilt: {rebuilt} item(s)"))
+        }
         AgentEvent::ChannelCreate {
             name,
             description,

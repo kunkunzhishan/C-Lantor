@@ -297,6 +297,14 @@ pub(crate) async fn read(
     }))
 }
 
+pub(crate) async fn rebuild_manifest(pool: &SqlitePool, agent_id: Uuid) -> CommandResult<usize> {
+    let root = memory_root(pool, agent_id).await?;
+    let items = rebuild_manifest_from_markdown(&root.root)?;
+    let count = items.len();
+    write_manifest(&root.root, &MemoryManifest { items })?;
+    Ok(count)
+}
+
 async fn memory_root(pool: &SqlitePool, agent_id: Uuid) -> CommandResult<MemoryRoot> {
     let row = sqlx::query("select handle, working_directory from agents where id = $1")
         .bind(agent_id)
@@ -388,6 +396,87 @@ fn upsert_manifest_item(root: &Path, item: MemoryManifestItem) -> CommandResult<
     write_manifest(root, &manifest)
 }
 
+fn rebuild_manifest_from_markdown(root: &Path) -> CommandResult<Vec<MemoryManifestItem>> {
+    let mut items = Vec::new();
+    if !root.exists() {
+        return Ok(items);
+    }
+    collect_markdown_manifest_items(root, root, &mut items)?;
+    items.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(items)
+}
+
+fn collect_markdown_manifest_items(
+    root: &Path,
+    dir: &Path,
+    items: &mut Vec<MemoryManifestItem>,
+) -> CommandResult<()> {
+    for entry in fs::read_dir(dir).map_err(to_string)? {
+        let entry = entry.map_err(to_string)?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(to_string)?;
+        if file_type.is_dir() {
+            collect_markdown_manifest_items(root, &path, items)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("md") {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(to_string)?;
+        let Some(mut item) = parse_manifest_item_from_markdown(&content)? else {
+            continue;
+        };
+        let rel_path = path
+            .strip_prefix(root)
+            .map_err(to_string)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        item.path = rel_path;
+        items.push(item);
+    }
+    Ok(())
+}
+
+fn parse_manifest_item_from_markdown(content: &str) -> CommandResult<Option<MemoryManifestItem>> {
+    let Some(frontmatter) = extract_frontmatter(content) else {
+        return Ok(None);
+    };
+    let token_count = frontmatter_scalar(frontmatter, "token_count")
+        .unwrap_or_else(|| estimate_tokens(&strip_frontmatter(content)).to_string())
+        .parse::<usize>()
+        .map_err(to_string)?;
+    let Some(id) = frontmatter_scalar(frontmatter, "id") else {
+        return Ok(None);
+    };
+    let Some(kind) = frontmatter_scalar(frontmatter, "kind") else {
+        return Ok(None);
+    };
+    let Some(scope_type) = frontmatter_scalar(frontmatter, "scope_type") else {
+        return Ok(None);
+    };
+    let Some(scope_id) = frontmatter_scalar(frontmatter, "scope_id") else {
+        return Ok(None);
+    };
+    let Some(title) = frontmatter_scalar(frontmatter, "title") else {
+        return Ok(None);
+    };
+    let Some(created_at) = frontmatter_scalar(frontmatter, "created_at") else {
+        return Ok(None);
+    };
+    Ok(Some(MemoryManifestItem {
+        id,
+        kind,
+        scope_type,
+        scope_id,
+        title,
+        path: String::new(),
+        created_at,
+        token_count,
+        source_ids: frontmatter_list(frontmatter, "source_ids"),
+        parent_ids: frontmatter_list(frontmatter, "parent_ids"),
+    }))
+}
+
 fn read_item_content(root: &Path, rel_path: &str) -> CommandResult<String> {
     let path = root.join(rel_path);
     let canonical_root = root.canonicalize().map_err(to_string)?;
@@ -447,6 +536,56 @@ fn strip_frontmatter(content: &str) -> String {
         return rest[end + 5..].trim().to_owned();
     }
     content.trim().to_owned()
+}
+
+fn extract_frontmatter(content: &str) -> Option<&str> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---\n") {
+        return None;
+    }
+    let rest = &trimmed[4..];
+    rest.find("\n---\n").map(|end| &rest[..end])
+}
+
+fn frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    frontmatter.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix(&prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "[]")
+            .map(yaml_unescape)
+    })
+}
+
+fn frontmatter_list(frontmatter: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut in_list = false;
+    let prefix = format!("{key}:");
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if in_list {
+            if let Some(value) = trimmed.strip_prefix("- ") {
+                values.push(yaml_unescape(value.trim()));
+                continue;
+            }
+            if !trimmed.is_empty() {
+                break;
+            }
+        }
+        if let Some(value) = trimmed.strip_prefix(&prefix) {
+            let value = value.trim();
+            if value == "[]" {
+                return Vec::new();
+            }
+            if !value.is_empty() {
+                values.push(yaml_unescape(value));
+                return values;
+            }
+            in_list = true;
+        }
+    }
+    values
 }
 
 fn memory_snippet(content: &str, query: &str) -> String {
@@ -535,9 +674,49 @@ fn yaml_escape(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn yaml_unescape(value: &str) -> String {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    let mut output = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                output.push(next);
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        for statement in [
+            "create table agents (id blob primary key not null, handle text not null, working_directory text not null default '')",
+            "create table agent_work_items (id blob primary key not null, agent_id blob not null, channel_id blob, thread_root_id blob, task_id blob)",
+            "create table agent_runs (id blob primary key not null, agent_id blob not null, work_item_id blob)",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create test table");
+        }
+        pool
+    }
 
     #[test]
     fn frontmatter_formats_empty_arrays_inline() {
@@ -595,6 +774,119 @@ mod tests {
 
         assert!(read_item_content(&root, "inside.md").is_ok());
         assert!(read_item_content(&root, "../outside.md").is_err());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn rebuild_manifest_from_markdown_indexes_generated_files() {
+        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
+        let root = base.join("memory");
+        let run_dir = root.join("runs/2026-06-01");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(
+            run_dir.join("run_1.md"),
+            format_memory_markdown(
+                "run_1",
+                "run",
+                "thread",
+                "thread_1",
+                "Title",
+                "2026-06-01T00:00:00Z",
+                10,
+                &["msg:1".to_owned()],
+                &[],
+                "Body",
+            ),
+        )
+        .expect("write run");
+
+        let items = rebuild_manifest_from_markdown(&root).expect("rebuild manifest items");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "run_1");
+        assert_eq!(items[0].path, "runs/2026-06-01/run_1.md");
+        assert_eq!(items[0].source_ids, vec!["msg:1"]);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn append_search_read_and_rebuild_round_trip() {
+        let pool = test_pool().await;
+        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
+        let agent_id = Uuid::new_v4();
+        let work_item_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let thread_root_id = Uuid::new_v4();
+
+        sqlx::query("insert into agents (id, handle, working_directory) values ($1, 'Ada', $2)")
+            .bind(agent_id)
+            .bind(base.to_string_lossy().to_string())
+            .execute(&pool)
+            .await
+            .expect("insert agent");
+        sqlx::query(
+            "insert into agent_work_items (id, agent_id, thread_root_id) values ($1, $2, $3)",
+        )
+        .bind(work_item_id)
+        .bind(agent_id)
+        .bind(thread_root_id)
+        .execute(&pool)
+        .await
+        .expect("insert work item");
+        sqlx::query("insert into agent_runs (id, agent_id, work_item_id) values ($1, $2, $3)")
+            .bind(run_id)
+            .bind(agent_id)
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+
+        let memory_id = append_run_summary(
+            &pool,
+            agent_id,
+            run_id,
+            Some("记忆方案"),
+            "本轮讨论了 md 记忆方案继续推进。",
+            &["msg:1".to_owned()],
+        )
+        .await
+        .expect("append run summary");
+        let found = search(
+            &pool,
+            agent_id,
+            &json!({
+                "query": "方案",
+                "scope_type": "thread",
+                "scope_id": thread_root_id.to_string()
+            }),
+        )
+        .await
+        .expect("search memory");
+        assert_eq!(found["items"][0]["id"], memory_id);
+        assert!(found["items"][0]["snippet"]
+            .as_str()
+            .expect("snippet")
+            .contains("方案"));
+
+        let loaded = read(&pool, agent_id, &json!({ "id": memory_id }))
+            .await
+            .expect("read memory");
+        assert!(loaded["content"]
+            .as_str()
+            .expect("content")
+            .contains("md 记忆方案"));
+
+        fs::remove_file(base.join("memory/manifest.json")).expect("remove manifest");
+        let rebuilt = rebuild_manifest(&pool, agent_id)
+            .await
+            .expect("rebuild manifest");
+        assert_eq!(rebuilt, 1);
+        let found_after_rebuild = search(&pool, agent_id, &json!({ "query": "继续" }))
+            .await
+            .expect("search rebuilt memory");
+        assert_eq!(found_after_rebuild["items"][0]["id"], memory_id);
 
         let _ = fs::remove_dir_all(base);
     }

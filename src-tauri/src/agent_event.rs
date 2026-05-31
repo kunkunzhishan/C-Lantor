@@ -114,6 +114,7 @@ pub(crate) enum AgentEvent {
         #[serde(default)]
         source_ids: Option<Vec<String>>,
     },
+    MemoryRebuildManifest,
     ChannelCreate {
         name: String,
         description: Option<String>,
