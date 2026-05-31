@@ -70,7 +70,10 @@ fn lantor_dynamic_tools_prompt() -> &'static str {
 - Codex runtimes may have these app-server dynamic tools pre-registered at thread/start. They are direct tool calls, not deferred tools discovered through `tool_search`.
 - `lantor.search_tools`: list the available Lantor Codex tools. It returns tool ids, descriptions, schemas, side effects, display hints, and examples for `lantor.call_tool`; use the returned list to decide which tool fits the request.
 - `lantor.call_tool`: execute a Lantor Codex tool by `tool_id` with structured `arguments`.
-- Prefer `lantor.search_tools` followed by `lantor.call_tool` for Lantor Codex tools. Do not call Codex `tool_search` first for these names; `tool_search` searches Codex deferred tools and will not list Lantor dynamic tools."#
+- `lantor.memory_search`: search this agent's file-backed markdown memory and return candidate ids/snippets.
+- `lantor.memory_read`: read one markdown memory item by id.
+- Prefer `lantor.search_tools` followed by `lantor.call_tool` for Lantor Codex tools. Do not call Codex `tool_search` first for these names; `tool_search` searches Codex deferred tools and will not list Lantor dynamic tools.
+- Use `lantor.memory_search` / `lantor.memory_read` yourself when the user refers to prior discussion, earlier decisions, "上面", "之前", "继续", "这个方案", files, blockers, or task state that may not be fully present in the current prompt. Do not ask the user to repeat context before searching memory."#
 }
 
 fn lantor_turn_startup_sequence_prompt() -> &'static str {
@@ -103,6 +106,8 @@ LANTOR_EVENT {"type":"activity","kind":"thinking|command|file_edit|tools|acting"
 LANTOR_EVENT {"type":"usage","input_tokens":1234,"output_tokens":567,"cost_usd":0.0123}
 LANTOR_EVENT {"type":"memory_append","body":"<durable update staged in notes/work-log.md>"}
 LANTOR_EVENT {"type":"memory_compact","body":"<full compact MEMORY.md replacement with Role, Key Knowledge / Memory Map, Active Context, and Memory Policy>"}
+LANTOR_EVENT {"type":"memory_run_summary","title":"<short title>","body":"<markdown run summary>","source_ids":["<optional source ref>"]}
+LANTOR_EVENT {"type":"memory_summary","title":"<short title>","body":"<markdown compacted summary>","scope_type":"thread|task|channel|agent","scope_id":"<optional scope id>","parent_ids":["<memory item id>"],"source_ids":["<optional source ref>"]}
 LANTOR_EVENT {"type":"profile_update","display_name":"<optional>","role":"<optional concise role>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional capability summary>"}
 LANTOR_EVENT {"type":"owner_profile_update","display_name":"<optional>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional>"}
 LANTOR_EVENT {"type":"reminder_create","when":"<ISO8601 timestamp>","title":"<title>","note":"<optional note>","recurrence":"none|daily|weekly|every:20m"}

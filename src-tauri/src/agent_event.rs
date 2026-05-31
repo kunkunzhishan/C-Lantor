@@ -94,6 +94,26 @@ pub(crate) enum AgentEvent {
     MemoryCompact {
         body: String,
     },
+    MemoryRunSummary {
+        title: Option<String>,
+        #[serde(alias = "summary", alias = "content")]
+        body: String,
+        #[serde(default)]
+        source_ids: Option<Vec<String>>,
+    },
+    MemorySummary {
+        title: Option<String>,
+        #[serde(alias = "summary", alias = "content")]
+        body: String,
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<String>,
+        #[serde(default)]
+        parent_ids: Option<Vec<String>>,
+        #[serde(default)]
+        source_ids: Option<Vec<String>>,
+    },
     ChannelCreate {
         name: String,
         description: Option<String>,

@@ -10,6 +10,7 @@ mod events;
 mod inbox;
 mod launch_agent;
 mod long_task;
+mod md_memory;
 mod models;
 mod prompts;
 mod publish_guard;
@@ -9543,6 +9544,62 @@ async fn handle_agent_event(
             .await?;
             Ok("memory compacted".to_owned())
         }
+        AgentEvent::MemoryRunSummary {
+            title,
+            body,
+            source_ids,
+        } => {
+            let memory_id = md_memory::append_run_summary(
+                pool,
+                agent_id,
+                run_id,
+                title.as_deref(),
+                &body,
+                &source_ids.unwrap_or_default(),
+            )
+            .await?;
+            record_agent_activity(
+                pool,
+                Some(agent_id),
+                Some(run_id),
+                "memory",
+                "Run summary saved",
+                json!({ "operation": "run_summary", "memory_id": memory_id }).to_string(),
+            )
+            .await?;
+            Ok("memory run summary saved".to_owned())
+        }
+        AgentEvent::MemorySummary {
+            title,
+            body,
+            scope_type,
+            scope_id,
+            parent_ids,
+            source_ids,
+        } => {
+            let memory_id = md_memory::append_summary(
+                pool,
+                agent_id,
+                run_id,
+                title.as_deref(),
+                &body,
+                scope_type.as_deref(),
+                scope_id.as_deref(),
+                &parent_ids.unwrap_or_default(),
+                &source_ids.unwrap_or_default(),
+            )
+            .await?;
+            record_agent_activity(
+                pool,
+                Some(agent_id),
+                Some(run_id),
+                "memory",
+                "Memory summary saved",
+                json!({ "operation": "summary", "memory_id": memory_id }).to_string(),
+            )
+            .await?;
+            Ok("memory summary saved".to_owned())
+        }
         AgentEvent::ChannelCreate {
             name,
             description,
@@ -12148,6 +12205,32 @@ async fn handle_codex_dynamic_tool_call(
                         tools::execute(pool, tool_id, tool_arguments).await?.into()
                     }
                     Err(error) => error,
+                }
+            }
+            codex_dynamic_tools::MEMORY_SEARCH => {
+                match md_memory::search(pool, agent_id, arguments).await {
+                    Ok(data) => codex_dynamic_tools::DynamicToolResult {
+                        success: true,
+                        text: "Memory search completed.".to_owned(),
+                        structured_content: json!({ "success": true, "data": data }),
+                    },
+                    Err(err) => codex_dynamic_tools::DynamicToolResult::error(
+                        err,
+                        json!({ "error": "memory_search_failed" }),
+                    ),
+                }
+            }
+            codex_dynamic_tools::MEMORY_READ => {
+                match md_memory::read(pool, agent_id, arguments).await {
+                    Ok(data) => codex_dynamic_tools::DynamicToolResult {
+                        success: true,
+                        text: "Memory item loaded.".to_owned(),
+                        structured_content: json!({ "success": true, "data": data }),
+                    },
+                    Err(err) => codex_dynamic_tools::DynamicToolResult::error(
+                        err,
+                        json!({ "error": "memory_read_failed" }),
+                    ),
                 }
             }
             _ => codex_dynamic_tools::DynamicToolResult::error(
