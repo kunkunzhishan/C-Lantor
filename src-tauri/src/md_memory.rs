@@ -16,6 +16,7 @@ use crate::{
 const MANIFEST_FILE: &str = "manifest.json";
 const SEARCH_SNIPPET_LIMIT: usize = 360;
 const READ_CONTENT_LIMIT: usize = 24_000;
+const COMPACTION_SOURCE_LIMIT: usize = 6_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryManifest {
@@ -38,6 +39,13 @@ struct MemoryManifestItem {
 
 struct MemoryRoot {
     root: PathBuf,
+}
+
+pub(crate) struct CompactResult {
+    pub(crate) memory_id: String,
+    pub(crate) parent_ids: Vec<String>,
+    pub(crate) scope_type: String,
+    pub(crate) scope_id: String,
 }
 
 pub(crate) async fn append_run_summary(
@@ -305,6 +313,36 @@ pub(crate) async fn rebuild_manifest(pool: &SqlitePool, agent_id: Uuid) -> Comma
     Ok(count)
 }
 
+pub(crate) async fn compact_ready_runs(
+    pool: &SqlitePool,
+    agent_id: Uuid,
+    run_id: Uuid,
+    scope_type: Option<&str>,
+    scope_id: Option<&str>,
+    min_runs: usize,
+    keep_recent: usize,
+) -> CommandResult<Option<CompactResult>> {
+    let root = memory_root(pool, agent_id).await?;
+    let (derived_scope_type, derived_scope_id, source_ids) =
+        run_scope(pool, agent_id, run_id).await?;
+    let scope_type = scope_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&derived_scope_type);
+    let scope_id = scope_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&derived_scope_id);
+    compact_ready_runs_in_root(
+        &root.root,
+        scope_type,
+        scope_id,
+        min_runs.max(2),
+        keep_recent,
+        &source_ids,
+    )
+}
+
 async fn memory_root(pool: &SqlitePool, agent_id: Uuid) -> CommandResult<MemoryRoot> {
     let row = sqlx::query("select handle, working_directory from agents where id = $1")
         .bind(agent_id)
@@ -394,6 +432,125 @@ fn upsert_manifest_item(root: &Path, item: MemoryManifestItem) -> CommandResult<
         .items
         .sort_by(|left, right| right.created_at.cmp(&left.created_at));
     write_manifest(root, &manifest)
+}
+
+fn compact_ready_runs_in_root(
+    root: &Path,
+    scope_type: &str,
+    scope_id: &str,
+    min_runs: usize,
+    keep_recent: usize,
+    source_ids: &[String],
+) -> CommandResult<Option<CompactResult>> {
+    let manifest = read_manifest(root)?;
+    let compacted_parent_ids = manifest
+        .items
+        .iter()
+        .filter(|item| item.kind == "summary")
+        .flat_map(|item| item.parent_ids.iter().cloned())
+        .collect::<std::collections::HashSet<_>>();
+    let mut runs = manifest
+        .items
+        .iter()
+        .filter(|item| {
+            item.kind == "run"
+                && item.scope_type == scope_type
+                && item.scope_id == scope_id
+                && !compacted_parent_ids.contains(&item.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    runs.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    if runs.len() < min_runs {
+        return Ok(None);
+    }
+    let compact_count = runs.len().saturating_sub(keep_recent).max(2);
+    let selected = runs.into_iter().take(compact_count).collect::<Vec<_>>();
+    if selected.len() < 2 {
+        return Ok(None);
+    }
+
+    let now = Utc::now();
+    let id = format!(
+        "summary_{}_{}",
+        now.format("%Y%m%d_%H%M%S"),
+        short_uuid(Uuid::new_v4())
+    );
+    let title = format!("Compacted {scope_type} memory");
+    let parent_ids = selected
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let body = format_compacted_runs(root, &selected)?;
+    let token_count = estimate_tokens(&body);
+    let created_at = now.to_rfc3339();
+    let rel_path = format!("summaries/{}/{}.md", safe_path_segment(scope_type), id);
+    let path = root.join(&rel_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+    }
+    let mut summary_sources = selected
+        .iter()
+        .flat_map(|item| item.source_ids.iter().cloned())
+        .chain(source_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    summary_sources.sort();
+    summary_sources.dedup();
+    let content = format_memory_markdown(
+        &id,
+        "summary",
+        scope_type,
+        scope_id,
+        &title,
+        &created_at,
+        token_count,
+        &summary_sources,
+        &parent_ids,
+        &body,
+    );
+    fs::write(&path, content).map_err(to_string)?;
+
+    upsert_manifest_item(
+        root,
+        MemoryManifestItem {
+            id: id.clone(),
+            kind: "summary".to_owned(),
+            scope_type: scope_type.to_owned(),
+            scope_id: scope_id.to_owned(),
+            title,
+            path: rel_path,
+            created_at,
+            token_count,
+            source_ids: summary_sources,
+            parent_ids: parent_ids.clone(),
+        },
+    )?;
+    Ok(Some(CompactResult {
+        memory_id: id,
+        parent_ids,
+        scope_type: scope_type.to_owned(),
+        scope_id: scope_id.to_owned(),
+    }))
+}
+
+fn format_compacted_runs(root: &Path, runs: &[MemoryManifestItem]) -> CommandResult<String> {
+    let mut lines = vec![
+        "## Summary".to_owned(),
+        format!("Compacted {} run summaries.", runs.len()),
+        String::new(),
+        "## Source Runs".to_owned(),
+    ];
+    for run in runs {
+        let content = read_item_content(root, &run.path)?;
+        let body = compact_chars_middle(&strip_frontmatter(&content), COMPACTION_SOURCE_LIMIT)
+            .trim()
+            .to_owned();
+        lines.push(format!("- {} ({}, {})", run.title, run.id, run.created_at));
+        lines.push(String::new());
+        lines.push(body);
+        lines.push(String::new());
+    }
+    Ok(lines.join("\n").trim().to_owned())
 }
 
 fn rebuild_manifest_from_markdown(root: &Path) -> CommandResult<Vec<MemoryManifestItem>> {
@@ -887,6 +1044,79 @@ mod tests {
             .await
             .expect("search rebuilt memory");
         assert_eq!(found_after_rebuild["items"][0]["id"], memory_id);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn compact_ready_runs_writes_summary_and_skips_compacted_parents() {
+        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
+        let root = base.join("memory");
+        let run_dir = root.join("runs/2026-06-01");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        let mut manifest = MemoryManifest { items: Vec::new() };
+        for idx in 0..4 {
+            let id = format!("run_{idx}");
+            let created_at = format!("2026-06-01T00:00:0{idx}Z");
+            let rel_path = format!("runs/2026-06-01/{id}.md");
+            fs::write(
+                root.join(&rel_path),
+                format_memory_markdown(
+                    &id,
+                    "run",
+                    "thread",
+                    "thread_1",
+                    &format!("Run {idx}"),
+                    &created_at,
+                    10,
+                    &[format!("msg:{idx}")],
+                    &[],
+                    &format!("Body {idx}"),
+                ),
+            )
+            .expect("write run");
+            manifest.items.push(MemoryManifestItem {
+                id,
+                kind: "run".to_owned(),
+                scope_type: "thread".to_owned(),
+                scope_id: "thread_1".to_owned(),
+                title: format!("Run {idx}"),
+                path: rel_path,
+                created_at,
+                token_count: 10,
+                source_ids: vec![format!("msg:{idx}")],
+                parent_ids: Vec::new(),
+            });
+        }
+        write_manifest(&root, &manifest).expect("write manifest");
+
+        let compacted = compact_ready_runs_in_root(
+            &root,
+            "thread",
+            "thread_1",
+            4,
+            1,
+            &["run:latest".to_owned()],
+        )
+        .expect("compact")
+        .expect("compacted");
+
+        assert_eq!(compacted.parent_ids, vec!["run_0", "run_1", "run_2"]);
+        let manifest = read_manifest(&root).expect("read manifest");
+        let summary = manifest
+            .items
+            .iter()
+            .find(|item| item.id == compacted.memory_id)
+            .expect("summary item");
+        assert_eq!(summary.kind, "summary");
+        assert_eq!(summary.parent_ids, vec!["run_0", "run_1", "run_2"]);
+        let summary_content = read_item_content(&root, &summary.path).expect("read summary");
+        assert!(summary_content.contains("Body 0"));
+        assert!(summary_content.contains("Body 2"));
+
+        let second = compact_ready_runs_in_root(&root, "thread", "thread_1", 2, 0, &[])
+            .expect("second compact");
+        assert!(second.is_none());
 
         let _ = fs::remove_dir_all(base);
     }

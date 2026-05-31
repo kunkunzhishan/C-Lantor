@@ -115,6 +115,16 @@ pub(crate) enum AgentEvent {
         source_ids: Option<Vec<String>>,
     },
     MemoryRebuildManifest,
+    MemoryCompactRuns {
+        #[serde(default)]
+        scope_type: Option<String>,
+        #[serde(default)]
+        scope_id: Option<String>,
+        #[serde(default)]
+        min_runs: Option<usize>,
+        #[serde(default)]
+        keep_recent: Option<usize>,
+    },
     ChannelCreate {
         name: String,
         description: Option<String>,

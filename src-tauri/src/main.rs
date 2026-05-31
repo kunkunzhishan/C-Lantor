@@ -9567,6 +9567,26 @@ async fn handle_agent_event(
                 json!({ "operation": "run_summary", "memory_id": memory_id }).to_string(),
             )
             .await?;
+            let compacted =
+                md_memory::compact_ready_runs(pool, agent_id, run_id, None, None, 8, 2).await?;
+            if let Some(result) = compacted {
+                record_agent_activity(
+                    pool,
+                    Some(agent_id),
+                    Some(run_id),
+                    "memory",
+                    "Run summaries compacted",
+                    json!({
+                        "operation": "compact_runs",
+                        "memory_id": result.memory_id,
+                        "parent_ids": result.parent_ids,
+                        "scope_type": result.scope_type,
+                        "scope_id": result.scope_id
+                    })
+                    .to_string(),
+                )
+                .await?;
+            }
             Ok("memory run summary saved".to_owned())
         }
         AgentEvent::MemorySummary {
@@ -9612,6 +9632,47 @@ async fn handle_agent_event(
             )
             .await?;
             Ok(format!("memory manifest rebuilt: {rebuilt} item(s)"))
+        }
+        AgentEvent::MemoryCompactRuns {
+            scope_type,
+            scope_id,
+            min_runs,
+            keep_recent,
+        } => {
+            let compacted = md_memory::compact_ready_runs(
+                pool,
+                agent_id,
+                run_id,
+                scope_type.as_deref(),
+                scope_id.as_deref(),
+                min_runs.unwrap_or(3),
+                keep_recent.unwrap_or(1),
+            )
+            .await?;
+            if let Some(result) = compacted {
+                record_agent_activity(
+                    pool,
+                    Some(agent_id),
+                    Some(run_id),
+                    "memory",
+                    "Run summaries compacted",
+                    json!({
+                        "operation": "compact_runs",
+                        "memory_id": result.memory_id,
+                        "parent_ids": result.parent_ids,
+                        "scope_type": result.scope_type,
+                        "scope_id": result.scope_id
+                    })
+                    .to_string(),
+                )
+                .await?;
+                Ok(format!(
+                    "memory run summaries compacted: {}",
+                    result.memory_id
+                ))
+            } else {
+                Ok("memory run summaries not compacted: below threshold".to_owned())
+            }
         }
         AgentEvent::ChannelCreate {
             name,

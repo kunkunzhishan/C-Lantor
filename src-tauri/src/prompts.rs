@@ -109,6 +109,7 @@ LANTOR_EVENT {"type":"memory_compact","body":"<full compact MEMORY.md replacemen
 LANTOR_EVENT {"type":"memory_run_summary","title":"<short title>","body":"<markdown run summary>","source_ids":["<optional source ref>"]}
 LANTOR_EVENT {"type":"memory_summary","title":"<short title>","body":"<markdown compacted summary>","scope_type":"thread|task|channel|agent","scope_id":"<optional scope id>","parent_ids":["<memory item id>"],"source_ids":["<optional source ref>"]}
 LANTOR_EVENT {"type":"memory_rebuild_manifest"}
+LANTOR_EVENT {"type":"memory_compact_runs","scope_type":"<optional thread|task|channel|agent>","scope_id":"<optional scope id>","min_runs":8,"keep_recent":2}
 LANTOR_EVENT {"type":"profile_update","display_name":"<optional>","role":"<optional concise role>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional capability summary>"}
 LANTOR_EVENT {"type":"owner_profile_update","display_name":"<optional>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional>"}
 LANTOR_EVENT {"type":"reminder_create","when":"<ISO8601 timestamp>","title":"<title>","note":"<optional note>","recurrence":"none|daily|weekly|every:20m"}
