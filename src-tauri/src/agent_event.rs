@@ -125,10 +125,6 @@ pub(crate) enum AgentEvent {
         #[serde(default)]
         keep_recent: Option<usize>,
     },
-    MemoryMigrateLegacy {
-        #[serde(default)]
-        dry_run: Option<bool>,
-    },
     ChannelCreate {
         name: String,
         description: Option<String>,

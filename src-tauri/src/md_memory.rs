@@ -19,6 +19,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const SEARCH_SNIPPET_LIMIT: usize = 360;
 const READ_CONTENT_LIMIT: usize = 24_000;
 const COMPACTION_SOURCE_LIMIT: usize = 6_000;
+const LEGACY_MIGRATED_FILE: &str = ".legacy_migrated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryManifest {
@@ -574,6 +575,16 @@ fn migrate_legacy_workspace(
     agent_id: Uuid,
     dry_run: bool,
 ) -> CommandResult<Value> {
+    let marker = root.join(LEGACY_MIGRATED_FILE);
+    if !dry_run && marker.exists() {
+        return Ok(json!({
+            "dry_run": false,
+            "already_migrated": true,
+            "planned": [],
+            "created": [],
+            "skipped": []
+        }));
+    }
     let candidates = legacy_memory_candidates(workspace)?;
     let mut manifest = read_manifest(root)?;
     let mut existing_ids = manifest
@@ -586,7 +597,7 @@ fn migrate_legacy_workspace(
     let mut skipped = Vec::new();
     let now = Utc::now().to_rfc3339();
 
-    for source_path in candidates {
+    for source_path in &candidates {
         let body = fs::read_to_string(&source_path).map_err(to_string)?;
         let body = body.trim();
         if body.is_empty() {
@@ -655,6 +666,12 @@ fn migrate_legacy_workspace(
             .items
             .sort_by(|left, right| right.created_at.cmp(&left.created_at));
         write_manifest(root, &manifest)?;
+        archive_legacy_candidates(workspace, root, &candidates)?;
+        fs::write(
+            marker,
+            format!("migrated_at: {}\n", Utc::now().to_rfc3339()),
+        )
+        .map_err(to_string)?;
     }
     Ok(json!({
         "dry_run": dry_run,
@@ -682,6 +699,29 @@ fn legacy_memory_candidates(workspace: &Path) -> CommandResult<Vec<PathBuf>> {
     }
     candidates.sort();
     Ok(candidates)
+}
+
+fn archive_legacy_candidates(
+    workspace: &Path,
+    root: &Path,
+    candidates: &[PathBuf],
+) -> CommandResult<()> {
+    let archive_root = root.join("legacy_sources");
+    for source_path in candidates {
+        if !source_path.exists() {
+            continue;
+        }
+        let rel_source = source_path.strip_prefix(workspace).map_err(to_string)?;
+        let archive_path = archive_root.join(rel_source);
+        if let Some(parent) = archive_path.parent() {
+            fs::create_dir_all(parent).map_err(to_string)?;
+        }
+        if archive_path.exists() {
+            fs::remove_file(&archive_path).map_err(to_string)?;
+        }
+        fs::rename(source_path, archive_path).map_err(to_string)?;
+    }
+    Ok(())
 }
 
 fn stable_hash(value: &str) -> String {
@@ -1290,11 +1330,15 @@ mod tests {
             .expect("memory item");
         let memory_content = read_item_content(&root, &memory_item.path).expect("read migrated");
         assert!(memory_content.contains("Stable fact"));
+        assert!(!base.join("MEMORY.md").exists());
+        assert!(!notes.join("work-log.md").exists());
+        assert!(root.join("legacy_sources/MEMORY.md").exists());
+        assert!(root.join("legacy_sources/notes/work-log.md").exists());
 
         let reapplied =
             migrate_legacy_workspace(&base, &root, agent_id, false).expect("reapply migration");
         assert_eq!(reapplied["created"].as_array().expect("created").len(), 0);
-        assert_eq!(reapplied["skipped"].as_array().expect("skipped").len(), 2);
+        assert_eq!(reapplied["already_migrated"], true);
 
         let _ = fs::remove_dir_all(base);
     }

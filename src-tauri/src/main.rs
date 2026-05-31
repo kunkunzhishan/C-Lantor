@@ -97,13 +97,13 @@ use models::{
     LaunchAgentStatus, Message, MessageAttachment, OwnerProfile, Reminder, RuntimeCheck,
     SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity, TodoItem,
 };
+#[cfg(test)]
+use prompts::WORK_ITEM_FINISH_PROMPT;
 use prompts::{
     build_claude_streaming_prompt, build_codex_streaming_prompt, build_streaming_work_item_prompt,
     build_work_item_prompt, claude_system_prompt, codex_developer_instructions,
-    ensure_agent_workspace, load_agent_memory_context, prepend_memory_context,
+    ensure_agent_workspace,
 };
-#[cfg(test)]
-use prompts::{AGENT_MEMORY_CONTEXT_LIMIT, WORK_ITEM_FINISH_PROMPT};
 use publish_guard::{
     bump_thread_version, can_publish_public_output, control_action_kind_for_event_type,
     hold_streaming_public_output, hold_visible_control_event, output_buffer_exists,
@@ -9674,36 +9674,6 @@ async fn handle_agent_event(
                 Ok("memory run summaries not compacted: below threshold".to_owned())
             }
         }
-        AgentEvent::MemoryMigrateLegacy { dry_run } => {
-            let result = md_memory::migrate_legacy(pool, agent_id, dry_run.unwrap_or(true)).await?;
-            let created = result
-                .get("created")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or_default();
-            let planned = result
-                .get("planned")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or_default();
-            record_agent_activity(
-                pool,
-                Some(agent_id),
-                Some(run_id),
-                "memory",
-                "Legacy memory migration checked",
-                json!({ "operation": "migrate_legacy", "result": result }).to_string(),
-            )
-            .await?;
-            Ok(format!(
-                "legacy memory migration {}: {created} created, {planned} planned",
-                if dry_run.unwrap_or(true) {
-                    "dry-run"
-                } else {
-                    "applied"
-                }
-            ))
-        }
         AgentEvent::ChannelCreate {
             name,
             description,
@@ -14941,19 +14911,36 @@ async fn supervisor_start_agent(
     let avatar: Option<String> = row.get("avatar");
     let is_warm_streaming_runtime =
         runtime.eq_ignore_ascii_case("codex") || runtime.eq_ignore_ascii_case("claude");
-    let memory_context = match load_agent_memory_context(&working_directory) {
-        Ok(memory_context) => memory_context,
+    let memory_context: Option<String> = None;
+    match md_memory::migrate_legacy(pool, agent_id, false).await {
+        Ok(result) => {
+            let created = result
+                .get("created")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            if created > 0 {
+                record_agent_activity(
+                    pool,
+                    Some(agent_id),
+                    None,
+                    "memory",
+                    "Legacy memory migrated",
+                    json!({ "operation": "migrate_legacy", "result": result }).to_string(),
+                )
+                .await?;
+            }
+        }
         Err(err) => {
             record_agent_activity(
                 pool,
                 Some(agent_id),
                 None,
                 "profile",
-                "Memory context skipped",
+                "Legacy memory migration skipped",
                 err,
             )
             .await?;
-            None
         }
     };
     let work_item_prompt = match work_item_id {
@@ -15063,7 +15050,6 @@ async fn supervisor_start_agent(
         )
         .await;
     }
-    let work_item_prompt = prepend_memory_context(work_item_prompt, memory_context.as_deref());
     let command_text = effective_launch_command(launch_command, runtime, model, handle.clone());
     let initial_log = if work_item_prompt.is_empty() {
         format!("$ {command_text}\n")
@@ -17043,15 +17029,14 @@ mod tests {
         format_memory_index_entry, forward_task_in_pool, handle_agent_event,
         handle_codex_warm_stdout_line, handle_streaming_agent_event_json, inbox_wake_context,
         insert_agent_message, insert_memory_index_entry, load_agent_activities,
-        load_agent_memory_context, load_channel_agent_roster, load_channels, load_messages,
-        load_reminders, load_runtime_thread_id, load_thread_activities,
-        mark_all_owner_inbox_read_in_pool, mark_inbox_items_read_in_pool,
-        maybe_hide_silent_streaming_reply, migrate, normalize_open_link_target,
-        notify_ui_work_item_changed, open_dm_with_agent_in_pool, parse_activity_metadata,
-        parse_tailscale_ipv4_from_text, prepend_inbox_context, process_due_agent_schedules,
-        process_due_reminders, queue_mentions_as_work_items, reassign_agent_work_in_pool,
-        record_agent_activity, recover_supervisor_commands_at_startup, send_owner_message_in_pool,
-        should_keep_ui_refresh_metric_line, silent_reply_reason,
+        load_channel_agent_roster, load_channels, load_messages, load_reminders,
+        load_runtime_thread_id, load_thread_activities, mark_all_owner_inbox_read_in_pool,
+        mark_inbox_items_read_in_pool, maybe_hide_silent_streaming_reply, migrate,
+        normalize_open_link_target, notify_ui_work_item_changed, open_dm_with_agent_in_pool,
+        parse_activity_metadata, parse_tailscale_ipv4_from_text, prepend_inbox_context,
+        process_due_agent_schedules, process_due_reminders, queue_mentions_as_work_items,
+        reassign_agent_work_in_pool, record_agent_activity, recover_supervisor_commands_at_startup,
+        send_owner_message_in_pool, should_keep_ui_refresh_metric_line, silent_reply_reason,
         split_complete_streaming_agent_event_lines, split_streaming_agent_event_lines,
         split_terminal_streaming_agent_event_lines, streaming_message_body_is_empty,
         supervisor_start_codex_streaming_agent, trim_ui_refresh_metric_lines_to_size,
@@ -17061,7 +17046,7 @@ mod tests {
         AgentAttachmentFile, AgentEvent, AgentInboxItemInput, AgentMessageControlDemuxState,
         ClaudeActiveTurn, ClaudeSurface, CodexActiveTurn, CodexActiveTurnScheduleState,
         InboxWakeItem, InboxWakeSummary, MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState,
-        WarmCodexRegistry, WarmCodexRuntime, WarmCodexState, AGENT_MEMORY_CONTEXT_LIMIT,
+        WarmCodexRegistry, WarmCodexRuntime, WarmCodexState,
         CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS, CODEX_TURN_START_TIMEOUT,
         STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER, UI_REFRESH_METRICS_MAX_BYTES,
         WORK_ITEM_FINISH_PROMPT,
@@ -17259,27 +17244,6 @@ inline `@kunk` and after @longbaby
     }
 
     #[test]
-    fn memory_context_is_bounded_and_preserves_tail() {
-        let dir = std::env::temp_dir().join(format!("lantor-memory-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp memory dir");
-        let memory_path = dir.join("MEMORY.md");
-        let memory = format!(
-            "# Agent\n\n{}\n\n## Active Context\nimportant tail survives",
-            "context ".repeat(AGENT_MEMORY_CONTEXT_LIMIT)
-        );
-        std::fs::write(&memory_path, memory).expect("write memory");
-
-        let context =
-            load_agent_memory_context(dir.to_str().expect("utf8 temp dir")).expect("load memory");
-        std::fs::remove_dir_all(&dir).ok();
-
-        let context = context.expect("memory should load");
-        assert!(context.contains("Lantor omitted"));
-        assert!(context.contains("important tail survives"));
-        assert!(context.chars().count() < AGENT_MEMORY_CONTEXT_LIMIT + 1_000);
-    }
-
-    #[test]
     fn runtime_standing_prompt_carries_memory_once() {
         let prompt =
             claude_system_prompt("tester", Some("Persistent memory: prefer concise replies"));
@@ -17287,13 +17251,14 @@ inline `@kunk` and after @longbaby
         assert!(prompt.contains("channel and thread are delivered as message envelope fields"));
         assert!(prompt.contains("Treat messages as conversation"));
         assert!(prompt.contains("Activity events are the short progress notes"));
-        assert!(prompt.contains("MEMORY.md is the compact index"));
-        assert!(prompt.contains("raw conversation/tool logs should stay out of memory"));
-        assert!(prompt.contains("notes/<topic>.md"));
-        assert!(prompt.contains("not replay past turns"));
-        assert!(prompt.contains("timestamp-log-like"));
+        assert!(prompt.contains("Lantor md memory is the durable recovery layer"));
+        assert!(prompt.contains("memory/manifest.json"));
+        assert!(prompt.contains("memory_run_summary"));
+        assert!(prompt.contains("lantor.memory_search"));
+        assert!(
+            prompt.contains("Legacy `MEMORY.md` / `notes/*.md` files are migration sources only")
+        );
         assert!(prompt.contains("stable user preferences"));
-        assert!(prompt.contains("Before long-running work, update Active Context"));
         assert!(prompt.contains("Turn startup sequence:"));
         assert!(
             prompt.contains("Use history-read or message-search when older channel/thread context")
@@ -17315,21 +17280,14 @@ inline `@kunk` and after @longbaby
     }
 
     #[test]
-    fn ensure_agent_workspace_creates_index_memory_template_and_notes_dir() {
+    fn ensure_agent_workspace_creates_workspace_and_notes_dir_without_legacy_memory_template() {
         let dir = std::env::temp_dir().join(format!("lantor-memory-template-{}", Uuid::new_v4()));
         ensure_agent_workspace(dir.to_str().expect("utf8 temp dir"), "template-agent")
             .expect("ensure workspace");
 
-        let memory = std::fs::read_to_string(dir.join("MEMORY.md")).expect("read memory");
+        assert!(dir.is_dir());
         assert!(dir.join("notes").is_dir());
-        assert!(memory.contains("# @template-agent"));
-        assert!(memory.contains("## Key Knowledge"));
-        assert!(memory.contains("## Memory Map"));
-        assert!(memory.contains("notes/user-preferences.md"));
-        assert!(memory.contains("notes/work-log.md"));
-        assert!(memory.contains("## Active Context"));
-        assert!(memory.contains("Keep this file concise and index-like"));
-        assert!(memory.contains("Do not use MEMORY.md as a chronological log"));
+        assert!(!dir.join("MEMORY.md").exists());
 
         std::fs::remove_dir_all(dir).ok();
     }
