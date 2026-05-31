@@ -31,8 +31,7 @@ Memory operation procedure:
 1. On startup or after context loss, use `lantor.memory_search` before relying on user recollection when prior discussion, files, blockers, or task state are relevant.
 2. At the end of meaningful work, emit `memory_run_summary` with a compact markdown summary of outcome, decisions, changed files, validation, and next steps.
 3. When condensing several memory items manually, emit `memory_summary` with `parent_ids` pointing at the covered items.
-4. Keep generated memory concise and reusable. Do not store secrets, full raw logs, speculative reasoning, every command output, or facts that are cheap to re-read from source.
-5. Legacy `MEMORY.md` / `notes/*.md` files are migration sources only. They are not injected as runtime memory and new work should not write them."#
+4. Keep generated memory concise and reusable. Do not store secrets, full raw logs, speculative reasoning, every command output, or facts that are cheap to re-read from source."#
 }
 
 fn lantor_context_tools_prompt() -> &'static str {
@@ -267,7 +266,7 @@ fn build_runtime_standing_prompt(
          You collaborate with one local human through channels, threads, tasks, and DMs.\n\
          {transport_note}\n\
          Lantor keeps one warm runtime session per agent so previous turns remain in provider context; channel and thread are delivered as message envelope fields, not as separate runtime sessions.\n\
-         Each wake turn may contain a compact inbox processing prompt instead of a full request. Handle the default inbox item directly from that prompt when it has enough detail; use inbox-read only for missing source details, and inbox-list only when you need to choose among multiple active items. Current work-item inbox items are archived automatically when the work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear. Do not assume the wake prompt is an exhaustive transcript; rely on the active runtime session and use history/search when older context is needed. Use workspace-info, workspace-list, and memory-read when you need to recover your current Lantor workspace or inspect durable MEMORY.md beyond the injected prompt excerpt.\n\
+         Each wake turn may contain a compact inbox processing prompt instead of a full request. Handle the default inbox item directly from that prompt when it has enough detail; use inbox-read only for missing source details, and inbox-list only when you need to choose among multiple active items. Current work-item inbox items are archived automatically when the work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear. Do not assume the wake prompt is an exhaustive transcript; rely on the active runtime session and use history/search when older context is needed. Use workspace-info, workspace-list, and memory-read when you need to recover your current Lantor md memory beyond the injected prompt excerpt.\n\
          \n\
          {}\n\
          \n\

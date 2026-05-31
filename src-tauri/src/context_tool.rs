@@ -898,7 +898,18 @@ async fn notify_context_tool_refresh(pool: &SqlitePool, reason: &str) {
 }
 
 fn memory_path(workspace: &Path) -> PathBuf {
-    workspace.join("MEMORY.md")
+    workspace.join("memory")
+}
+
+fn strip_memory_frontmatter(content: &str) -> &str {
+    let content = content.trim_start();
+    if !content.starts_with("---\n") {
+        return content;
+    }
+    content[4..]
+        .find("\n---\n")
+        .map(|end| &content[end + 9..])
+        .unwrap_or(content)
 }
 
 fn file_summary(path: &Path) -> String {
@@ -983,6 +994,7 @@ pub(crate) async fn agent_context_workspace_info(
     let target = resolve_agent_workspace_target(pool, args).await?;
     let workspace = workspace_path(&target)?;
     let memory = memory_path(&workspace);
+    let manifest = memory.join("manifest.json");
     let cwd = env::current_dir()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|err| format!("unavailable: {err}"));
@@ -996,6 +1008,8 @@ pub(crate) async fn agent_context_workspace_info(
         format!("memory_path=\"{}\"", memory.display()),
         format!("memory_exists={}", memory.exists()),
         format!("memory_kind={}", file_summary(&memory)),
+        format!("memory_manifest_path=\"{}\"", manifest.display()),
+        format!("memory_manifest_exists={}", manifest.exists()),
     ];
 
     if workspace.exists() && workspace.is_dir() {
@@ -1016,28 +1030,62 @@ pub(crate) async fn agent_context_memory_read(
     let target = resolve_agent_workspace_target(pool, args).await?;
     let workspace = workspace_path(&target)?;
     let memory = memory_path(&workspace);
+    let manifest_path = memory.join("manifest.json");
     if !memory.exists() {
         return Ok(format!(
-            "Lantor MEMORY.md for @{}\nmemory_path=\"{}\"\nmemory_exists=false",
+            "Lantor md memory for @{}\nmemory_path=\"{}\"\nmemory_exists=false",
             target.handle,
             memory.display()
         ));
     }
-    let metadata = fs::metadata(&memory).map_err(to_string)?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "MEMORY.md is not a regular file: {}",
-            memory.display()
+    let limit = parse_context_tool_usize_limit(args, 16 * 1024, 64 * 1024)?;
+    if !manifest_path.is_file() {
+        return Ok(format!(
+            "Lantor md memory for @{}\nmemory_path=\"{}\"\nmanifest_path=\"{}\"\nmanifest_exists=false",
+            target.handle,
+            memory.display(),
+            manifest_path.display()
         ));
     }
-    let limit = parse_context_tool_usize_limit(args, 16 * 1024, 64 * 1024)?;
-    let body = fs::read_to_string(&memory).map_err(to_string)?;
+    let manifest_body = fs::read_to_string(&manifest_path).map_err(to_string)?;
+    let manifest: Value = serde_json::from_str(&manifest_body).map_err(to_string)?;
+    let items = manifest
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut sections = Vec::new();
+    for item in items.iter().take(8) {
+        let id = item.get("id").and_then(Value::as_str).unwrap_or("unknown");
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled");
+        let created_at = item
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let content = fs::read_to_string(memory.join(path)).unwrap_or_default();
+        sections.push(format!(
+            "## {title}\nid={id} kind={kind} created_at={created_at} path={path}\n\n{}",
+            strip_memory_frontmatter(&content).trim()
+        ));
+    }
+    let body = sections.join("\n\n");
     let compacted = compact_chars_middle(body.trim(), limit);
     Ok(format!(
-        "Lantor MEMORY.md for @{}\nmemory_path=\"{}\"\nbytes={}\nchars_returned={}\n\n{}",
+        "Lantor md memory for @{}\nmemory_path=\"{}\"\nmanifest_path=\"{}\"\nitems={}\nchars_returned={}\n\n{}",
         target.handle,
         memory.display(),
-        metadata.len(),
+        manifest_path.display(),
+        items.len(),
         compacted.chars().count(),
         compacted
     ))

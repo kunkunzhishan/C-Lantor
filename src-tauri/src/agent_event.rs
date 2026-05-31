@@ -88,12 +88,6 @@ pub(crate) enum AgentEvent {
         #[serde(default)]
         cost_usd: Option<f64>,
     },
-    MemoryAppend {
-        body: String,
-    },
-    MemoryCompact {
-        body: String,
-    },
     MemoryRunSummary {
         title: Option<String>,
         #[serde(alias = "summary", alias = "content")]
