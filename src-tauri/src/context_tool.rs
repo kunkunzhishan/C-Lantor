@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
@@ -912,6 +912,25 @@ fn strip_memory_frontmatter(content: &str) -> &str {
         .unwrap_or(content)
 }
 
+fn safe_memory_item_path(root: &Path, relative_path: &str) -> CommandResult<PathBuf> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute() {
+        return Err("memory item path must be relative".to_owned());
+    }
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err("memory item path cannot escape memory root".to_owned());
+        }
+    }
+    let root = root.canonicalize().map_err(to_string)?;
+    let path = root.join(relative);
+    let canonical = path.canonicalize().map_err(to_string)?;
+    if !canonical.starts_with(&root) {
+        return Err("memory item path cannot escape memory root".to_owned());
+    }
+    Ok(canonical)
+}
+
 fn file_summary(path: &Path) -> String {
     match fs::metadata(path) {
         Ok(metadata) => {
@@ -1072,7 +1091,10 @@ pub(crate) async fn agent_context_memory_read(
         let Some(path) = item.get("path").and_then(Value::as_str) else {
             continue;
         };
-        let content = fs::read_to_string(memory.join(path)).unwrap_or_default();
+        let Ok(item_path) = safe_memory_item_path(&memory, path) else {
+            continue;
+        };
+        let content = fs::read_to_string(item_path).unwrap_or_default();
         sections.push(format!(
             "## {title}\nid={id} kind={kind} created_at={created_at} path={path}\n\n{}",
             strip_memory_frontmatter(&content).trim()

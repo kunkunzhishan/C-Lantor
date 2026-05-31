@@ -17691,6 +17691,8 @@ inline `@kunk` and after @longbaby
         let workspace =
             std::env::temp_dir().join(format!("lantor-workspace-tool-{}", Uuid::new_v4()));
         let result: Result<(), String> = async {
+            std::fs::write(workspace.with_extension("outside.md"), "outside secret")
+                .map_err(|err| err.to_string())?;
             std::fs::create_dir_all(workspace.join("memory/summaries/agent"))
                 .map_err(|err| err.to_string())?;
             std::fs::write(
@@ -17705,6 +17707,18 @@ inline `@kunk` and after @longbaby
       "title": "Workspace memory",
       "path": "summaries/agent/summary_workspace.md",
       "created_at": "2026-01-01T00:00:00+00:00",
+      "token_count": 8,
+      "source_ids": [],
+      "parent_ids": []
+    },
+    {
+      "id": "summary_escape",
+      "kind": "summary",
+      "scope_type": "agent",
+      "scope_id": "workspace-agent",
+      "title": "Escaped memory",
+      "path": "../outside.md",
+      "created_at": "2026-01-01T00:00:01+00:00",
       "token_count": 8,
       "source_ids": [],
       "parent_ids": []
@@ -17745,6 +17759,7 @@ inline `@kunk` and after @longbaby
             ];
             let memory = agent_context_memory_read(&pool, &memory_args).await?;
             assert!(memory.contains("Workspace-aware test agent"));
+            assert!(!memory.contains("outside secret"));
 
             let list_args = vec![
                 "workspace-list".to_owned(),
@@ -17760,6 +17775,7 @@ inline `@kunk` and after @longbaby
         }
         .await;
         let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_file(workspace.with_extension("outside.md"));
         drop_test_schema(pool, schema).await;
         assert!(result.is_ok(), "{:?}", result.err());
     }

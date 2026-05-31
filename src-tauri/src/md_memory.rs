@@ -464,7 +464,7 @@ fn compact_ready_runs_in_root(
     if runs.len() < min_runs {
         return Ok(None);
     }
-    let compact_count = runs.len().saturating_sub(keep_recent).max(2);
+    let compact_count = runs.len().saturating_sub(keep_recent);
     let selected = runs.into_iter().take(compact_count).collect::<Vec<_>>();
     if selected.len() < 2 {
         return Ok(None);
@@ -1117,6 +1117,54 @@ mod tests {
         let second = compact_ready_runs_in_root(&root, "thread", "thread_1", 2, 0, &[])
             .expect("second compact");
         assert!(second.is_none());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn compact_ready_runs_respects_keep_recent_for_manual_parameters() {
+        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
+        let root = base.join("memory");
+        fs::create_dir_all(root.join("runs/2026-06-01")).expect("create runs");
+        let mut manifest = MemoryManifest { items: Vec::new() };
+        for idx in 0..2 {
+            let id = format!("run_{idx}");
+            let created_at = format!("2026-06-01T00:00:0{idx}Z");
+            let rel_path = format!("runs/2026-06-01/{id}.md");
+            fs::write(
+                root.join(&rel_path),
+                format_memory_markdown(
+                    &id,
+                    "run",
+                    "thread",
+                    "thread_1",
+                    &format!("Run {idx}"),
+                    &created_at,
+                    10,
+                    &[],
+                    &[],
+                    &format!("Body {idx}"),
+                ),
+            )
+            .expect("write run");
+            manifest.items.push(MemoryManifestItem {
+                id,
+                kind: "run".to_owned(),
+                scope_type: "thread".to_owned(),
+                scope_id: "thread_1".to_owned(),
+                title: format!("Run {idx}"),
+                path: rel_path,
+                created_at,
+                token_count: 10,
+                source_ids: Vec::new(),
+                parent_ids: Vec::new(),
+            });
+        }
+        write_manifest(&root, &manifest).expect("write manifest");
+
+        let compacted =
+            compact_ready_runs_in_root(&root, "thread", "thread_1", 2, 1, &[]).expect("compact");
+        assert!(compacted.is_none());
 
         let _ = fs::remove_dir_all(base);
     }
