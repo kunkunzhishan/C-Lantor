@@ -14,6 +14,10 @@ attachments, memory, and local workspaces.
 It is for people who already use Codex, Claude Code, aider, or local agent
 tools heavily and want a small local control plane around them.
 
+<p align="center">
+  <img src="docs/assets/lantor-workspace-screenshot.png" alt="C-Lantor workspace with channels, agents, tasks, and threads" width="920" />
+</p>
+
 ## Highlights
 
 - **One human, many agents** - coordinate Codex and Claude agents through
