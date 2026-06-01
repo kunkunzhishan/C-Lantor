@@ -4,32 +4,71 @@
 
 # C-Lantor
 
+**Run a local one-person team of Codex and Claude coding agents.**
+
+C-Lantor is a local-first desktop workspace for coordinating coding agents on
+your own machine. Instead of juggling terminal sessions and chat tabs, you can
+give agents channels, threads, DMs, tasks, handoffs, reminders, artifacts,
+attachments, memory, and local workspaces.
+
+It is for people who already use Codex, Claude Code, aider, or local agent
+tools heavily and want a small local control plane around them.
+
+## Highlights
+
+- **One human, many agents** - coordinate Codex and Claude agents through
+  channels, threads, DMs, tasks, and handoffs.
+- **Long-running work** - monitor, continue, and stop Codex long tasks that
+  should run beyond a normal chat turn.
+- **File-backed memory** - keep agent memory as readable local Markdown files
+  that can be searched, summarized, backed up, and rebuilt.
+- **Call Mode** - dispatch work with a phone-style voice workflow instead of
+  typing every instruction.
+- **Visual tools** - agents can open interactive tool views, not just return
+  text.
+- **Local-first storage** - SQLite state, attachments, chat history, agent
+  profiles, memory, and workspaces stay on your Mac.
+
+## Quickstart
+
+C-Lantor is an early macOS desktop app. Install Node 20+, Rust, and at least
+one agent runtime first:
+
+```bash
+brew install node
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+npm install -g @openai/codex
+codex
+
+# Optional, if you want Claude agents too:
+npm install -g @anthropic-ai/claude-code
+claude
+```
+
+Clone and launch the app:
+
+```bash
+git clone https://github.com/xxhZs/C-Lantor.git
+cd C-Lantor
+npm install
+npm run tauri:dev
+```
+
+When the desktop app opens, create an agent, choose Codex or Claude, point it
+at a workspace directory, and mention it in a channel or task.
+
+## Fork Status
+
 This project is based on the original
 [chenzl25/lantor](https://github.com/chenzl25/lantor). This fork keeps the
-same local-first agent workspace direction, while adding a few capabilities for
-long-running work and voice-first coordination.
+same local-first agent workspace direction while adding long tasks,
+file-backed memory work, voice-first coordination, visual tools, and smaller
+local workflow additions. Upstream features and fixes are reviewed and
+selectively ported when they fit this branch.
 
-The fork tries to stay feature-level compatible with upstream Lantor. Upstream
-features and fixes are reviewed and selectively ported when they fit this
-branch, instead of treating the fork as a completely separate product.
-
-## What This Version Adds
-
-- **Long Task support** - Codex-only long-running task support for work that
-  should continue beyond a normal chat turn.
-- **Call Mode** - a phone-style voice workflow for coordinating agents while
-  speaking.
-- **Built-in speech-to-text** - native transcription support for voice input.
-- **Mobile access path** - this fork recommends using your own domain for
-  mobile access; after opening the app, you can ask any agent in this branch
-  how to set that up.
-- **Personal workflow additions** - smaller opinionated changes such as message
-  todos and other local workflow tweaks.
-
-If there is a feature you want, you can also ask an agent to develop it on this
-branch.
-
-## Original README
+## Full README
 
 The section below is based on the original Lantor README, with the old mobile
 access recommendation removed.
