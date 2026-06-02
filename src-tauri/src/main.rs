@@ -6565,7 +6565,7 @@ fn load_agent_workspace_summary(working_directory: &str) -> AgentWorkspaceSummar
     let memory_path = workspace.join("memory");
     let memory_path_string = memory_path.to_string_lossy().to_string();
     let exists = workspace.is_dir();
-    let memory_exists = memory_path.is_file();
+    let memory_exists = memory_path.is_dir();
     let mut entries = Vec::new();
 
     if exists {
@@ -9373,7 +9373,7 @@ async fn handle_agent_event(
             body,
             source_ids,
         } => {
-            let memory_id = md_memory::append_run_summary(
+            let memory_path = md_memory::append_run_summary(
                 pool,
                 agent_id,
                 run_id,
@@ -9387,116 +9387,11 @@ async fn handle_agent_event(
                 Some(agent_id),
                 Some(run_id),
                 "memory",
-                "Run summary saved",
-                json!({ "operation": "run_summary", "memory_id": memory_id }).to_string(),
+                "Realtime memory updated",
+                json!({ "operation": "realtime_run_summary", "path": memory_path }).to_string(),
             )
             .await?;
-            let compacted =
-                md_memory::compact_ready_runs(pool, agent_id, run_id, None, None, 8, 2).await?;
-            if let Some(result) = compacted {
-                record_agent_activity(
-                    pool,
-                    Some(agent_id),
-                    Some(run_id),
-                    "memory",
-                    "Run summaries compacted",
-                    json!({
-                        "operation": "compact_runs",
-                        "memory_id": result.memory_id,
-                        "parent_ids": result.parent_ids,
-                        "scope_type": result.scope_type,
-                        "scope_id": result.scope_id
-                    })
-                    .to_string(),
-                )
-                .await?;
-            }
-            Ok("memory run summary saved".to_owned())
-        }
-        AgentEvent::MemorySummary {
-            title,
-            body,
-            scope_type,
-            scope_id,
-            parent_ids,
-            source_ids,
-        } => {
-            let memory_id = md_memory::append_summary(
-                pool,
-                agent_id,
-                run_id,
-                title.as_deref(),
-                &body,
-                scope_type.as_deref(),
-                scope_id.as_deref(),
-                &parent_ids.unwrap_or_default(),
-                &source_ids.unwrap_or_default(),
-            )
-            .await?;
-            record_agent_activity(
-                pool,
-                Some(agent_id),
-                Some(run_id),
-                "memory",
-                "Memory summary saved",
-                json!({ "operation": "summary", "memory_id": memory_id }).to_string(),
-            )
-            .await?;
-            Ok("memory summary saved".to_owned())
-        }
-        AgentEvent::MemoryRebuildManifest => {
-            let rebuilt = md_memory::rebuild_manifest(pool, agent_id).await?;
-            record_agent_activity(
-                pool,
-                Some(agent_id),
-                Some(run_id),
-                "memory",
-                "Memory manifest rebuilt",
-                json!({ "operation": "rebuild_manifest", "items": rebuilt }).to_string(),
-            )
-            .await?;
-            Ok(format!("memory manifest rebuilt: {rebuilt} item(s)"))
-        }
-        AgentEvent::MemoryCompactRuns {
-            scope_type,
-            scope_id,
-            min_runs,
-            keep_recent,
-        } => {
-            let compacted = md_memory::compact_ready_runs(
-                pool,
-                agent_id,
-                run_id,
-                scope_type.as_deref(),
-                scope_id.as_deref(),
-                min_runs.unwrap_or(3),
-                keep_recent.unwrap_or(1),
-            )
-            .await?;
-            if let Some(result) = compacted {
-                record_agent_activity(
-                    pool,
-                    Some(agent_id),
-                    Some(run_id),
-                    "memory",
-                    "Run summaries compacted",
-                    json!({
-                        "operation": "compact_runs",
-                        "memory_id": result.memory_id,
-                        "parent_ids": result.parent_ids,
-                        "scope_type": result.scope_type,
-                        "scope_id": result.scope_id
-                    })
-                    .to_string(),
-                )
-                .await?;
-                Ok(format!(
-                    "memory run summaries compacted: {}",
-                    result.memory_id
-                ))
-            } else {
-                Ok("memory run summaries not compacted: below threshold".to_owned())
-            }
+            Ok("realtime memory updated".to_owned())
         }
         AgentEvent::ChannelCreate {
             name,
@@ -12105,32 +12000,6 @@ async fn handle_codex_dynamic_tool_call(
                     Err(error) => error,
                 }
             }
-            codex_dynamic_tools::MEMORY_SEARCH => {
-                match md_memory::search(pool, agent_id, arguments).await {
-                    Ok(data) => codex_dynamic_tools::DynamicToolResult {
-                        success: true,
-                        text: "Memory search completed.".to_owned(),
-                        structured_content: json!({ "success": true, "data": data }),
-                    },
-                    Err(err) => codex_dynamic_tools::DynamicToolResult::error(
-                        err,
-                        json!({ "error": "memory_search_failed" }),
-                    ),
-                }
-            }
-            codex_dynamic_tools::MEMORY_READ => {
-                match md_memory::read(pool, agent_id, arguments).await {
-                    Ok(data) => codex_dynamic_tools::DynamicToolResult {
-                        success: true,
-                        text: "Memory item loaded.".to_owned(),
-                        structured_content: json!({ "success": true, "data": data }),
-                    },
-                    Err(err) => codex_dynamic_tools::DynamicToolResult::error(
-                        err,
-                        json!({ "error": "memory_read_failed" }),
-                    ),
-                }
-            }
             _ => codex_dynamic_tools::DynamicToolResult::error(
                 format!("Unknown Lantor dynamic tool: {tool}"),
                 json!({ "error": "unknown_tool", "tool": tool }),
@@ -14735,7 +14604,10 @@ async fn supervisor_start_agent(
     let avatar: Option<String> = row.get("avatar");
     let is_warm_streaming_runtime =
         runtime.eq_ignore_ascii_case("codex") || runtime.eq_ignore_ascii_case("claude");
-    let memory_context: Option<String> = None;
+    let memory_context = md_memory::runtime_context(pool, agent_id, 16 * 1024)
+        .await
+        .ok()
+        .flatten();
     let work_item_prompt = match work_item_id {
         Some(work_item_id) => {
             let row = sqlx::query(
@@ -16117,6 +15989,97 @@ async fn claude_warm_idle_reaper(
     }
 }
 
+fn event_ingest_input_segments_from_context(context: &str) -> Vec<String> {
+    context
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("- realtime/")
+                .map(|path| format!("realtime/{}", path.trim()))
+        })
+        .filter(|path| path.ends_with(".md"))
+        .collect()
+}
+
+fn safe_relative_path(root: &Path, relative_path: &str) -> CommandResult<PathBuf> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute() {
+        return Err("path must be relative".to_owned());
+    }
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err("path cannot escape root".to_owned());
+        }
+    }
+    Ok(root.join(relative))
+}
+
+async fn validate_event_ingest_work_item_done(
+    pool: &SqlitePool,
+    agent_id: Uuid,
+    work_item_id: Uuid,
+) -> CommandResult<Option<String>> {
+    let row = sqlx::query(
+        r#"
+        select w.source_kind, w.context, a.working_directory
+        from agent_work_items w
+        join agents a on a.id = w.agent_id
+        where w.id = $1 and w.agent_id = $2
+        "#,
+    )
+    .bind(work_item_id)
+    .bind(agent_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let source_kind: String = row.get("source_kind");
+    if source_kind != "event_ingest" {
+        return Ok(None);
+    }
+    let context: String = row.get("context");
+    let working_directory: String = row.get("working_directory");
+    let memory_root = PathBuf::from(working_directory.trim()).join("memory");
+    let input_segments = event_ingest_input_segments_from_context(&context);
+    if input_segments.is_empty() {
+        return Ok(Some(
+            "event_ingest missing input segments in work item context".to_owned(),
+        ));
+    }
+    for input in input_segments {
+        let path = safe_relative_path(&memory_root, &input)?;
+        if path.exists() {
+            return Ok(Some(format!(
+                "event_ingest input segment still exists: {}",
+                path.display()
+            )));
+        }
+    }
+    let summary_path = memory_root
+        .join("events")
+        .join(agent_id.to_string())
+        .join("summary.md");
+    let Ok(summary) = fs::read_to_string(&summary_path) else {
+        return Ok(Some(format!(
+            "event_ingest did not write event summary: {}",
+            summary_path.display()
+        )));
+    };
+    if summary.contains("Use this format for each event:")
+        && !summary.lines().any(|line| {
+            line.trim().starts_with("Summary:") && !line.contains("<merged concise event summary")
+        })
+    {
+        return Ok(Some(format!(
+            "event_ingest left event summary scaffold unchanged: {}",
+            summary_path.display()
+        )));
+    }
+    Ok(None)
+}
+
 async fn finish_warm_claude_active_turn(
     pool: &SqlitePool,
     agent_id: Uuid,
@@ -16234,13 +16197,19 @@ async fn finish_warm_claude_active_turn(
                 .map_err(to_string)?;
         let was_silent = current_work_status.as_deref() == Some("silent");
         let was_interrupted = current_work_status.as_deref() == Some("interrupted");
+        let ingest_error = if success && !was_cancelled {
+            validate_event_ingest_work_item_done(pool, agent_id, work_item_id).await?
+        } else {
+            None
+        };
+        let effective_success = success && ingest_error.is_none();
         let work_status = if was_cancelled {
             "cancelled"
-        } else if was_interrupted && success {
+        } else if was_interrupted && effective_success {
             "interrupted"
-        } else if was_silent && success {
+        } else if was_silent && effective_success {
             "silent"
-        } else if success {
+        } else if effective_success {
             "done"
         } else {
             "failed"
@@ -16257,7 +16226,7 @@ async fn finish_warm_claude_active_turn(
         )
         .bind(work_item_id)
         .bind(work_status)
-        .bind(if success && !was_cancelled {
+        .bind(if effective_success && !was_cancelled {
             final_output_text.as_str()
         } else {
             ""
@@ -16280,7 +16249,7 @@ async fn finish_warm_claude_active_turn(
             Some(active.run_id),
             "dispatch",
             work_status_title(work_status),
-            work_item_id.to_string(),
+            ingest_error.unwrap_or_else(|| work_item_id.to_string()),
         )
         .await?;
     }
@@ -16462,13 +16431,19 @@ async fn finish_warm_codex_active_turn(
                 .map_err(to_string)?;
         let was_silent = current_work_status.as_deref() == Some("silent");
         let was_interrupted = current_work_status.as_deref() == Some("interrupted");
+        let ingest_error = if success && !was_cancelled {
+            validate_event_ingest_work_item_done(pool, agent_id, work_item_id).await?
+        } else {
+            None
+        };
+        let effective_success = success && ingest_error.is_none();
         let work_status = if was_cancelled {
             "cancelled"
-        } else if was_interrupted && success {
+        } else if was_interrupted && effective_success {
             "interrupted"
-        } else if was_silent && success {
+        } else if was_silent && effective_success {
             "silent"
-        } else if success {
+        } else if effective_success {
             "done"
         } else {
             "failed"
@@ -16485,7 +16460,7 @@ async fn finish_warm_codex_active_turn(
         )
         .bind(work_item_id)
         .bind(work_status)
-        .bind(if success && !was_cancelled {
+        .bind(if effective_success && !was_cancelled {
             final_output_text.as_str()
         } else {
             ""
@@ -16508,7 +16483,7 @@ async fn finish_warm_codex_active_turn(
             Some(active.run_id),
             "dispatch",
             work_status_title(work_status),
-            work_item_id.to_string(),
+            ingest_error.unwrap_or_else(|| work_item_id.to_string()),
         )
         .await?;
     }
@@ -16809,9 +16784,8 @@ mod tests {
         context_tool::{
             agent_context_agent_inspect, agent_context_artifact_read_in_pool,
             agent_context_attachment_info, agent_context_history_read, agent_context_inbox_archive,
-            agent_context_inbox_list, agent_context_inbox_read, agent_context_memory_read,
-            agent_context_message_search, agent_context_workspace_info,
-            agent_context_workspace_list, short_id,
+            agent_context_inbox_list, agent_context_inbox_read, agent_context_message_search,
+            agent_context_workspace_info, agent_context_workspace_list, short_id,
         },
         create_agent_inbox_item, create_channel_in_pool, db_connect_with_url, delete_agent_in_pool,
         delete_channel_in_pool, delete_intermediate_run_messages,
@@ -16836,10 +16810,10 @@ mod tests {
         try_claim_unassigned_task, update_channel_in_pool, update_owner_profile_in_pool,
         upsert_agent_thread_subscription, upsert_runtime_thread_id,
         usage::{usage_from_run_log, usage_from_runtime_event},
-        AgentAttachmentFile, AgentEvent, AgentInboxItemInput, AgentMessageControlDemuxState,
-        ClaudeActiveTurn, ClaudeSurface, CodexActiveTurn, CodexActiveTurnScheduleState,
-        InboxWakeItem, InboxWakeSummary, MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState,
-        WarmCodexRegistry, WarmCodexRuntime, WarmCodexState,
+        validate_event_ingest_work_item_done, AgentAttachmentFile, AgentEvent, AgentInboxItemInput,
+        AgentMessageControlDemuxState, ClaudeActiveTurn, ClaudeSurface, CodexActiveTurn,
+        CodexActiveTurnScheduleState, InboxWakeItem, InboxWakeSummary, MentionDispatchOrigin,
+        WarmClaudeRuntime, WarmClaudeState, WarmCodexRegistry, WarmCodexRuntime, WarmCodexState,
         CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS, CODEX_TURN_START_TIMEOUT,
         STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER, UI_REFRESH_METRICS_MAX_BYTES,
         WORK_ITEM_FINISH_PROMPT,
@@ -17044,10 +17018,12 @@ inline `@kunk` and after @longbaby
         assert!(prompt.contains("channel and thread are delivered as message envelope fields"));
         assert!(prompt.contains("Treat messages as conversation"));
         assert!(prompt.contains("Activity events are the short progress notes"));
-        assert!(prompt.contains("Lantor md memory is the durable recovery layer"));
-        assert!(prompt.contains("memory/manifest.json"));
+        assert!(prompt.contains("Lantor md memory has a realtime layer and a durable event layer"));
+        assert!(prompt.contains("memory/realtime/<agent_id>/<number>.md"));
+        assert!(prompt.contains("memory/events/<agent_id>/"));
         assert!(prompt.contains("memory_run_summary"));
-        assert!(prompt.contains("lantor.memory_search"));
+        assert!(!prompt.contains("memory-read"));
+        assert!(prompt.contains("injected memory path"));
         assert!(prompt.contains("stable user preferences"));
         assert!(prompt.contains("Turn startup sequence:"));
         assert!(
@@ -17693,44 +17669,18 @@ inline `@kunk` and after @longbaby
         let result: Result<(), String> = async {
             std::fs::write(workspace.with_extension("outside.md"), "outside secret")
                 .map_err(|err| err.to_string())?;
-            std::fs::create_dir_all(workspace.join("memory/summaries/agent"))
+            std::fs::create_dir_all(workspace.join("memory/realtime/workspace-agent"))
+                .map_err(|err| err.to_string())?;
+            std::fs::create_dir_all(workspace.join("memory/events/workspace-agent"))
                 .map_err(|err| err.to_string())?;
             std::fs::write(
-                workspace.join("memory/manifest.json"),
-                r#"{
-  "items": [
-    {
-      "id": "summary_workspace",
-      "kind": "summary",
-      "scope_type": "agent",
-      "scope_id": "workspace-agent",
-      "title": "Workspace memory",
-      "path": "summaries/agent/summary_workspace.md",
-      "created_at": "2026-01-01T00:00:00+00:00",
-      "token_count": 8,
-      "source_ids": [],
-      "parent_ids": []
-    },
-    {
-      "id": "summary_escape",
-      "kind": "summary",
-      "scope_type": "agent",
-      "scope_id": "workspace-agent",
-      "title": "Escaped memory",
-      "path": "../outside.md",
-      "created_at": "2026-01-01T00:00:01+00:00",
-      "token_count": 8,
-      "source_ids": [],
-      "parent_ids": []
-    }
-  ]
-}
-"#,
+                workspace.join("memory/realtime/workspace-agent/000001.md"),
+                "## 2026-01-01T00:00:00Z · Workspace memory\n\nWorkspace-aware test agent.",
             )
             .map_err(|err| err.to_string())?;
             std::fs::write(
-                workspace.join("memory/summaries/agent/summary_workspace.md"),
-                "---\nid: summary_workspace\n---\n\nWorkspace-aware test agent.",
+                workspace.join("memory/events/workspace-agent/summary.md"),
+                "# Event Memory Summary\n\n## Workspace event\nSummary: Durable event memory is readable.",
             )
             .map_err(|err| err.to_string())?;
 
@@ -17750,16 +17700,6 @@ inline `@kunk` and after @longbaby
             let workspace_info = agent_context_workspace_info(&pool, &target_args).await?;
             assert!(workspace_info.contains("Lantor workspace for @workspace-agent"));
             assert!(workspace_info.contains("memory_exists=true"));
-            assert!(workspace_info.contains("manifest_exists=true"));
-
-            let memory_args = vec![
-                "memory-read".to_owned(),
-                "--target".to_owned(),
-                "@workspace-agent".to_owned(),
-            ];
-            let memory = agent_context_memory_read(&pool, &memory_args).await?;
-            assert!(memory.contains("Workspace-aware test agent"));
-            assert!(!memory.contains("outside secret"));
 
             let list_args = vec![
                 "workspace-list".to_owned(),
@@ -17770,12 +17710,88 @@ inline `@kunk` and after @longbaby
             ];
             let listing = agent_context_workspace_list(&pool, &list_args).await?;
             assert!(listing.contains("memory/"));
-            assert!(listing.contains("memory/manifest.json"));
+            assert!(listing.contains("memory/events/"));
             Ok(())
         }
         .await;
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_file(workspace.with_extension("outside.md"));
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn event_ingest_completion_validation_checks_inputs_and_summary() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("lantor-event-ingest-{}", Uuid::new_v4()));
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "ingest-agent").await?;
+            sqlx::query("update agents set working_directory = $2 where id = $1")
+                .bind(agent_id)
+                .bind(workspace.to_string_lossy().to_string())
+                .execute(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let input_rel = format!("realtime/{agent_id}/000001.md");
+            let input_path = workspace.join("memory").join(&input_rel);
+            std::fs::create_dir_all(input_path.parent().expect("input parent"))
+                .map_err(|err| err.to_string())?;
+            std::fs::write(&input_path, "## realtime item").map_err(|err| err.to_string())?;
+            let summary_path = workspace
+                .join("memory/events")
+                .join(agent_id.to_string())
+                .join("summary.md");
+            std::fs::create_dir_all(summary_path.parent().expect("summary parent"))
+                .map_err(|err| err.to_string())?;
+            std::fs::write(
+                &summary_path,
+                "# Event Memory Summary\n\nUse this format for each event:\n\nSummary: <merged concise event summary, preserving the event timeline and context>",
+            )
+            .map_err(|err| err.to_string())?;
+
+            let work_item_id: Uuid = sqlx::query_scalar(
+                r#"
+                insert into agent_work_items (agent_id, source_kind, title, context, status)
+                values ($1, 'event_ingest', 'Process memory event ingest job', $2, 'running')
+                returning id
+                "#,
+            )
+            .bind(agent_id)
+            .bind(format!(
+                "# Memory Event Ingest Task\n\n## Input Segments\n\n- {input_rel}"
+            ))
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            let input_still_present =
+                validate_event_ingest_work_item_done(&pool, agent_id, work_item_id).await?;
+            assert!(input_still_present
+                .expect("input still present")
+                .contains("input segment still exists"));
+
+            std::fs::remove_file(&input_path).map_err(|err| err.to_string())?;
+            let scaffold =
+                validate_event_ingest_work_item_done(&pool, agent_id, work_item_id).await?;
+            assert!(scaffold
+                .expect("summary scaffold")
+                .contains("summary scaffold unchanged"));
+
+            std::fs::write(
+                &summary_path,
+                "# Event Memory Summary\n\n## Real event\nSummary: Finished event ingest.",
+            )
+            .map_err(|err| err.to_string())?;
+            let ok = validate_event_ingest_work_item_done(&pool, agent_id, work_item_id).await?;
+            assert!(ok.is_none());
+            Ok(())
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&workspace);
         drop_test_schema(pool, schema).await;
         assert!(result.is_ok(), "{:?}", result.err());
     }
@@ -20612,6 +20628,63 @@ inline `@kunk` and after @longbaby
             Ok(())
         }
         .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn memory_run_summary_writes_realtime_segments() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("lantor-realtime-memory-{}", Uuid::new_v4()));
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "realtime-agent").await?;
+            sqlx::query("update agents set working_directory = $2 where id = $1")
+                .bind(agent_id)
+                .bind(workspace.to_string_lossy().to_string())
+                .execute(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            let run_id: Uuid = sqlx::query_scalar(
+                r#"
+                insert into agent_runs (agent_id, command, status)
+                values ($1, 'codex app-server', 'running')
+                returning id
+                "#,
+            )
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            handle_agent_event(
+                &pool,
+                agent_id,
+                run_id,
+                AgentEvent::MemoryRunSummary {
+                    title: Some("Turn note".to_owned()),
+                    body: "Decision: keep realtime entries short.".to_owned(),
+                    source_ids: Some(vec!["message:abc123".to_owned()]),
+                },
+            )
+            .await?;
+
+            let segment = workspace
+                .join("memory/realtime")
+                .join(agent_id.to_string())
+                .join("000001.md");
+            let memory = std::fs::read_to_string(segment).map_err(|err| err.to_string())?;
+            assert!(memory.contains("Turn note"));
+            assert!(memory.contains("Source:"));
+            assert!(memory.contains("message:abc123"));
+            assert!(memory.contains("Decision: keep realtime entries short."));
+            assert!(!workspace.join("memory/manifest.json").exists());
+            Ok(())
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&workspace);
         drop_test_schema(pool, schema).await;
         assert!(result.is_ok(), "{:?}", result.err());
     }
