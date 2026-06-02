@@ -2,9 +2,7 @@ use std::{fs, path::PathBuf};
 
 use uuid::Uuid;
 
-use crate::{text::compact_chars_middle, CommandResult};
-
-pub(crate) const AGENT_MEMORY_CONTEXT_LIMIT: usize = 8 * 1024;
+use crate::CommandResult;
 
 pub(crate) const WORK_ITEM_FINISH_PROMPT: &str = "Finish behavior: warm streaming runtimes should answer with normal assistant text; stdout command runtimes should use the visible reply event template from the turn context. Only update task status when this request is tied to an explicit task number.";
 
@@ -17,30 +15,23 @@ fn lantor_operating_policy_prompt() -> &'static str {
 - Keep visible replies high-density: final results, decisions, blockers, user questions, and handoffs. Put intermediate steps in activity events.
 - Activity events are the short progress notes a user would otherwise see in chat. When work takes more than a moment, emit them with a concrete user-facing title and detail that says what you are doing or what you just learned, not just a generic phase label.
 - Reminders are visible, cancelable future wakeups. Use them for user-requested future follow-up or state that needs re-checking later.
-- MEMORY.md is durable recovery context. Keep it concise, index-like, and useful after restart or context compaction; do not use it as a turn-by-turn journal."#
+- Lantor md memory is the durable recovery layer. Use `memory_run_summary` / `memory_summary` to write markdown-backed memory items; use memory search/read tools to recall prior context."#
 }
 
 fn lantor_memory_management_prompt() -> &'static str {
     r#"Workspace memory:
-- Your working directory is your persistent agent-owned workspace. Files there survive across turns and runtime restarts; use it for MEMORY.md, notes/, artifacts, code checkouts, and task-specific files.
-- Treat memory as readable files: MEMORY.md is the compact index, notes/<topic>.md holds detailed durable knowledge, artifacts/ holds deliverables, and raw conversation/tool logs should stay out of memory unless the user explicitly asks to preserve them.
-- Keep MEMORY.md structured and short: Role, Key Knowledge / Memory Map links, Active Context, and Memory Policy. It should tell a restarted agent what matters and where to look next, not replay past turns.
-- Put detailed durable knowledge in topic notes such as notes/user-preferences.md, notes/channels.md, notes/work-log.md, or domain-specific notes. Add or update a link from MEMORY.md when a note becomes important.
-- Context can be compressed or the runtime can restart. After reading MEMORY.md, you should be able to recover who you are, what stable facts matter, what current work is active, and which notes to inspect next.
+- Your working directory is your persistent agent-owned workspace. Files there survive across turns and runtime restarts; use it for artifacts, code checkouts, and Lantor-managed `memory/**/*.md` items.
+- Treat durable memory as file-backed md memory: each item is a markdown file with frontmatter, and `memory/manifest.json` is a rebuildable index cache rather than the source of truth.
+- Each useful run should emit `memory_run_summary`; broader compacted context should emit `memory_summary`. Lantor may compact multiple run summaries into summary items and track sources with `parent_ids`.
+- Codex should recall prior context by calling `lantor.memory_search` and `lantor.memory_read`; do not ask the user to repeat prior discussion before searching memory.
 - Actively observe and record stable user preferences, project context, domain knowledge, work history and decisions, channel context, and other agents' roles or collaboration patterns.
 - Do not memorize transient reasoning, every chat turn, raw logs, command transcripts, or one-off intermediate details. Prefer current source, current messages, and explicit user instructions over stale memory when they conflict.
-- Before long-running work, update Active Context with one compact resume point. After significant work finishes, clear or replace that resume point and update the relevant note or MEMORY.md index only if the information remains useful.
-- Use memory_append to stage chronological durable updates in notes/work-log.md. Use memory_compact when MEMORY.md becomes long, repetitive, timestamp-log-like, or poorly organized; the replacement must preserve the Role, Key Knowledge / Memory Map, Active Context, and Memory Policy structure.
 
 Memory operation procedure:
-1. On startup or after context loss, read the injected MEMORY.md first. Use memory-read or workspace-list only when you need details from notes/ or the injected excerpt is missing/stale.
-2. During work, keep raw evidence in the live context or artifacts, not in MEMORY.md. If a long tool result, transcript, or report must survive, save it as an artifact or note and put only the path plus a one-line reason in MEMORY.md.
-3. For a durable but not-yet-distilled update, emit memory_append with a compact fact, decision, preference, or handoff. Lantor writes it to notes/work-log.md and ensures MEMORY.md links to that work log.
-4. For cleaned long-term memory, emit memory_compact with the full replacement MEMORY.md. Distill from notes/work-log.md and current work into stable bullets; remove stale Active Context and duplicate dated entries.
-5. For Active Context, include only the current resume point: objective, files/commands that matter, status, blocker/next step. Clear it when the work is done.
-6. Use this summary shape when compacting active work: Goal, Constraints, Progress, Key Decisions, Critical Context, Next Steps. Keep each bullet directly reusable after restart.
-7. Split long-term knowledge by type: user preferences in notes/user-preferences.md, channel or collaboration facts in notes/channels.md, completed work summaries in notes/work-log.md, and project/domain notes in named topic files.
-8. Do not store secrets, full raw logs, speculative reasoning, every command output, or facts that are cheap to re-read from source. If unsure, prefer a short note path over copying content into MEMORY.md."#
+1. On startup or after context loss, use `lantor.memory_search` before relying on user recollection when prior discussion, files, blockers, or task state are relevant.
+2. At the end of meaningful work, emit `memory_run_summary` with a compact markdown summary of outcome, decisions, changed files, validation, and next steps.
+3. When condensing several memory items manually, emit `memory_summary` with `parent_ids` pointing at the covered items.
+4. Keep generated memory concise and reusable. Do not store secrets, full raw logs, speculative reasoning, every command output, or facts that are cheap to re-read from source."#
 }
 
 fn lantor_context_tools_prompt() -> &'static str {
@@ -70,7 +61,10 @@ fn lantor_dynamic_tools_prompt() -> &'static str {
 - Codex runtimes may have these app-server dynamic tools pre-registered at thread/start. They are direct tool calls, not deferred tools discovered through `tool_search`.
 - `lantor.search_tools`: list the available Lantor Codex tools. It returns tool ids, descriptions, schemas, side effects, display hints, and examples for `lantor.call_tool`; use the returned list to decide which tool fits the request.
 - `lantor.call_tool`: execute a Lantor Codex tool by `tool_id` with structured `arguments`.
-- Prefer `lantor.search_tools` followed by `lantor.call_tool` for Lantor Codex tools. Do not call Codex `tool_search` first for these names; `tool_search` searches Codex deferred tools and will not list Lantor dynamic tools."#
+- `lantor.memory_search`: search this agent's file-backed markdown memory and return candidate ids/snippets.
+- `lantor.memory_read`: read one markdown memory item by id.
+- Prefer `lantor.search_tools` followed by `lantor.call_tool` for Lantor Codex tools. Do not call Codex `tool_search` first for these names; `tool_search` searches Codex deferred tools and will not list Lantor dynamic tools.
+- Use `lantor.memory_search` / `lantor.memory_read` yourself when the user refers to prior discussion, earlier decisions, "上面", "之前", "继续", "这个方案", files, blockers, or task state that may not be fully present in the current prompt. Do not ask the user to repeat context before searching memory."#
 }
 
 fn lantor_turn_startup_sequence_prompt() -> &'static str {
@@ -101,8 +95,10 @@ fn lantor_control_api_prompt() -> &'static str {
     r#"Standalone LANTOR_EVENT control lines:
 LANTOR_EVENT {"type":"activity","kind":"thinking|command|file_edit|tools|acting","title":"<short user-facing status>","detail":"<optional compact detail>"}
 LANTOR_EVENT {"type":"usage","input_tokens":1234,"output_tokens":567,"cost_usd":0.0123}
-LANTOR_EVENT {"type":"memory_append","body":"<durable update staged in notes/work-log.md>"}
-LANTOR_EVENT {"type":"memory_compact","body":"<full compact MEMORY.md replacement with Role, Key Knowledge / Memory Map, Active Context, and Memory Policy>"}
+LANTOR_EVENT {"type":"memory_run_summary","title":"<short title>","body":"<markdown run summary>","source_ids":["<optional source ref>"]}
+LANTOR_EVENT {"type":"memory_summary","title":"<short title>","body":"<markdown compacted summary>","scope_type":"thread|task|channel|agent","scope_id":"<optional scope id>","parent_ids":["<memory item id>"],"source_ids":["<optional source ref>"]}
+LANTOR_EVENT {"type":"memory_rebuild_manifest"}
+LANTOR_EVENT {"type":"memory_compact_runs","scope_type":"<optional thread|task|channel|agent>","scope_id":"<optional scope id>","min_runs":8,"keep_recent":2}
 LANTOR_EVENT {"type":"profile_update","display_name":"<optional>","role":"<optional concise role>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional capability summary>"}
 LANTOR_EVENT {"type":"owner_profile_update","display_name":"<optional>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional>"}
 LANTOR_EVENT {"type":"reminder_create","when":"<ISO8601 timestamp>","title":"<title>","note":"<optional note>","recurrence":"none|daily|weekly|every:20m"}
@@ -247,33 +243,6 @@ pub(crate) fn build_streaming_work_item_prompt(
     )
 }
 
-pub(crate) fn load_agent_memory_context(working_directory: &str) -> CommandResult<Option<String>> {
-    let working_directory = working_directory.trim();
-    if working_directory.is_empty() {
-        return Ok(None);
-    }
-    let memory_path = PathBuf::from(working_directory).join("MEMORY.md");
-    if !memory_path.exists() {
-        return Ok(None);
-    }
-    let metadata = fs::metadata(&memory_path).map_err(|err| err.to_string())?;
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-    let memory = fs::read_to_string(&memory_path).map_err(|err| err.to_string())?;
-    let memory = memory.trim();
-    if memory.is_empty() {
-        Ok(None)
-    } else {
-        let memory = compact_chars_middle(memory, AGENT_MEMORY_CONTEXT_LIMIT);
-        Ok(Some(format!(
-            "Persistent agent memory from {}:\n{}\n\nUse this as durable context for this workspace, but prefer the current user request when there is a conflict.",
-            memory_path.display(),
-            memory
-        )))
-    }
-}
-
 pub(crate) fn ensure_agent_workspace(working_directory: &str, handle: &str) -> CommandResult<()> {
     let working_directory = working_directory.trim();
     if working_directory.is_empty() {
@@ -283,26 +252,8 @@ pub(crate) fn ensure_agent_workspace(working_directory: &str, handle: &str) -> C
     fs::create_dir_all(&workspace).map_err(|err| err.to_string())?;
     let notes = workspace.join("notes");
     fs::create_dir_all(&notes).map_err(|err| err.to_string())?;
-    let memory_path = workspace.join("MEMORY.md");
-    if memory_path.exists() {
-        return Ok(());
-    }
-    let template = format!(
-        "# @{handle}\n\n## Role\nLantor agent.\n\n## Key Knowledge\n- Add stable facts and links that help a restarted agent recover quickly.\n\n## Memory Map\n- `notes/user-preferences.md` - stable user preferences.\n- `notes/channels.md` - durable channel or collaboration context.\n- `notes/work-log.md` - chronological durable updates staged by memory_append; periodically distill into this index.\n\n## Active Context\n- Currently working on: none.\n- Last interaction: workspace initialized.\n\n## Memory Policy\n- Keep this file concise and index-like. Put detailed durable knowledge in `notes/` and link it above.\n- Record stable user preferences, project context, domain knowledge, work history, channel context, and collaboration patterns.\n- Do not use MEMORY.md as a chronological log. Avoid raw transcripts, command output, transient reasoning, and one-off intermediate details.\n- Before long-running work, replace Active Context with one compact resume point covering Goal, Constraints, Progress, Key Decisions, Critical Context, and Next Steps when those fields matter.\n- After significant work finishes, clear or update Active Context and update this index only if needed.\n- Use `memory_append` for staged durable updates in `notes/work-log.md`; use `memory_compact` to rewrite this file into a clean recovery index.\n",
-    );
-    fs::write(memory_path, template).map_err(|err| err.to_string())?;
+    let _ = handle;
     Ok(())
-}
-
-pub(crate) fn prepend_memory_context(prompt: String, memory_context: Option<&str>) -> String {
-    let Some(memory_context) = memory_context else {
-        return prompt;
-    };
-    if prompt.trim().is_empty() {
-        memory_context.to_owned()
-    } else {
-        format!("{memory_context}\n\n{prompt}")
-    }
 }
 
 fn build_runtime_standing_prompt(
@@ -315,7 +266,7 @@ fn build_runtime_standing_prompt(
          You collaborate with one local human through channels, threads, tasks, and DMs.\n\
          {transport_note}\n\
          Lantor keeps one warm runtime session per agent so previous turns remain in provider context; channel and thread are delivered as message envelope fields, not as separate runtime sessions.\n\
-         Each wake turn may contain a compact inbox processing prompt instead of a full request. Handle the default inbox item directly from that prompt when it has enough detail; use inbox-read only for missing source details, and inbox-list only when you need to choose among multiple active items. Current work-item inbox items are archived automatically when the work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear. Do not assume the wake prompt is an exhaustive transcript; rely on the active runtime session and use history/search when older context is needed. Use workspace-info, workspace-list, and memory-read when you need to recover your current Lantor workspace or inspect durable MEMORY.md beyond the injected prompt excerpt.\n\
+         Each wake turn may contain a compact inbox processing prompt instead of a full request. Handle the default inbox item directly from that prompt when it has enough detail; use inbox-read only for missing source details, and inbox-list only when you need to choose among multiple active items. Current work-item inbox items are archived automatically when the work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear. Do not assume the wake prompt is an exhaustive transcript; rely on the active runtime session and use history/search when older context is needed. Use workspace-info, workspace-list, and memory-read when you need to recover your current Lantor md memory beyond the injected prompt excerpt.\n\
          \n\
          {}\n\
          \n\

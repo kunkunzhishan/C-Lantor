@@ -10,6 +10,7 @@ mod events;
 mod inbox;
 mod launch_agent;
 mod long_task;
+mod md_memory;
 mod models;
 mod prompts;
 mod publish_guard;
@@ -96,13 +97,13 @@ use models::{
     LaunchAgentStatus, Message, MessageAttachment, OwnerProfile, Reminder, RuntimeCheck,
     SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity, TodoItem,
 };
+#[cfg(test)]
+use prompts::WORK_ITEM_FINISH_PROMPT;
 use prompts::{
     build_claude_streaming_prompt, build_codex_streaming_prompt, build_streaming_work_item_prompt,
     build_work_item_prompt, claude_system_prompt, codex_developer_instructions,
-    ensure_agent_workspace, load_agent_memory_context, prepend_memory_context,
+    ensure_agent_workspace,
 };
-#[cfg(test)]
-use prompts::{AGENT_MEMORY_CONTEXT_LIMIT, WORK_ITEM_FINISH_PROMPT};
 use publish_guard::{
     bump_thread_version, can_publish_public_output, control_action_kind_for_event_type,
     hold_streaming_public_output, hold_visible_control_event, output_buffer_exists,
@@ -6561,7 +6562,7 @@ fn load_agent_workspace_summary(working_directory: &str) -> AgentWorkspaceSummar
     }
 
     let workspace = PathBuf::from(working_directory);
-    let memory_path = workspace.join("MEMORY.md");
+    let memory_path = workspace.join("memory");
     let memory_path_string = memory_path.to_string_lossy().to_string();
     let exists = workspace.is_dir();
     let memory_exists = memory_path.is_file();
@@ -8023,156 +8024,6 @@ fn parse_activity_metadata(detail: &str) -> Value {
     Value::Object(metadata)
 }
 
-fn memory_path_for_workspace(working_directory: &str) -> CommandResult<PathBuf> {
-    let working_directory = working_directory.trim();
-    if working_directory.is_empty() {
-        return Err("agent working_directory is not configured".to_owned());
-    }
-    let workspace = PathBuf::from(working_directory);
-    fs::create_dir_all(&workspace).map_err(to_string)?;
-    Ok(workspace.join("MEMORY.md"))
-}
-
-async fn agent_memory_path(pool: &SqlitePool, agent_id: Uuid) -> CommandResult<PathBuf> {
-    let row = sqlx::query("select handle, working_directory from agents where id = $1")
-        .bind(agent_id)
-        .fetch_one(pool)
-        .await
-        .map_err(to_string)?;
-    let handle: String = row.get("handle");
-    let working_directory: String = row.get("working_directory");
-    ensure_agent_workspace(working_directory.trim(), &handle)?;
-    memory_path_for_workspace(&working_directory)
-}
-
-#[cfg(test)]
-fn format_memory_index_entry(body: &str) -> String {
-    let body = body.trim();
-    let body = body
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let body = body
-        .strip_prefix("- ")
-        .or_else(|| body.strip_prefix("* "))
-        .unwrap_or(&body)
-        .trim();
-    let mut lines = body.lines();
-    let first = lines.next().unwrap_or("").trim();
-    let mut entry = format!("- {first}");
-    for line in lines {
-        let line = line.trim();
-        if !line.is_empty() {
-            entry.push_str("\n  ");
-            entry.push_str(line);
-        }
-    }
-    entry
-}
-
-fn insert_memory_index_entry(memory: &str, entry: &str) -> String {
-    let memory = memory.trim_end();
-    let entry = entry.trim();
-    if memory
-        .lines()
-        .any(|line| line.trim() == entry || line.trim() == entry.trim_start_matches("- ").trim())
-    {
-        return format!("{memory}\n");
-    }
-
-    let section_start = memory
-        .find("\n## Key Knowledge")
-        .or_else(|| memory.starts_with("## Key Knowledge").then_some(0));
-    let Some(section_start) = section_start else {
-        return format!("{memory}\n\n## Key Knowledge\n{entry}\n");
-    };
-
-    let content_start = if section_start == 0 {
-        "## Key Knowledge".len()
-    } else {
-        section_start + "\n## Key Knowledge".len()
-    };
-    let section_end = memory[content_start..]
-        .find("\n## ")
-        .map(|offset| content_start + offset)
-        .unwrap_or(memory.len());
-    let section = &memory[content_start..section_end];
-
-    let placeholder = section
-        .trim()
-        .lines()
-        .all(|line| line.trim().is_empty() || line.trim_start().starts_with("- Add "));
-
-    let mut updated = String::new();
-    updated.push_str(&memory[..content_start]);
-    updated.push('\n');
-    if !placeholder {
-        let existing = section.trim();
-        if !existing.is_empty() {
-            updated.push_str(existing);
-            updated.push('\n');
-        }
-    }
-    updated.push_str(entry);
-    updated.push('\n');
-    updated.push_str(memory[section_end..].trim_start_matches('\n'));
-    updated.push('\n');
-    updated
-}
-
-async fn append_agent_memory(pool: &SqlitePool, agent_id: Uuid, body: &str) -> CommandResult<()> {
-    let body = body.trim();
-    if body.is_empty() {
-        return Err("memory_append body is empty".to_owned());
-    }
-    let path = agent_memory_path(pool, agent_id).await?;
-    let workspace = path
-        .parent()
-        .ok_or_else(|| "agent memory path has no parent".to_owned())?;
-    let notes_dir = workspace.join("notes");
-    fs::create_dir_all(&notes_dir).map_err(to_string)?;
-
-    let memory = fs::read_to_string(&path).unwrap_or_default();
-    if !memory.contains("notes/work-log.md") {
-        let index_entry = "- `notes/work-log.md`: chronological durable updates staged by `memory_append`; keep `MEMORY.md` as the compact recovery index.";
-        fs::write(&path, insert_memory_index_entry(&memory, index_entry)).map_err(to_string)?;
-    }
-
-    let note_path = notes_dir.join("work-log.md");
-    if !note_path.exists() {
-        fs::write(
-            &note_path,
-            "# Work Log\n\nChronological durable updates staged by `memory_append`. Promote only stable, reusable facts into `MEMORY.md` with `memory_compact`.\n",
-        )
-        .map_err(to_string)?;
-    }
-    let entry = format!(
-        "\n\n## Memory update {}\n{}\n",
-        Utc::now().to_rfc3339(),
-        body
-    );
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(note_path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, entry.as_bytes()))
-        .map_err(to_string)
-}
-
-async fn compact_agent_memory(pool: &SqlitePool, agent_id: Uuid, body: &str) -> CommandResult<()> {
-    let body = body.trim();
-    if body.is_empty() {
-        return Err("memory_compact body is empty".to_owned());
-    }
-    let path = agent_memory_path(pool, agent_id).await?;
-    if path.exists() {
-        let backup = path.with_extension(format!("md.bak-{}", Utc::now().format("%Y%m%d%H%M%S")));
-        let _ = fs::copy(&path, backup);
-    }
-    fs::write(path, format!("{body}\n")).map_err(to_string)
-}
-
 pub(crate) async fn create_channel_in_pool(
     pool: &SqlitePool,
     name: &str,
@@ -9517,31 +9368,135 @@ async fn handle_agent_event(
             .await?;
             Ok("usage accepted".to_owned())
         }
-        AgentEvent::MemoryAppend { body } => {
-            append_agent_memory(pool, agent_id, &body).await?;
+        AgentEvent::MemoryRunSummary {
+            title,
+            body,
+            source_ids,
+        } => {
+            let memory_id = md_memory::append_run_summary(
+                pool,
+                agent_id,
+                run_id,
+                title.as_deref(),
+                &body,
+                &source_ids.unwrap_or_default(),
+            )
+            .await?;
             record_agent_activity(
                 pool,
                 Some(agent_id),
                 Some(run_id),
                 "memory",
-                "Memory updated",
-                json!({ "operation": "append" }).to_string(),
+                "Run summary saved",
+                json!({ "operation": "run_summary", "memory_id": memory_id }).to_string(),
             )
             .await?;
-            Ok("memory appended".to_owned())
+            let compacted =
+                md_memory::compact_ready_runs(pool, agent_id, run_id, None, None, 8, 2).await?;
+            if let Some(result) = compacted {
+                record_agent_activity(
+                    pool,
+                    Some(agent_id),
+                    Some(run_id),
+                    "memory",
+                    "Run summaries compacted",
+                    json!({
+                        "operation": "compact_runs",
+                        "memory_id": result.memory_id,
+                        "parent_ids": result.parent_ids,
+                        "scope_type": result.scope_type,
+                        "scope_id": result.scope_id
+                    })
+                    .to_string(),
+                )
+                .await?;
+            }
+            Ok("memory run summary saved".to_owned())
         }
-        AgentEvent::MemoryCompact { body } => {
-            compact_agent_memory(pool, agent_id, &body).await?;
+        AgentEvent::MemorySummary {
+            title,
+            body,
+            scope_type,
+            scope_id,
+            parent_ids,
+            source_ids,
+        } => {
+            let memory_id = md_memory::append_summary(
+                pool,
+                agent_id,
+                run_id,
+                title.as_deref(),
+                &body,
+                scope_type.as_deref(),
+                scope_id.as_deref(),
+                &parent_ids.unwrap_or_default(),
+                &source_ids.unwrap_or_default(),
+            )
+            .await?;
             record_agent_activity(
                 pool,
                 Some(agent_id),
                 Some(run_id),
                 "memory",
-                "Memory compacted",
-                json!({ "operation": "compact" }).to_string(),
+                "Memory summary saved",
+                json!({ "operation": "summary", "memory_id": memory_id }).to_string(),
             )
             .await?;
-            Ok("memory compacted".to_owned())
+            Ok("memory summary saved".to_owned())
+        }
+        AgentEvent::MemoryRebuildManifest => {
+            let rebuilt = md_memory::rebuild_manifest(pool, agent_id).await?;
+            record_agent_activity(
+                pool,
+                Some(agent_id),
+                Some(run_id),
+                "memory",
+                "Memory manifest rebuilt",
+                json!({ "operation": "rebuild_manifest", "items": rebuilt }).to_string(),
+            )
+            .await?;
+            Ok(format!("memory manifest rebuilt: {rebuilt} item(s)"))
+        }
+        AgentEvent::MemoryCompactRuns {
+            scope_type,
+            scope_id,
+            min_runs,
+            keep_recent,
+        } => {
+            let compacted = md_memory::compact_ready_runs(
+                pool,
+                agent_id,
+                run_id,
+                scope_type.as_deref(),
+                scope_id.as_deref(),
+                min_runs.unwrap_or(3),
+                keep_recent.unwrap_or(1),
+            )
+            .await?;
+            if let Some(result) = compacted {
+                record_agent_activity(
+                    pool,
+                    Some(agent_id),
+                    Some(run_id),
+                    "memory",
+                    "Run summaries compacted",
+                    json!({
+                        "operation": "compact_runs",
+                        "memory_id": result.memory_id,
+                        "parent_ids": result.parent_ids,
+                        "scope_type": result.scope_type,
+                        "scope_id": result.scope_id
+                    })
+                    .to_string(),
+                )
+                .await?;
+                Ok(format!(
+                    "memory run summaries compacted: {}",
+                    result.memory_id
+                ))
+            } else {
+                Ok("memory run summaries not compacted: below threshold".to_owned())
+            }
         }
         AgentEvent::ChannelCreate {
             name,
@@ -12150,6 +12105,32 @@ async fn handle_codex_dynamic_tool_call(
                     Err(error) => error,
                 }
             }
+            codex_dynamic_tools::MEMORY_SEARCH => {
+                match md_memory::search(pool, agent_id, arguments).await {
+                    Ok(data) => codex_dynamic_tools::DynamicToolResult {
+                        success: true,
+                        text: "Memory search completed.".to_owned(),
+                        structured_content: json!({ "success": true, "data": data }),
+                    },
+                    Err(err) => codex_dynamic_tools::DynamicToolResult::error(
+                        err,
+                        json!({ "error": "memory_search_failed" }),
+                    ),
+                }
+            }
+            codex_dynamic_tools::MEMORY_READ => {
+                match md_memory::read(pool, agent_id, arguments).await {
+                    Ok(data) => codex_dynamic_tools::DynamicToolResult {
+                        success: true,
+                        text: "Memory item loaded.".to_owned(),
+                        structured_content: json!({ "success": true, "data": data }),
+                    },
+                    Err(err) => codex_dynamic_tools::DynamicToolResult::error(
+                        err,
+                        json!({ "error": "memory_read_failed" }),
+                    ),
+                }
+            }
             _ => codex_dynamic_tools::DynamicToolResult::error(
                 format!("Unknown Lantor dynamic tool: {tool}"),
                 json!({ "error": "unknown_tool", "tool": tool }),
@@ -14754,21 +14735,7 @@ async fn supervisor_start_agent(
     let avatar: Option<String> = row.get("avatar");
     let is_warm_streaming_runtime =
         runtime.eq_ignore_ascii_case("codex") || runtime.eq_ignore_ascii_case("claude");
-    let memory_context = match load_agent_memory_context(&working_directory) {
-        Ok(memory_context) => memory_context,
-        Err(err) => {
-            record_agent_activity(
-                pool,
-                Some(agent_id),
-                None,
-                "profile",
-                "Memory context skipped",
-                err,
-            )
-            .await?;
-            None
-        }
-    };
+    let memory_context: Option<String> = None;
     let work_item_prompt = match work_item_id {
         Some(work_item_id) => {
             let row = sqlx::query(
@@ -14815,7 +14782,7 @@ async fn supervisor_start_agent(
                 .is_none()
                 .then(|| {
                     format!(
-                        "Your agent profile currently has no avatar. If your handle or MEMORY.md gives you a stable identity, you may emit one standalone LANTOR_EVENT profile_update with an avatar like `dicebear:dylan:{handle}`. Keep handling the user's request normally and do not send visible chat only for avatar setup."
+                        "Your agent profile currently has no avatar. If your handle or md memory gives you a stable identity, you may emit one standalone LANTOR_EVENT profile_update with an avatar like `dicebear:dylan:{handle}`. Keep handling the user's request normally and do not send visible chat only for avatar setup."
                     )
                 });
             if is_warm_streaming_runtime {
@@ -14876,7 +14843,6 @@ async fn supervisor_start_agent(
         )
         .await;
     }
-    let work_item_prompt = prepend_memory_context(work_item_prompt, memory_context.as_deref());
     let command_text = effective_launch_command(launch_command, runtime, model, handle.clone());
     let initial_log = if work_item_prompt.is_empty() {
         format!("$ {command_text}\n")
@@ -16853,10 +16819,9 @@ mod tests {
         dispatch_streaming_agent_message_mentions, ensure_agent_workspace,
         ensure_streaming_agent_message, extract_agent_event_json, extract_agent_mentions,
         finish_streaming_agent_message, finish_streaming_agent_message_deferred_mentions,
-        format_memory_index_entry, forward_task_in_pool, handle_agent_event,
-        handle_codex_warm_stdout_line, handle_streaming_agent_event_json, inbox_wake_context,
-        insert_agent_message, insert_memory_index_entry, load_agent_activities,
-        load_agent_memory_context, load_channel_agent_roster, load_channels, load_messages,
+        forward_task_in_pool, handle_agent_event, handle_codex_warm_stdout_line,
+        handle_streaming_agent_event_json, inbox_wake_context, insert_agent_message,
+        load_agent_activities, load_channel_agent_roster, load_channels, load_messages,
         load_reminders, load_runtime_thread_id, load_thread_activities,
         mark_all_owner_inbox_read_in_pool, mark_inbox_items_read_in_pool,
         maybe_hide_silent_streaming_reply, migrate, normalize_open_link_target,
@@ -16874,7 +16839,7 @@ mod tests {
         AgentAttachmentFile, AgentEvent, AgentInboxItemInput, AgentMessageControlDemuxState,
         ClaudeActiveTurn, ClaudeSurface, CodexActiveTurn, CodexActiveTurnScheduleState,
         InboxWakeItem, InboxWakeSummary, MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState,
-        WarmCodexRegistry, WarmCodexRuntime, WarmCodexState, AGENT_MEMORY_CONTEXT_LIMIT,
+        WarmCodexRegistry, WarmCodexRuntime, WarmCodexState,
         CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS, CODEX_TURN_START_TIMEOUT,
         STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER, UI_REFRESH_METRICS_MAX_BYTES,
         WORK_ITEM_FINISH_PROMPT,
@@ -17072,27 +17037,6 @@ inline `@kunk` and after @longbaby
     }
 
     #[test]
-    fn memory_context_is_bounded_and_preserves_tail() {
-        let dir = std::env::temp_dir().join(format!("lantor-memory-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp memory dir");
-        let memory_path = dir.join("MEMORY.md");
-        let memory = format!(
-            "# Agent\n\n{}\n\n## Active Context\nimportant tail survives",
-            "context ".repeat(AGENT_MEMORY_CONTEXT_LIMIT)
-        );
-        std::fs::write(&memory_path, memory).expect("write memory");
-
-        let context =
-            load_agent_memory_context(dir.to_str().expect("utf8 temp dir")).expect("load memory");
-        std::fs::remove_dir_all(&dir).ok();
-
-        let context = context.expect("memory should load");
-        assert!(context.contains("Lantor omitted"));
-        assert!(context.contains("important tail survives"));
-        assert!(context.chars().count() < AGENT_MEMORY_CONTEXT_LIMIT + 1_000);
-    }
-
-    #[test]
     fn runtime_standing_prompt_carries_memory_once() {
         let prompt =
             claude_system_prompt("tester", Some("Persistent memory: prefer concise replies"));
@@ -17100,13 +17044,11 @@ inline `@kunk` and after @longbaby
         assert!(prompt.contains("channel and thread are delivered as message envelope fields"));
         assert!(prompt.contains("Treat messages as conversation"));
         assert!(prompt.contains("Activity events are the short progress notes"));
-        assert!(prompt.contains("MEMORY.md is the compact index"));
-        assert!(prompt.contains("raw conversation/tool logs should stay out of memory"));
-        assert!(prompt.contains("notes/<topic>.md"));
-        assert!(prompt.contains("not replay past turns"));
-        assert!(prompt.contains("timestamp-log-like"));
+        assert!(prompt.contains("Lantor md memory is the durable recovery layer"));
+        assert!(prompt.contains("memory/manifest.json"));
+        assert!(prompt.contains("memory_run_summary"));
+        assert!(prompt.contains("lantor.memory_search"));
         assert!(prompt.contains("stable user preferences"));
-        assert!(prompt.contains("Before long-running work, update Active Context"));
         assert!(prompt.contains("Turn startup sequence:"));
         assert!(
             prompt.contains("Use history-read or message-search when older channel/thread context")
@@ -17128,40 +17070,16 @@ inline `@kunk` and after @longbaby
     }
 
     #[test]
-    fn ensure_agent_workspace_creates_index_memory_template_and_notes_dir() {
+    fn ensure_agent_workspace_creates_workspace_and_notes_dir_without_legacy_memory_template() {
         let dir = std::env::temp_dir().join(format!("lantor-memory-template-{}", Uuid::new_v4()));
         ensure_agent_workspace(dir.to_str().expect("utf8 temp dir"), "template-agent")
             .expect("ensure workspace");
 
-        let memory = std::fs::read_to_string(dir.join("MEMORY.md")).expect("read memory");
+        assert!(dir.is_dir());
         assert!(dir.join("notes").is_dir());
-        assert!(memory.contains("# @template-agent"));
-        assert!(memory.contains("## Key Knowledge"));
-        assert!(memory.contains("## Memory Map"));
-        assert!(memory.contains("notes/user-preferences.md"));
-        assert!(memory.contains("notes/work-log.md"));
-        assert!(memory.contains("## Active Context"));
-        assert!(memory.contains("Keep this file concise and index-like"));
-        assert!(memory.contains("Do not use MEMORY.md as a chronological log"));
+        assert!(!dir.join("MEMORY.md").exists());
 
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn memory_append_can_add_work_log_link_without_timestamp_log() {
-        let memory = "# @agent\n\n## Role\nLantor agent.\n\n## Key Knowledge\n- Add stable facts and links that help a restarted agent recover quickly.\n\n## Active Context\n- Currently working on: none.";
-
-        let updated = insert_memory_index_entry(
-            memory,
-            &format_memory_index_entry("`notes/work-log.md` - staged durable updates."),
-        );
-
-        assert!(
-            updated.contains("## Key Knowledge\n- `notes/work-log.md` - staged durable updates.")
-        );
-        assert!(updated.contains("\n## Active Context"));
-        assert!(!updated.contains("Memory update"));
-        assert!(!updated.contains("Add stable facts and links"));
     }
 
     #[test]
@@ -17773,14 +17691,48 @@ inline `@kunk` and after @longbaby
         let workspace =
             std::env::temp_dir().join(format!("lantor-workspace-tool-{}", Uuid::new_v4()));
         let result: Result<(), String> = async {
-            std::fs::create_dir_all(workspace.join("notes")).map_err(|err| err.to_string())?;
+            std::fs::write(workspace.with_extension("outside.md"), "outside secret")
+                .map_err(|err| err.to_string())?;
+            std::fs::create_dir_all(workspace.join("memory/summaries/agent"))
+                .map_err(|err| err.to_string())?;
             std::fs::write(
-                workspace.join("MEMORY.md"),
-                "# @workspace-agent\n\n## Role\nWorkspace-aware test agent.\n",
+                workspace.join("memory/manifest.json"),
+                r#"{
+  "items": [
+    {
+      "id": "summary_workspace",
+      "kind": "summary",
+      "scope_type": "agent",
+      "scope_id": "workspace-agent",
+      "title": "Workspace memory",
+      "path": "summaries/agent/summary_workspace.md",
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "token_count": 8,
+      "source_ids": [],
+      "parent_ids": []
+    },
+    {
+      "id": "summary_escape",
+      "kind": "summary",
+      "scope_type": "agent",
+      "scope_id": "workspace-agent",
+      "title": "Escaped memory",
+      "path": "../outside.md",
+      "created_at": "2026-01-01T00:00:01+00:00",
+      "token_count": 8,
+      "source_ids": [],
+      "parent_ids": []
+    }
+  ]
+}
+"#,
             )
             .map_err(|err| err.to_string())?;
-            std::fs::write(workspace.join("notes").join("handoff.md"), "handoff note")
-                .map_err(|err| err.to_string())?;
+            std::fs::write(
+                workspace.join("memory/summaries/agent/summary_workspace.md"),
+                "---\nid: summary_workspace\n---\n\nWorkspace-aware test agent.",
+            )
+            .map_err(|err| err.to_string())?;
 
             let agent_id = insert_test_agent(&pool, "workspace-agent").await?;
             sqlx::query("update agents set working_directory = $2 where id = $1")
@@ -17798,7 +17750,7 @@ inline `@kunk` and after @longbaby
             let workspace_info = agent_context_workspace_info(&pool, &target_args).await?;
             assert!(workspace_info.contains("Lantor workspace for @workspace-agent"));
             assert!(workspace_info.contains("memory_exists=true"));
-            assert!(workspace_info.contains("MEMORY.md"));
+            assert!(workspace_info.contains("manifest_exists=true"));
 
             let memory_args = vec![
                 "memory-read".to_owned(),
@@ -17807,6 +17759,7 @@ inline `@kunk` and after @longbaby
             ];
             let memory = agent_context_memory_read(&pool, &memory_args).await?;
             assert!(memory.contains("Workspace-aware test agent"));
+            assert!(!memory.contains("outside secret"));
 
             let list_args = vec![
                 "workspace-list".to_owned(),
@@ -17816,12 +17769,13 @@ inline `@kunk` and after @longbaby
                 "2".to_owned(),
             ];
             let listing = agent_context_workspace_list(&pool, &list_args).await?;
-            assert!(listing.contains("notes/"));
-            assert!(listing.contains("notes/handoff.md"));
+            assert!(listing.contains("memory/"));
+            assert!(listing.contains("memory/manifest.json"));
             Ok(())
         }
         .await;
         let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_file(workspace.with_extension("outside.md"));
         drop_test_schema(pool, schema).await;
         assert!(result.is_ok(), "{:?}", result.err());
     }
@@ -19223,14 +19177,14 @@ inline `@kunk` and after @longbaby
     #[test]
     fn consumes_newline_delimited_adjacent_control_events() {
         let (visible, events) = split_streaming_agent_event_lines(
-            "LANTOR_EVENT {\"type\":\"activity\",\"title\":\"one\"}\nLANTOR_EVENT {\"type\":\"memory_append\",\"body\":\"two\"}\nVisible reply",
+            "LANTOR_EVENT {\"type\":\"activity\",\"title\":\"one\"}\nLANTOR_EVENT {\"type\":\"memory_run_summary\",\"body\":\"two\"}\nVisible reply",
         );
 
         assert_eq!(
             events,
             vec![
                 r#"{"type":"activity","title":"one"}"#,
-                r#"{"type":"memory_append","body":"two"}"#
+                r#"{"type":"memory_run_summary","body":"two"}"#
             ]
         );
         assert_eq!(visible, "Visible reply");
@@ -19239,26 +19193,26 @@ inline `@kunk` and after @longbaby
     #[test]
     fn preserves_adjacent_control_event_without_line_boundary_after_consumed_event() {
         let (visible, events) = split_streaming_agent_event_lines(
-            "LANTOR_EVENT {\"type\":\"activity\",\"title\":\"one\"}LANTOR_EVENT {\"type\":\"memory_append\",\"body\":\"two\"}",
+            "LANTOR_EVENT {\"type\":\"activity\",\"title\":\"one\"}LANTOR_EVENT {\"type\":\"memory_run_summary\",\"body\":\"two\"}",
         );
 
         assert_eq!(events, vec![r#"{"type":"activity","title":"one"}"#]);
         assert_eq!(
             visible,
-            "LANTOR_EVENT {\"type\":\"memory_append\",\"body\":\"two\"}"
+            "LANTOR_EVENT {\"type\":\"memory_run_summary\",\"body\":\"two\"}"
         );
     }
 
     #[test]
     fn preserves_inline_streaming_control_events_without_newlines() {
         let (visible, events) = split_streaming_agent_event_lines(
-            r#"Working patch.LANTOR_EVENT {"type":"activity","title":"Step","detail":"one"}LANTOR_EVENT {"type":"memory_append","body":"saved"}  Final result"#,
+            r#"Working patch.LANTOR_EVENT {"type":"activity","title":"Step","detail":"one"}LANTOR_EVENT {"type":"memory_run_summary","body":"saved"}  Final result"#,
         );
 
         assert!(events.is_empty());
         assert_eq!(
             visible,
-            r#"Working patch.LANTOR_EVENT {"type":"activity","title":"Step","detail":"one"}LANTOR_EVENT {"type":"memory_append","body":"saved"}  Final result"#
+            r#"Working patch.LANTOR_EVENT {"type":"activity","title":"Step","detail":"one"}LANTOR_EVENT {"type":"memory_run_summary","body":"saved"}  Final result"#
         );
     }
 
@@ -20655,69 +20609,6 @@ inline `@kunk` and after @longbaby
             assert_eq!(row.get::<i64, _>("input_tokens"), 1000);
             assert_eq!(row.get::<i64, _>("output_tokens"), 200);
             assert_eq!(row.get::<i64, _>("cost_micros"), 1234);
-            Ok(())
-        }
-        .await;
-        drop_test_schema(pool, schema).await;
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[tokio::test]
-    async fn memory_events_append_and_compact_memory_file() {
-        let Some((pool, schema)) = test_pool().await else {
-            return;
-        };
-        let result: Result<(), String> = async {
-            let agent_id = insert_test_agent(&pool, "memory-agent").await?;
-            let run_id: Uuid = sqlx::query_scalar(
-                r#"
-                insert into agent_runs (agent_id, command, status)
-                values ($1, 'codex app-server', 'running')
-                returning id
-                "#,
-            )
-            .bind(agent_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(|err| err.to_string())?;
-            let dir = std::env::temp_dir().join(format!("lantor-memory-write-{}", Uuid::new_v4()));
-            sqlx::query("update agents set working_directory = $2 where id = $1")
-                .bind(agent_id)
-                .bind(dir.to_string_lossy().to_string())
-                .execute(&pool)
-                .await
-                .map_err(|err| err.to_string())?;
-            handle_agent_event(
-                &pool,
-                agent_id,
-                run_id,
-                AgentEvent::MemoryAppend {
-                    body: "Remember: concise replies.".to_owned(),
-                },
-            )
-            .await?;
-            let memory_path = dir.join("MEMORY.md");
-            let memory = std::fs::read_to_string(&memory_path).map_err(|err| err.to_string())?;
-            let work_log_path = dir.join("notes").join("work-log.md");
-            let work_log =
-                std::fs::read_to_string(&work_log_path).map_err(|err| err.to_string())?;
-            assert!(memory.contains("notes/work-log.md"));
-            assert!(memory.contains("## Memory Map"));
-            assert!(!memory.contains("## Memory update"));
-            assert!(work_log.contains("## Memory update"));
-            assert!(work_log.contains("Remember: concise replies."));
-            handle_agent_event(
-                &pool,
-                agent_id,
-                run_id,
-                AgentEvent::MemoryCompact {
-                    body: "# @memory-agent\n\n## Role\nCompact memory.\n".to_owned(),
-                },
-            )
-            .await?;
-            let memory = std::fs::read_to_string(&memory_path).map_err(|err| err.to_string())?;
-            assert_eq!(memory, "# @memory-agent\n\n## Role\nCompact memory.\n");
-            let _ = std::fs::remove_dir_all(dir);
             Ok(())
         }
         .await;
