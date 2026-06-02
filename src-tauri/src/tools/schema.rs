@@ -31,54 +31,6 @@ pub(crate) fn call_tool_input() -> Value {
     })
 }
 
-pub(crate) fn memory_search_input() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search text for prior decisions, task state, files, blockers, or context."
-            },
-            "scope_type": {
-                "type": "string",
-                "enum": ["agent", "channel", "thread", "task"],
-                "description": "Optional memory scope filter."
-            },
-            "scope": {
-                "type": "string",
-                "enum": ["agent", "channel", "thread", "task"],
-                "description": "Alias for scope_type."
-            },
-            "scope_id": {
-                "type": "string",
-                "description": "Optional scope id filter, such as the current thread/task/channel id."
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 20,
-                "description": "Maximum candidates to return. Defaults to 8."
-            }
-        },
-        "required": ["query"],
-        "additionalProperties": false
-    })
-}
-
-pub(crate) fn memory_read_input() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "id": {
-                "type": "string",
-                "description": "Memory item id returned by memory_search."
-            }
-        },
-        "required": ["id"],
-        "additionalProperties": false
-    })
-}
-
 pub(crate) fn tool_browser_open_input() -> Value {
     json!({
         "type": "object",

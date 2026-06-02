@@ -411,7 +411,7 @@ export function AgentDetailDrawer({
   const deleteDisabled = Boolean(activeRun);
   const workspacePath = agent.working_directory.trim();
   const rootWorkspaceEntries = workspaceNodes[""] ?? agent.workspace_entries ?? [];
-  const memoryPath = agent.workspace_memory_path || (workspacePath ? `${workspacePath}/MEMORY.md` : "");
+  const memoryPath = agent.workspace_memory_path || (workspacePath ? `${workspacePath}/memory` : "");
   const agentReminders = reminders
     .filter((reminder) => reminder.creator_agent_id === agent.id)
     .sort((left, right) => new Date(left.due_at).getTime() - new Date(right.due_at).getTime());
@@ -706,7 +706,7 @@ export function AgentDetailDrawer({
         </div>
         <div className={`workspace-memory-card ${agent.workspace_memory_exists ? "ready" : "missing"}`}>
           <div>
-            <span>MEMORY.md</span>
+            <span>memory/</span>
             <code title={memoryPath}>{memoryPath ? compactPath(memoryPath) : "Not configured"}</code>
           </div>
         </div>

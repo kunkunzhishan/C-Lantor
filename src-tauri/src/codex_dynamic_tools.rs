@@ -5,8 +5,6 @@ use crate::tools::{self, schema, ToolResult};
 pub(crate) const NAMESPACE: &str = "lantor";
 pub(crate) const SEARCH_TOOLS: &str = "search_tools";
 pub(crate) const CALL_TOOL: &str = "call_tool";
-pub(crate) const MEMORY_SEARCH: &str = "memory_search";
-pub(crate) const MEMORY_READ: &str = "memory_read";
 
 #[derive(Debug, Clone)]
 pub(crate) struct DynamicToolResult {
@@ -52,18 +50,6 @@ pub(crate) fn definitions() -> Value {
             "name": CALL_TOOL,
             "description": "Call a Lantor Codex tool returned by lantor.search_tools.",
             "inputSchema": schema::call_tool_input()
-        },
-        {
-            "namespace": NAMESPACE,
-            "name": MEMORY_SEARCH,
-            "description": "Search this agent's file-backed Lantor memory. Returns candidate memory item ids and snippets; call memory_read to load full markdown content.",
-            "inputSchema": schema::memory_search_input()
-        },
-        {
-            "namespace": NAMESPACE,
-            "name": MEMORY_READ,
-            "description": "Read one file-backed Lantor memory item by id.",
-            "inputSchema": schema::memory_read_input()
         }
     ])
 }
@@ -168,7 +154,7 @@ mod tests {
             .get("dynamicTools")
             .and_then(Value::as_array)
             .expect("dynamicTools");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 2);
         assert_eq!(
             tools[0].get("namespace").and_then(Value::as_str),
             Some(NAMESPACE)

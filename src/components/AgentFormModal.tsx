@@ -256,7 +256,7 @@ export function AgentFormModal({
                 onChange={(event) => onChange({ ...form, workingDirectory: event.target.value })}
                 placeholder="~/Library/Application Support/Lantor/agents/<handle>"
               />
-              <small>{APP_DISPLAY_NAME} loads MEMORY.md from this directory as persistent context when the agent runs.</small>
+              <small>{APP_DISPLAY_NAME} stores agent memory under the memory/ directory in this workspace.</small>
             </label>
           </>
         )}

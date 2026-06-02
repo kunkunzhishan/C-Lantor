@@ -75,16 +75,15 @@ const LANTOR_OPERATING_POLICY = [
   "- Keep visible replies high-density: final results, decisions, blockers, user questions, and handoffs. Put intermediate steps in activity events.",
   "- Activity events are the short progress notes a user would otherwise see in chat. Before the final reply, emit them when you start a meaningful step, switch work modes, or learn something useful; use the matching kind and concrete title/detail, not just a generic phase label.",
   "- Reminders are visible, cancelable future wakeups. Use them for user-requested future follow-up or state that needs re-checking later.",
-  "- MEMORY.md is durable recovery context. Keep it concise and index-like; do not use it as a chronological log. Store detailed durable knowledge in notes/<topic>.md and link it from MEMORY.md.",
+  "- Lantor md memory has a realtime layer and a durable event layer. Use memory_run_summary for concise realtime continuity entries; older realtime segments are moved into memory/events/<agent_id>/ by event-ingest jobs.",
 ].join("\n");
 
 const LANTOR_MEMORY_MANAGEMENT = [
   "Workspace memory:",
-  "- Treat memory as readable files: MEMORY.md is the compact recovery index, notes/<topic>.md holds detailed durable knowledge, artifacts/ holds deliverables, and raw conversation/tool logs should stay out of memory unless explicitly preserved.",
-  "- Keep MEMORY.md structured: Role, Key Knowledge / Memory Map, Active Context, and Memory Policy. It should help a restarted agent recover what matters and where to look next.",
-  "- Use notes/user-preferences.md for stable user preferences, notes/channels.md for collaboration context, notes/work-log.md for chronological durable updates, and named topic notes for project/domain knowledge.",
-  "- Use memory_append for durable updates that still need later distillation; Lantor stages them in notes/work-log.md. Use memory_compact to replace MEMORY.md with a cleaned index when it becomes noisy, stale, duplicated, or log-like.",
-  "- When compacting active work, preserve Goal, Constraints, Progress, Key Decisions, Critical Context, and Next Steps. Keep Active Context to one current resume point and clear it after completion.",
+  "- Realtime memory is a time-ordered append-only segment log under memory/realtime/<agent_id>/<number>.md.",
+  "- Durable event memory is file-backed markdown under memory/events/<agent_id>/ and has no manifest.",
+  "- At the end of meaningful work, emit memory_run_summary with a short reusable note. Prefer 2-5 bullets or a short paragraph.",
+  "- Recall prior context by checking the injected memory path and reading files directly when older durable context is actually needed.",
   "- Do not store secrets, raw logs, full command output, transient reasoning, every chat turn, or facts that are cheap to re-read from source.",
 ].join("\n");
 
@@ -95,13 +94,12 @@ const LANTOR_CONTEXT_TOOLS = [
   '- inbox archive: "$LANTOR_CONTEXT_TOOL" --agent-context-tool inbox-archive --inbox-id "<uuid-or-prefix>"',
   '- workspace info: "$LANTOR_CONTEXT_TOOL" --agent-context-tool workspace-info',
   '- workspace files: "$LANTOR_CONTEXT_TOOL" --agent-context-tool workspace-list --max-depth 2 --limit 80',
-  '- durable memory: "$LANTOR_CONTEXT_TOOL" --agent-context-tool memory-read --limit 16000',
   '- history: "$LANTOR_CONTEXT_TOOL" --agent-context-tool history-read --target "#channel[:thread_id]" --limit 20',
   '- search: "$LANTOR_CONTEXT_TOOL" --agent-context-tool message-search --query "text" --target "#channel" --limit 20',
   '- attachment: "$LANTOR_CONTEXT_TOOL" --agent-context-tool attachment-info --attachment-id "<uuid>"',
   '- artifact: "$LANTOR_CONTEXT_TOOL" --agent-context-tool artifact-read --artifact-id "<uuid>"',
   '- agent introspection: "$LANTOR_CONTEXT_TOOL" --agent-context-tool agent-inspect --target "@handle"',
-  'Inbox, workspace, and memory commands default to your own LANTOR_AGENT_ID; add --target "@handle" only when inspecting another visible agent.',
+  'Inbox and workspace commands default to your own LANTOR_AGENT_ID; add --target "@handle" only when inspecting another visible agent.',
   "On inbox wake turns, list/read active inbox items first and archive handled or intentionally ignored items.",
 ].join("\n");
 
@@ -117,8 +115,7 @@ const LANTOR_CONTROL_EVENTS = [
   "Standalone LANTOR_EVENT control lines:",
   '{"type":"activity","kind":"thinking|command|file_edit|tools|acting","title":"Short user-facing status","detail":"Optional compact detail"}',
   '{"type":"usage","input_tokens":1234,"output_tokens":567,"cost_usd":0.0123}',
-  '{"type":"memory_append","body":"Durable update staged in notes/work-log.md"}',
-  '{"type":"memory_compact","body":"Full compact MEMORY.md replacement with Role, Key Knowledge / Memory Map, Active Context, and Memory Policy"}',
+  '{"type":"memory_run_summary","title":"Short title","body":"Concise realtime note","source_ids":["optional source ref"]}',
   '{"type":"profile_update","display_name":"Name","role":"specialist role","avatar":"dicebear:dylan:Hancock","description":"What this agent is good at"}',
   '{"type":"owner_profile_update","display_name":"Name","avatar":"dicebear:dylan:owner","description":"Owner profile text"}',
   '{"type":"reminder_create","when":"ISO8601 timestamp","title":"Follow-up title","note":"optional note","recurrence":"none|daily|weekly|every:20m"}',
