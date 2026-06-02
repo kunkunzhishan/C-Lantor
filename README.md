@@ -144,7 +144,7 @@ automatically on every start.
 - **Local First, privacy.** App, supervisor, SQLite state, attachments, and
   agent workspaces all run on your Mac.
 - **You own your context.** Chat history, tasks, artifacts, attachments,
-  agent profiles, and each agent's `MEMORY.md` / `notes/` stay on disk.
+  agent profiles, and each agent's `memory/` workspace stay on disk.
 - **One human, many agents.** Channels, DMs, threads, tasks, and handoffs are
   shaped around a solo operator coordinating agent work.
 - **Workspace, not just chat.** Messages can become tasks, threads carry
@@ -189,7 +189,7 @@ Storage stays local:
 - **Attachments** - `~/Library/Application Support/Lantor/attachments/`.
 - **Agent workspaces** - `~/Library/Application Support/Lantor/agents/<handle>/`
   by default (you can point each agent at any directory you like), including
-  that agent's `MEMORY.md`, `notes/`, and durable task files.
+  that agent's `memory/` directory and durable task files.
 
 The optional mobile web UI is served by the same local desktop process and
 shares the same SQLite database and attachment store. There is still no

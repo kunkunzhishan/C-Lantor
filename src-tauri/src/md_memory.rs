@@ -4,48 +4,25 @@ use std::{
 };
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
-    prompts::ensure_agent_workspace, text::compact_chars_middle, to_string, CommandResult,
+    events::notify_supervisor_wake, prompts::ensure_agent_workspace, text::compact_chars_middle,
+    to_string, CommandResult,
 };
 
-const MANIFEST_FILE: &str = "manifest.json";
-const SEARCH_SNIPPET_LIMIT: usize = 360;
-const READ_CONTENT_LIMIT: usize = 24_000;
-const COMPACTION_SOURCE_LIMIT: usize = 6_000;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryManifest {
-    items: Vec<MemoryManifestItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryManifestItem {
-    id: String,
-    kind: String,
-    scope_type: String,
-    scope_id: String,
-    title: String,
-    path: String,
-    created_at: String,
-    token_count: usize,
-    source_ids: Vec<String>,
-    parent_ids: Vec<String>,
-}
-
+const REALTIME_SEGMENT_LIMIT_BYTES: u64 = 16 * 1024;
+const REALTIME_MAX_SEGMENTS: usize = 12;
+const REALTIME_KEEP_RECENT_SEGMENTS: usize = 4;
+const REALTIME_SEGMENT_NAME_WIDTH: usize = 6;
 struct MemoryRoot {
     root: PathBuf,
 }
 
-pub(crate) struct CompactResult {
-    pub(crate) memory_id: String,
-    pub(crate) parent_ids: Vec<String>,
-    pub(crate) scope_type: String,
-    pub(crate) scope_id: String,
+struct RealtimeAppendResult {
+    path: String,
+    ingest_inputs: Option<Vec<String>>,
 }
 
 pub(crate) async fn append_run_summary(
@@ -63,7 +40,7 @@ pub(crate) async fn append_run_summary(
     let root = memory_root(pool, agent_id).await?;
     fs::create_dir_all(&root.root).map_err(to_string)?;
 
-    let (scope_type, scope_id, mut derived_sources) = run_scope(pool, agent_id, run_id).await?;
+    let (_, _, mut derived_sources) = run_scope(pool, agent_id, run_id).await?;
     derived_sources.extend(
         source_ids
             .iter()
@@ -74,273 +51,85 @@ pub(crate) async fn append_run_summary(
     derived_sources.dedup();
 
     let now = Utc::now();
-    let id = format!(
-        "run_{}_{}",
-        now.format("%Y%m%d_%H%M%S"),
-        short_uuid(Uuid::new_v4())
-    );
     let title = title
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Agent run summary");
-    let rel_path = format!("runs/{}/{}.md", now.format("%Y-%m-%d"), id);
-    let path = root.root.join(&rel_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(to_string)?;
-    }
-    let token_count = estimate_tokens(body);
-    let created_at = now.to_rfc3339();
-    let content = format_memory_markdown(
-        &id,
-        "run",
-        &scope_type,
-        &scope_id,
+    let entry = format_realtime_entry(
+        &now.to_rfc3339(),
         title,
-        &created_at,
-        token_count,
+        &agent_id.to_string(),
         &derived_sources,
-        &[],
         body,
     );
-    fs::write(&path, content).map_err(to_string)?;
+    let result = append_realtime_entry(&root.root, &agent_id.to_string(), &entry)?;
+    if let Some(inputs) = result.ingest_inputs.as_deref() {
+        enqueue_event_ingest_work_item(pool, agent_id, inputs).await?;
+    }
+    Ok(result.path)
+}
 
-    let item = MemoryManifestItem {
-        id: id.clone(),
-        kind: "run".to_owned(),
-        scope_type,
-        scope_id,
-        title: title.to_owned(),
-        path: rel_path,
-        created_at,
-        token_count,
-        source_ids: derived_sources,
-        parent_ids: Vec::new(),
+async fn enqueue_event_ingest_work_item(
+    pool: &SqlitePool,
+    agent_id: Uuid,
+    inputs: &[String],
+) -> CommandResult<()> {
+    let Some(first_input) = inputs.first() else {
+        return Ok(());
     };
-    upsert_manifest_item(&root.root, item)?;
-    Ok(id)
-}
-
-pub(crate) async fn append_summary(
-    pool: &SqlitePool,
-    agent_id: Uuid,
-    run_id: Uuid,
-    title: Option<&str>,
-    body: &str,
-    scope_type: Option<&str>,
-    scope_id: Option<&str>,
-    parent_ids: &[String],
-    source_ids: &[String],
-) -> CommandResult<String> {
-    let body = body.trim();
-    if body.is_empty() {
-        return Err("memory_summary body is empty".to_owned());
-    }
-    let root = memory_root(pool, agent_id).await?;
-    fs::create_dir_all(&root.root).map_err(to_string)?;
-
-    let (derived_scope_type, derived_scope_id, mut derived_sources) =
-        run_scope(pool, agent_id, run_id).await?;
-    let scope_type = scope_type
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&derived_scope_type)
-        .to_owned();
-    let scope_id = scope_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&derived_scope_id)
-        .to_owned();
-    derived_sources.extend(
-        source_ids
-            .iter()
-            .filter(|value| !value.trim().is_empty())
-            .cloned(),
-    );
-    derived_sources.sort();
-    derived_sources.dedup();
-
-    let now = Utc::now();
-    let id = format!(
-        "summary_{}_{}",
-        now.format("%Y%m%d_%H%M%S"),
-        short_uuid(Uuid::new_v4())
-    );
-    let title = title
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Memory summary");
-    let rel_path = format!("summaries/{}/{}.md", safe_path_segment(&scope_type), id);
-    let path = root.root.join(&rel_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(to_string)?;
-    }
-    let token_count = estimate_tokens(body);
-    let created_at = now.to_rfc3339();
-    let content = format_memory_markdown(
-        &id,
-        "summary",
-        &scope_type,
-        &scope_id,
-        title,
-        &created_at,
-        token_count,
-        &derived_sources,
-        parent_ids,
-        body,
-    );
-    fs::write(&path, content).map_err(to_string)?;
-
-    let item = MemoryManifestItem {
-        id: id.clone(),
-        kind: "summary".to_owned(),
-        scope_type,
-        scope_id,
-        title: title.to_owned(),
-        path: rel_path,
-        created_at,
-        token_count,
-        source_ids: derived_sources,
-        parent_ids: parent_ids.to_vec(),
-    };
-    upsert_manifest_item(&root.root, item)?;
-    Ok(id)
-}
-
-pub(crate) async fn search(
-    pool: &SqlitePool,
-    agent_id: Uuid,
-    arguments: &Value,
-) -> CommandResult<Value> {
-    let root = memory_root(pool, agent_id).await?;
-    let query = arguments
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-    let scope_type = arguments
-        .get("scope_type")
-        .or_else(|| arguments.get("scope"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let scope_id = arguments
-        .get("scope_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let limit = arguments
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(8)
-        .clamp(1, 20) as usize;
-
-    let manifest = read_manifest(&root.root)?;
-    let mut matches = Vec::new();
-    for item in manifest.items {
-        if scope_type.is_some_and(|scope_type| scope_type != item.scope_type) {
-            continue;
-        }
-        if scope_id.is_some_and(|scope_id| scope_id != item.scope_id) {
-            continue;
-        }
-        let content = read_item_content(&root.root, &item.path).unwrap_or_default();
-        let haystack = format!("{} {}", item.title, content).to_lowercase();
-        if !query.is_empty() && !haystack.contains(&query) {
-            continue;
-        }
-        let snippet = memory_snippet(&content, &query);
-        matches.push(json!({
-            "id": item.id,
-            "kind": item.kind,
-            "title": item.title,
-            "snippet": snippet,
-            "scope_type": item.scope_type,
-            "scope_id": item.scope_id,
-            "created_at": item.created_at,
-            "token_count": item.token_count,
-            "source_ids": item.source_ids
-        }));
-    }
-    matches.sort_by(|left, right| {
-        right
-            .get("created_at")
-            .and_then(Value::as_str)
-            .cmp(&left.get("created_at").and_then(Value::as_str))
-    });
-    matches.truncate(limit);
-    Ok(json!({ "items": matches }))
-}
-
-pub(crate) async fn read(
-    pool: &SqlitePool,
-    agent_id: Uuid,
-    arguments: &Value,
-) -> CommandResult<Value> {
-    let id = arguments
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "memory_read requires id".to_owned())?;
-    let root = memory_root(pool, agent_id).await?;
-    let manifest = read_manifest(&root.root)?;
-    let item = manifest
-        .items
-        .into_iter()
-        .find(|item| item.id == id)
-        .ok_or_else(|| format!("unknown memory item: {id}"))?;
-    let content = read_item_content(&root.root, &item.path)?;
-    Ok(json!({
-        "id": item.id,
-        "kind": item.kind,
-        "title": item.title,
-        "content": compact_chars_middle(&strip_frontmatter(&content), READ_CONTENT_LIMIT),
-        "scope_type": item.scope_type,
-        "scope_id": item.scope_id,
-        "created_at": item.created_at,
-        "source_ids": item.source_ids,
-        "parent_ids": item.parent_ids,
-        "path": item.path
-    }))
-}
-
-pub(crate) async fn rebuild_manifest(pool: &SqlitePool, agent_id: Uuid) -> CommandResult<usize> {
-    let root = memory_root(pool, agent_id).await?;
-    let items = rebuild_manifest_from_markdown(&root.root)?;
-    let count = items.len();
-    write_manifest(&root.root, &MemoryManifest { items })?;
-    Ok(count)
-}
-
-pub(crate) async fn compact_ready_runs(
-    pool: &SqlitePool,
-    agent_id: Uuid,
-    run_id: Uuid,
-    scope_type: Option<&str>,
-    scope_id: Option<&str>,
-    min_runs: usize,
-    keep_recent: usize,
-) -> CommandResult<Option<CompactResult>> {
-    let root = memory_root(pool, agent_id).await?;
-    let (derived_scope_type, derived_scope_id, source_ids) =
-        run_scope(pool, agent_id, run_id).await?;
-    let scope_type = scope_type
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&derived_scope_type);
-    let scope_id = scope_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&derived_scope_id);
-    compact_ready_runs_in_root(
-        &root.root,
-        scope_type,
-        scope_id,
-        min_runs.max(2),
-        keep_recent,
-        &source_ids,
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        select id
+        from agent_work_items
+        where agent_id = $1
+          and source_kind = 'event_ingest'
+          and status in ('queued', 'running')
+          and context like $2
+        limit 1
+        "#,
     )
+    .bind(agent_id)
+    .bind(format!("%- {first_input}%"))
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    let title = "Process memory event ingest task";
+    let context =
+        format_realtime_ingest_task(&Utc::now().to_rfc3339(), &agent_id.to_string(), inputs);
+
+    sqlx::query(
+        r#"
+        insert into agent_work_items (agent_id, source_kind, title, context, status)
+        values ($1, 'event_ingest', $2, $3, 'queued')
+        "#,
+    )
+    .bind(agent_id)
+    .bind(title)
+    .bind(context)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+    let _ = notify_supervisor_wake(pool).await;
+    Ok(())
+}
+
+pub(crate) async fn runtime_context(
+    pool: &SqlitePool,
+    agent_id: Uuid,
+    limit: usize,
+) -> CommandResult<Option<String>> {
+    let root = memory_root(pool, agent_id).await?;
+    let body = [
+        "Persistent Lantor md memory for this agent is available on disk.".to_owned(),
+        format!("memory_path=\"{}\"", root.root.display()),
+        "Read files under this path directly only when older durable context is needed.".to_owned(),
+    ]
+    .join("\n");
+    Ok(Some(compact_chars_middle(body.trim(), limit)))
 }
 
 async fn memory_root(pool: &SqlitePool, agent_id: Uuid) -> CommandResult<MemoryRoot> {
@@ -406,411 +195,231 @@ async fn run_scope(
     Ok(("agent".to_owned(), agent_id.to_string(), sources))
 }
 
-fn read_manifest(root: &Path) -> CommandResult<MemoryManifest> {
-    let path = root.join(MANIFEST_FILE);
-    if !path.exists() {
-        return Ok(MemoryManifest { items: Vec::new() });
-    }
-    let content = fs::read_to_string(path).map_err(to_string)?;
-    serde_json::from_str(&content).map_err(to_string)
-}
-
-fn write_manifest(root: &Path, manifest: &MemoryManifest) -> CommandResult<()> {
-    fs::create_dir_all(root).map_err(to_string)?;
-    let path = root.join(MANIFEST_FILE);
-    let tmp = root.join(format!("{MANIFEST_FILE}.tmp"));
-    let content = serde_json::to_string_pretty(manifest).map_err(to_string)?;
-    fs::write(&tmp, format!("{content}\n")).map_err(to_string)?;
-    fs::rename(tmp, path).map_err(to_string)
-}
-
-fn upsert_manifest_item(root: &Path, item: MemoryManifestItem) -> CommandResult<()> {
-    let mut manifest = read_manifest(root)?;
-    manifest.items.retain(|existing| existing.id != item.id);
-    manifest.items.push(item);
-    manifest
-        .items
-        .sort_by(|left, right| right.created_at.cmp(&left.created_at));
-    write_manifest(root, &manifest)
-}
-
-fn compact_ready_runs_in_root(
+fn append_realtime_entry(
     root: &Path,
-    scope_type: &str,
-    scope_id: &str,
-    min_runs: usize,
-    keep_recent: usize,
-    source_ids: &[String],
-) -> CommandResult<Option<CompactResult>> {
-    let manifest = read_manifest(root)?;
-    let compacted_parent_ids = manifest
-        .items
-        .iter()
-        .filter(|item| item.kind == "summary")
-        .flat_map(|item| item.parent_ids.iter().cloned())
-        .collect::<std::collections::HashSet<_>>();
-    let mut runs = manifest
-        .items
-        .iter()
-        .filter(|item| {
-            item.kind == "run"
-                && item.scope_type == scope_type
-                && item.scope_id == scope_id
-                && !compacted_parent_ids.contains(&item.id)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    runs.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-    if runs.len() < min_runs {
-        return Ok(None);
-    }
-    let compact_count = runs.len().saturating_sub(keep_recent);
-    let selected = runs.into_iter().take(compact_count).collect::<Vec<_>>();
-    if selected.len() < 2 {
-        return Ok(None);
-    }
+    agent_id: &str,
+    entry: &str,
+) -> CommandResult<RealtimeAppendResult> {
+    let dir = root.join("realtime").join(safe_path_segment(agent_id));
+    fs::create_dir_all(&dir).map_err(to_string)?;
 
-    let now = Utc::now();
-    let id = format!(
-        "summary_{}_{}",
-        now.format("%Y%m%d_%H%M%S"),
-        short_uuid(Uuid::new_v4())
-    );
-    let title = format!("Compacted {scope_type} memory");
-    let parent_ids = selected
-        .iter()
-        .map(|item| item.id.clone())
-        .collect::<Vec<_>>();
-    let body = format_compacted_runs(root, &selected)?;
-    let token_count = estimate_tokens(&body);
-    let created_at = now.to_rfc3339();
-    let rel_path = format!("summaries/{}/{}.md", safe_path_segment(scope_type), id);
-    let path = root.join(&rel_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(to_string)?;
-    }
-    let mut summary_sources = selected
-        .iter()
-        .flat_map(|item| item.source_ids.iter().cloned())
-        .chain(source_ids.iter().cloned())
-        .collect::<Vec<_>>();
-    summary_sources.sort();
-    summary_sources.dedup();
-    let content = format_memory_markdown(
-        &id,
-        "summary",
-        scope_type,
-        scope_id,
-        &title,
-        &created_at,
-        token_count,
-        &summary_sources,
-        &parent_ids,
-        &body,
-    );
-    fs::write(&path, content).map_err(to_string)?;
+    let entry = format!("\n\n{}\n", entry.trim());
+    let entry_len = entry.as_bytes().len() as u64;
 
-    upsert_manifest_item(
-        root,
-        MemoryManifestItem {
-            id: id.clone(),
-            kind: "summary".to_owned(),
-            scope_type: scope_type.to_owned(),
-            scope_id: scope_id.to_owned(),
-            title,
-            path: rel_path,
-            created_at,
-            token_count,
-            source_ids: summary_sources,
-            parent_ids: parent_ids.clone(),
-        },
-    )?;
-    Ok(Some(CompactResult {
-        memory_id: id,
-        parent_ids,
-        scope_type: scope_type.to_owned(),
-        scope_id: scope_id.to_owned(),
-    }))
+    let mut segments = realtime_segments_in_dir(&dir)?;
+    let segment = if let Some(segment) = segments.last().copied() {
+        let current_len = fs::metadata(realtime_segment_path(&dir, segment))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if current_len == 0 || current_len + entry_len <= REALTIME_SEGMENT_LIMIT_BYTES {
+            segment
+        } else {
+            segment + 1
+        }
+    } else {
+        1
+    };
+    let path = realtime_segment_path(&dir, segment);
+    append_to_file(&path, &entry)?;
+
+    if !segments.contains(&segment) {
+        segments.push(segment);
+    }
+    let ingest_inputs = maybe_prepare_realtime_ingest_inputs(root, agent_id, &segments)?;
+
+    Ok(RealtimeAppendResult {
+        path: realtime_segment_relative_path(agent_id, segment),
+        ingest_inputs,
+    })
 }
 
-fn format_compacted_runs(root: &Path, runs: &[MemoryManifestItem]) -> CommandResult<String> {
-    let mut lines = vec![
-        "## Summary".to_owned(),
-        format!("Compacted {} run summaries.", runs.len()),
-        String::new(),
-        "## Source Runs".to_owned(),
-    ];
-    for run in runs {
-        let content = read_item_content(root, &run.path)?;
-        let body = compact_chars_middle(&strip_frontmatter(&content), COMPACTION_SOURCE_LIMIT)
-            .trim()
-            .to_owned();
-        lines.push(format!("- {} ({}, {})", run.title, run.id, run.created_at));
-        lines.push(String::new());
-        lines.push(body);
-        lines.push(String::new());
+fn realtime_segments_in_dir(dir: &Path) -> CommandResult<Vec<usize>> {
+    let mut segments = Vec::new();
+    if !dir.exists() {
+        return Ok(segments);
     }
-    Ok(lines.join("\n").trim().to_owned())
-}
-
-fn rebuild_manifest_from_markdown(root: &Path) -> CommandResult<Vec<MemoryManifestItem>> {
-    let mut items = Vec::new();
-    if !root.exists() {
-        return Ok(items);
-    }
-    collect_markdown_manifest_items(root, root, &mut items)?;
-    items.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-    Ok(items)
-}
-
-fn collect_markdown_manifest_items(
-    root: &Path,
-    dir: &Path,
-    items: &mut Vec<MemoryManifestItem>,
-) -> CommandResult<()> {
     for entry in fs::read_dir(dir).map_err(to_string)? {
         let entry = entry.map_err(to_string)?;
         let path = entry.path();
-        let file_type = entry.file_type().map_err(to_string)?;
-        if file_type.is_dir() {
-            collect_markdown_manifest_items(root, &path, items)?;
-            continue;
-        }
         if path.extension().and_then(|value| value.to_str()) != Some("md") {
             continue;
         }
-        let content = fs::read_to_string(&path).map_err(to_string)?;
-        let Some(mut item) = parse_manifest_item_from_markdown(&content)? else {
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
-        let rel_path = path
-            .strip_prefix(root)
-            .map_err(to_string)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        item.path = rel_path;
-        items.push(item);
+        let Ok(segment) = stem.parse::<usize>() else {
+            continue;
+        };
+        segments.push(segment);
     }
-    Ok(())
+    segments.sort_unstable();
+    Ok(segments)
 }
 
-fn parse_manifest_item_from_markdown(content: &str) -> CommandResult<Option<MemoryManifestItem>> {
-    let Some(frontmatter) = extract_frontmatter(content) else {
-        return Ok(None);
-    };
-    let token_count = frontmatter_scalar(frontmatter, "token_count")
-        .unwrap_or_else(|| estimate_tokens(&strip_frontmatter(content)).to_string())
-        .parse::<usize>()
-        .map_err(to_string)?;
-    let Some(id) = frontmatter_scalar(frontmatter, "id") else {
-        return Ok(None);
-    };
-    let Some(kind) = frontmatter_scalar(frontmatter, "kind") else {
-        return Ok(None);
-    };
-    let Some(scope_type) = frontmatter_scalar(frontmatter, "scope_type") else {
-        return Ok(None);
-    };
-    let Some(scope_id) = frontmatter_scalar(frontmatter, "scope_id") else {
-        return Ok(None);
-    };
-    let Some(title) = frontmatter_scalar(frontmatter, "title") else {
-        return Ok(None);
-    };
-    let Some(created_at) = frontmatter_scalar(frontmatter, "created_at") else {
-        return Ok(None);
-    };
-    Ok(Some(MemoryManifestItem {
-        id,
-        kind,
-        scope_type,
-        scope_id,
-        title,
-        path: String::new(),
-        created_at,
-        token_count,
-        source_ids: frontmatter_list(frontmatter, "source_ids"),
-        parent_ids: frontmatter_list(frontmatter, "parent_ids"),
-    }))
+fn realtime_segment_path(dir: &Path, segment: usize) -> PathBuf {
+    dir.join(format!(
+        "{segment:0width$}.md",
+        width = REALTIME_SEGMENT_NAME_WIDTH
+    ))
 }
 
-fn read_item_content(root: &Path, rel_path: &str) -> CommandResult<String> {
-    let path = root.join(rel_path);
-    let canonical_root = root.canonicalize().map_err(to_string)?;
-    let canonical_path = path.canonicalize().map_err(to_string)?;
-    if !canonical_path.starts_with(canonical_root) {
-        return Err("memory item path escapes memory root".to_owned());
-    }
-    fs::read_to_string(canonical_path).map_err(to_string)
-}
-
-fn format_memory_markdown(
-    id: &str,
-    kind: &str,
-    scope_type: &str,
-    scope_id: &str,
-    title: &str,
-    created_at: &str,
-    token_count: usize,
-    source_ids: &[String],
-    parent_ids: &[String],
-    body: &str,
-) -> String {
+fn realtime_segment_relative_path(agent_id: &str, segment: usize) -> String {
     format!(
-        "---\n\
-         id: {}\n\
-         kind: {}\n\
-         scope_type: {}\n\
-         scope_id: {}\n\
-         title: {}\n\
-         created_at: {}\n\
-         {}\n\
-         {}\n\
-         token_count: {}\n\
-         ---\n\n\
-         # {}\n\n{}\n",
-        yaml_escape(id),
-        yaml_escape(kind),
-        yaml_escape(scope_type),
-        yaml_escape(scope_id),
-        yaml_escape(title),
-        yaml_escape(created_at),
-        yaml_list_field("source_ids", source_ids),
-        yaml_list_field("parent_ids", parent_ids),
-        token_count,
-        title,
-        body.trim()
+        "realtime/{}/{segment:0width$}.md",
+        safe_path_segment(agent_id),
+        width = REALTIME_SEGMENT_NAME_WIDTH
     )
 }
 
-fn strip_frontmatter(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---\n") {
-        return content.trim().to_owned();
-    }
-    let rest = &trimmed[4..];
-    if let Some(end) = rest.find("\n---\n") {
-        return rest[end + 5..].trim().to_owned();
-    }
-    content.trim().to_owned()
+fn append_to_file(path: &Path, body: &str) -> CommandResult<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(to_string)?;
+    file.write_all(body.as_bytes()).map_err(to_string)
 }
 
-fn extract_frontmatter(content: &str) -> Option<&str> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---\n") {
-        return None;
+fn maybe_prepare_realtime_ingest_inputs(
+    root: &Path,
+    agent_id: &str,
+    segments: &[usize],
+) -> CommandResult<Option<Vec<String>>> {
+    if segments.len() <= REALTIME_MAX_SEGMENTS {
+        return Ok(None);
     }
-    let rest = &trimmed[4..];
-    rest.find("\n---\n").map(|end| &rest[..end])
-}
-
-fn frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
-    frontmatter.lines().find_map(|line| {
-        let line = line.trim();
-        line.strip_prefix(&prefix)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "[]")
-            .map(yaml_unescape)
-    })
-}
-
-fn frontmatter_list(frontmatter: &str, key: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut in_list = false;
-    let prefix = format!("{key}:");
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if in_list {
-            if let Some(value) = trimmed.strip_prefix("- ") {
-                values.push(yaml_unescape(value.trim()));
-                continue;
-            }
-            if !trimmed.is_empty() {
-                break;
-            }
-        }
-        if let Some(value) = trimmed.strip_prefix(&prefix) {
-            let value = value.trim();
-            if value == "[]" {
-                return Vec::new();
-            }
-            if !value.is_empty() {
-                values.push(yaml_unescape(value));
-                return values;
-            }
-            in_list = true;
-        }
+    let ingest_count = segments.len().saturating_sub(REALTIME_KEEP_RECENT_SEGMENTS);
+    if ingest_count == 0 {
+        return Ok(None);
     }
-    values
-}
-
-fn memory_snippet(content: &str, query: &str) -> String {
-    let content = strip_frontmatter(content);
-    if query.is_empty() {
-        return compact_chars_middle(content.trim(), SEARCH_SNIPPET_LIMIT);
-    }
-    if let Some(idx) = find_case_insensitive_boundary(&content, query) {
-        let start = retreat_char_boundary(&content, idx, 120);
-        let end = advance_char_boundary(&content, idx, query.chars().count() + 240);
-        return compact_chars_middle(content[start..end].trim(), SEARCH_SNIPPET_LIMIT);
-    }
-    compact_chars_middle(content.trim(), SEARCH_SNIPPET_LIMIT)
-}
-
-fn yaml_list_field(name: &str, items: &[String]) -> String {
-    if items.is_empty() {
-        return format!("{name}: []");
-    }
-    let values = items
+    let inputs = segments
         .iter()
-        .map(|item| format!("  - {}", yaml_escape(item)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{name}:\n{values}")
-}
-
-fn find_case_insensitive_boundary(content: &str, query: &str) -> Option<usize> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Some(0);
+        .take(ingest_count)
+        .map(|segment| realtime_segment_relative_path(agent_id, *segment))
+        .collect::<Vec<_>>();
+    if inputs.is_empty() {
+        return Ok(None);
     }
-    content.char_indices().find_map(|(idx, _)| {
-        content[idx..]
-            .to_lowercase()
-            .starts_with(query)
-            .then_some(idx)
-    })
+
+    ensure_event_memory_scaffold(root, agent_id)?;
+    Ok(Some(inputs))
 }
 
-fn retreat_char_boundary(content: &str, idx: usize, chars: usize) -> usize {
-    let mut start = idx;
-    for _ in 0..chars {
-        let Some((prev_idx, _)) = content[..start].char_indices().next_back() else {
-            return 0;
-        };
-        start = prev_idx;
+fn format_realtime_ingest_task(created_at: &str, agent_id: &str, inputs: &[String]) -> String {
+    let events_dir = event_memory_relative_dir(agent_id);
+    let summary_path = format!("{events_dir}/summary.md");
+    let mut lines = vec![
+        "# Memory Event Ingest Task".to_owned(),
+        String::new(),
+        format!("Created: {created_at}"),
+        format!("Agent: {agent_id}"),
+        String::new(),
+        "## Directories".to_owned(),
+        String::new(),
+        format!(
+            "- Realtime input segments: `memory/realtime/{}/`",
+            safe_path_segment(agent_id)
+        ),
+        format!("- Long-term event memory: `memory/{events_dir}/`"),
+        format!("- Event summary index: `memory/{summary_path}`"),
+        "- Event detail files live under the long-term event memory directory. Create or update one markdown file per event as needed.".to_owned(),
+        String::new(),
+        "## Input Segments".to_owned(),
+        String::new(),
+    ];
+    lines.extend(inputs.iter().map(|input| format!("- {input}")));
+    lines.push(String::new());
+    lines.push("## Codex Task".to_owned());
+    lines.push(String::new());
+    lines.push(
+        "Read the input realtime segments and merge them into the event memory directory."
+            .to_owned(),
+    );
+    lines.push(String::new());
+    lines.push("The realtime segments are the source of truth for this task. They contain agent-written run summaries plus `Source:` references such as run/thread/message ids. Do not fetch raw source messages from the database; use the realtime items as written.".to_owned());
+    lines.push(String::new());
+    lines.push("Use `summary.md` as the event index. For each event, merge the new input with the existing summary so the event timeline and context stay coherent. Keep one start time, one end time, and a concise merged event summary.".to_owned());
+    lines.push("Use event detail markdown files for the event body. If the input belongs to an existing event, move the matching realtime items into that event's detail file one by one without rewriting or shortening them. If the input describes a new event, create a new event detail markdown file in the event memory directory and add it to `summary.md` as a new event.".to_owned());
+    lines.push("Convert from realtime order to event order. One input segment can contribute to multiple events, and multiple input segments can update the same event. Do not move content just because it is recent; merge by matching the same event.".to_owned());
+    lines.push("After all event writes succeed, delete the input realtime segment files. If anything is uncertain or fails, leave the inputs in place so a later event_ingest work item can retry.".to_owned());
+    lines.push(String::new());
+    lines.push("## `summary.md` Event Format".to_owned());
+    lines.push(String::new());
+    lines.push("Keep one section per event. Use this simple shape:".to_owned());
+    lines.push(String::new());
+    lines.push("```md".to_owned());
+    lines.push("## <event title>".to_owned());
+    lines.push("Start: <first relevant time>".to_owned());
+    lines.push("End: <last relevant time>".to_owned());
+    lines.push(
+        "Summary: <merged concise event summary, preserving the event timeline and context>"
+            .to_owned(),
+    );
+    lines.push("```".to_owned());
+    lines.push(String::new());
+    lines.push("## Event Detail Item Format".to_owned());
+    lines.push(String::new());
+    lines.push("Move matching realtime items into the matching event detail file one by one. Keep each moved item unchanged:".to_owned());
+    lines.push(String::new());
+    lines.push("```md".to_owned());
+    lines.push("<full realtime item, unchanged>".to_owned());
+    lines.push("```".to_owned());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn event_memory_relative_dir(agent_id: &str) -> String {
+    format!("events/{}", safe_path_segment(agent_id))
+}
+
+fn ensure_event_memory_scaffold(root: &Path, agent_id: &str) -> CommandResult<()> {
+    let dir = root.join(event_memory_relative_dir(agent_id));
+    fs::create_dir_all(&dir).map_err(to_string)?;
+    let summary_path = dir.join("summary.md");
+    if summary_path.exists() {
+        return Ok(());
     }
-    start
+    let body = [
+        "# Event Memory Summary",
+        "",
+        "This file is the long-term event index for this agent.",
+        "",
+        "Each event should record its start time, end time, and merged event summary.",
+        "",
+        "## Events",
+        "",
+        "Use this format for each event:",
+        "",
+        "```md",
+        "## <event title>",
+        "Start: <first relevant time>",
+        "End: <last relevant time>",
+        "Summary: <merged concise event summary, preserving the event timeline and context>",
+        "```",
+        "",
+    ]
+    .join("\n");
+    fs::write(summary_path, body).map_err(to_string)
 }
 
-fn advance_char_boundary(content: &str, idx: usize, chars: usize) -> usize {
-    let mut end = idx;
-    for _ in 0..chars {
-        let Some(ch) = content[end..].chars().next() else {
-            return content.len();
-        };
-        end += ch.len_utf8();
-    }
-    end
-}
-
-fn estimate_tokens(value: &str) -> usize {
-    (value.chars().count() / 4).max(1)
-}
-
-fn short_uuid(id: Uuid) -> String {
-    id.to_string().chars().take(8).collect()
+fn format_realtime_entry(
+    created_at: &str,
+    title: &str,
+    agent_id: &str,
+    source_ids: &[String],
+    body: &str,
+) -> String {
+    let mut sources = vec![format!("agent:{agent_id}")];
+    sources.extend(source_ids.iter().cloned());
+    sources.sort();
+    sources.dedup();
+    format!(
+        "## {created_at} · {title}\n\nSource: {}\n\n{}",
+        sources.join("; "),
+        body.trim()
+    )
 }
 
 fn safe_path_segment(value: &str) -> String {
@@ -826,31 +435,6 @@ fn safe_path_segment(value: &str) -> String {
         .collect()
 }
 
-fn yaml_escape(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-fn yaml_unescape(value: &str) -> String {
-    let value = value.trim();
-    let value = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value);
-    let mut output = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.next() {
-                output.push(next);
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,7 +448,7 @@ mod tests {
             .expect("connect sqlite");
         for statement in [
             "create table agents (id blob primary key not null, handle text not null, working_directory text not null default '')",
-            "create table agent_work_items (id blob primary key not null, agent_id blob not null, channel_id blob, thread_root_id blob, task_id blob)",
+            "create table agent_work_items (id blob primary key not null default (randomblob(16)), agent_id blob not null, channel_id blob, thread_root_id blob, task_id blob, source_kind text not null default 'manual', title text not null default '', context text not null default '', status text not null default 'queued')",
             "create table agent_runs (id blob primary key not null, agent_id blob not null, work_item_id blob)",
         ] {
             sqlx::query(statement)
@@ -875,101 +459,8 @@ mod tests {
         pool
     }
 
-    #[test]
-    fn frontmatter_formats_empty_arrays_inline() {
-        let markdown = format_memory_markdown(
-            "run_1",
-            "run",
-            "thread",
-            "thread_1",
-            "Title",
-            "2026-06-01T00:00:00Z",
-            10,
-            &[],
-            &[],
-            "Body",
-        );
-
-        assert!(markdown.contains("\nsource_ids: []\n"));
-        assert!(markdown.contains("\nparent_ids: []\n"));
-        assert!(!markdown.contains("source_ids:\n[]"));
-    }
-
-    #[test]
-    fn frontmatter_formats_non_empty_arrays_as_yaml_lists() {
-        let markdown = format_memory_markdown(
-            "summary_1",
-            "summary",
-            "task",
-            "task_1",
-            "Title",
-            "2026-06-01T00:00:00Z",
-            10,
-            &["msg:1".to_owned()],
-            &["run:1".to_owned()],
-            "Body",
-        );
-
-        assert!(markdown.contains("\nsource_ids:\n  - \"msg:1\"\n"));
-        assert!(markdown.contains("\nparent_ids:\n  - \"run:1\"\n"));
-    }
-
-    #[test]
-    fn memory_snippet_handles_non_ascii_query_without_panicking() {
-        let snippet = memory_snippet("前文包含一些中文内容，然后讨论这个方案继续推进。", "方案");
-
-        assert!(snippet.contains("方案"));
-    }
-
-    #[test]
-    fn read_item_content_rejects_paths_outside_memory_root() {
-        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
-        let root = base.join("memory");
-        fs::create_dir_all(&root).expect("create memory root");
-        fs::write(root.join("inside.md"), "inside").expect("write inside");
-        fs::write(base.join("outside.md"), "outside").expect("write outside");
-
-        assert!(read_item_content(&root, "inside.md").is_ok());
-        assert!(read_item_content(&root, "../outside.md").is_err());
-
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn rebuild_manifest_from_markdown_indexes_generated_files() {
-        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
-        let root = base.join("memory");
-        let run_dir = root.join("runs/2026-06-01");
-        fs::create_dir_all(&run_dir).expect("create run dir");
-        fs::write(
-            run_dir.join("run_1.md"),
-            format_memory_markdown(
-                "run_1",
-                "run",
-                "thread",
-                "thread_1",
-                "Title",
-                "2026-06-01T00:00:00Z",
-                10,
-                &["msg:1".to_owned()],
-                &[],
-                "Body",
-            ),
-        )
-        .expect("write run");
-
-        let items = rebuild_manifest_from_markdown(&root).expect("rebuild manifest items");
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, "run_1");
-        assert_eq!(items[0].path, "runs/2026-06-01/run_1.md");
-        assert_eq!(items[0].source_ids, vec!["msg:1"]);
-
-        let _ = fs::remove_dir_all(base);
-    }
-
     #[tokio::test]
-    async fn append_search_read_and_rebuild_round_trip() {
+    async fn append_run_summary_writes_realtime_segment() {
         let pool = test_pool().await;
         let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
         let agent_id = Uuid::new_v4();
@@ -1000,7 +491,7 @@ mod tests {
             .await
             .expect("insert run");
 
-        let memory_id = append_run_summary(
+        let memory_path = append_run_summary(
             &pool,
             agent_id,
             run_id,
@@ -1010,162 +501,119 @@ mod tests {
         )
         .await
         .expect("append run summary");
-        let found = search(
-            &pool,
-            agent_id,
-            &json!({
-                "query": "方案",
-                "scope_type": "thread",
-                "scope_id": thread_root_id.to_string()
-            }),
+        assert_eq!(memory_path, format!("realtime/{agent_id}/000001.md"));
+        let content = fs::read_to_string(base.join("memory").join(&memory_path))
+            .expect("read realtime segment");
+        assert!(content.contains("记忆方案"));
+        assert!(content.contains("thread:"));
+        assert!(content.contains("本轮讨论了 md 记忆方案继续推进。"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn append_run_summary_queues_event_ingest_work_item_when_inputs_are_ready() {
+        let pool = test_pool().await;
+        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
+        let agent_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+
+        sqlx::query("insert into agents (id, handle, working_directory) values ($1, 'Ada', $2)")
+            .bind(agent_id)
+            .bind(base.to_string_lossy().to_string())
+            .execute(&pool)
+            .await
+            .expect("insert agent");
+        sqlx::query("insert into agent_runs (id, agent_id) values ($1, $2)")
+            .bind(run_id)
+            .bind(agent_id)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+
+        let large_body = "x".repeat(REALTIME_SEGMENT_LIMIT_BYTES as usize);
+        for idx in 1..=13 {
+            append_run_summary(
+                &pool,
+                agent_id,
+                run_id,
+                Some(&format!("entry-{idx}")),
+                &large_body,
+                &[],
+            )
+            .await
+            .expect("append run summary");
+        }
+
+        let work = sqlx::query(
+            "select source_kind, title, context, status from agent_work_items where agent_id = $1",
         )
+        .bind(agent_id)
+        .fetch_one(&pool)
         .await
-        .expect("search memory");
-        assert_eq!(found["items"][0]["id"], memory_id);
-        assert!(found["items"][0]["snippet"]
-            .as_str()
-            .expect("snippet")
-            .contains("方案"));
-
-        let loaded = read(&pool, agent_id, &json!({ "id": memory_id }))
-            .await
-            .expect("read memory");
-        assert!(loaded["content"]
-            .as_str()
-            .expect("content")
-            .contains("md 记忆方案"));
-
-        fs::remove_file(base.join("memory/manifest.json")).expect("remove manifest");
-        let rebuilt = rebuild_manifest(&pool, agent_id)
-            .await
-            .expect("rebuild manifest");
-        assert_eq!(rebuilt, 1);
-        let found_after_rebuild = search(&pool, agent_id, &json!({ "query": "继续" }))
-            .await
-            .expect("search rebuilt memory");
-        assert_eq!(found_after_rebuild["items"][0]["id"], memory_id);
+        .expect("event ingest work item");
+        assert_eq!(work.get::<String, _>("source_kind"), "event_ingest");
+        assert_eq!(
+            work.get::<String, _>("title"),
+            "Process memory event ingest task"
+        );
+        assert_eq!(work.get::<String, _>("status"), "queued");
+        let context: String = work.get("context");
+        assert!(context.contains("## Input Segments"));
+        assert!(context.contains(&format!("realtime/{agent_id}/000001.md")));
+        assert!(context.contains(&format!("realtime/{agent_id}/000009.md")));
+        assert!(!context.contains(&format!("realtime/{agent_id}/000010.md")));
 
         let _ = fs::remove_dir_all(base);
     }
 
     #[test]
-    fn compact_ready_runs_writes_summary_and_skips_compacted_parents() {
-        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
-        let root = base.join("memory");
-        let run_dir = root.join("runs/2026-06-01");
-        fs::create_dir_all(&run_dir).expect("create run dir");
-        let mut manifest = MemoryManifest { items: Vec::new() };
-        for idx in 0..4 {
-            let id = format!("run_{idx}");
-            let created_at = format!("2026-06-01T00:00:0{idx}Z");
-            let rel_path = format!("runs/2026-06-01/{id}.md");
-            fs::write(
-                root.join(&rel_path),
-                format_memory_markdown(
-                    &id,
-                    "run",
-                    "thread",
-                    "thread_1",
-                    &format!("Run {idx}"),
-                    &created_at,
-                    10,
-                    &[format!("msg:{idx}")],
-                    &[],
-                    &format!("Body {idx}"),
-                ),
-            )
-            .expect("write run");
-            manifest.items.push(MemoryManifestItem {
-                id,
-                kind: "run".to_owned(),
-                scope_type: "thread".to_owned(),
-                scope_id: "thread_1".to_owned(),
-                title: format!("Run {idx}"),
-                path: rel_path,
-                created_at,
-                token_count: 10,
-                source_ids: vec![format!("msg:{idx}")],
-                parent_ids: Vec::new(),
-            });
+    fn realtime_segments_grow_and_prepare_ingest_inputs_without_pending() {
+        let root = std::env::temp_dir().join(format!("lantor-realtime-test-{}", Uuid::new_v4()));
+        let agent_id = Uuid::new_v4().to_string();
+        let large_entry = "x".repeat(REALTIME_SEGMENT_LIMIT_BYTES as usize);
+
+        for idx in 1..=13 {
+            let result =
+                append_realtime_entry(&root, &agent_id, &format!("entry-{idx} {large_entry}"))
+                    .expect("append realtime entry");
+            assert_eq!(result.path, format!("realtime/{agent_id}/{idx:06}.md"));
+            if idx < 13 {
+                assert!(result.ingest_inputs.is_none());
+            } else {
+                assert_eq!(
+                    result.ingest_inputs.as_deref(),
+                    Some(
+                        [
+                            format!("realtime/{agent_id}/000001.md"),
+                            format!("realtime/{agent_id}/000002.md"),
+                            format!("realtime/{agent_id}/000003.md"),
+                            format!("realtime/{agent_id}/000004.md"),
+                            format!("realtime/{agent_id}/000005.md"),
+                            format!("realtime/{agent_id}/000006.md"),
+                            format!("realtime/{agent_id}/000007.md"),
+                            format!("realtime/{agent_id}/000008.md"),
+                            format!("realtime/{agent_id}/000009.md"),
+                        ]
+                        .as_slice()
+                    )
+                );
+            }
         }
-        write_manifest(&root, &manifest).expect("write manifest");
 
-        let compacted = compact_ready_runs_in_root(
-            &root,
-            "thread",
-            "thread_1",
-            4,
-            1,
-            &["run:latest".to_owned()],
-        )
-        .expect("compact")
-        .expect("compacted");
+        let first = fs::read_to_string(root.join(format!("realtime/{agent_id}/000001.md")))
+            .expect("read first segment");
+        let thirteenth = fs::read_to_string(root.join(format!("realtime/{agent_id}/000013.md")))
+            .expect("read thirteenth segment");
+        assert!(first.contains("entry-1"));
+        assert!(thirteenth.contains("entry-13"));
+        assert!(!root.join("realtime_pending").exists());
+        let event_summary = fs::read_to_string(root.join(format!("events/{agent_id}/summary.md")))
+            .expect("read event summary scaffold");
+        assert!(event_summary.contains("# Event Memory Summary"));
+        assert!(event_summary.contains("start time, end time, and merged event summary"));
+        assert!(event_summary.contains("Use this format for each event"));
 
-        assert_eq!(compacted.parent_ids, vec!["run_0", "run_1", "run_2"]);
-        let manifest = read_manifest(&root).expect("read manifest");
-        let summary = manifest
-            .items
-            .iter()
-            .find(|item| item.id == compacted.memory_id)
-            .expect("summary item");
-        assert_eq!(summary.kind, "summary");
-        assert_eq!(summary.parent_ids, vec!["run_0", "run_1", "run_2"]);
-        let summary_content = read_item_content(&root, &summary.path).expect("read summary");
-        assert!(summary_content.contains("Body 0"));
-        assert!(summary_content.contains("Body 2"));
-
-        let second = compact_ready_runs_in_root(&root, "thread", "thread_1", 2, 0, &[])
-            .expect("second compact");
-        assert!(second.is_none());
-
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn compact_ready_runs_respects_keep_recent_for_manual_parameters() {
-        let base = std::env::temp_dir().join(format!("lantor-md-memory-test-{}", Uuid::new_v4()));
-        let root = base.join("memory");
-        fs::create_dir_all(root.join("runs/2026-06-01")).expect("create runs");
-        let mut manifest = MemoryManifest { items: Vec::new() };
-        for idx in 0..2 {
-            let id = format!("run_{idx}");
-            let created_at = format!("2026-06-01T00:00:0{idx}Z");
-            let rel_path = format!("runs/2026-06-01/{id}.md");
-            fs::write(
-                root.join(&rel_path),
-                format_memory_markdown(
-                    &id,
-                    "run",
-                    "thread",
-                    "thread_1",
-                    &format!("Run {idx}"),
-                    &created_at,
-                    10,
-                    &[],
-                    &[],
-                    &format!("Body {idx}"),
-                ),
-            )
-            .expect("write run");
-            manifest.items.push(MemoryManifestItem {
-                id,
-                kind: "run".to_owned(),
-                scope_type: "thread".to_owned(),
-                scope_id: "thread_1".to_owned(),
-                title: format!("Run {idx}"),
-                path: rel_path,
-                created_at,
-                token_count: 10,
-                source_ids: Vec::new(),
-                parent_ids: Vec::new(),
-            });
-        }
-        write_manifest(&root, &manifest).expect("write manifest");
-
-        let compacted =
-            compact_ready_runs_in_root(&root, "thread", "thread_1", 2, 1, &[]).expect("compact");
-        assert!(compacted.is_none());
-
-        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(root);
     }
 }

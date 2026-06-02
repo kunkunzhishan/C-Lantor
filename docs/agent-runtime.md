@@ -45,7 +45,6 @@ process inbox wakeups.
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool inbox-archive --inbox-id "<uuid-or-prefix>"
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool workspace-info
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool workspace-list --max-depth 2 --limit 80
-"$LANTOR_CONTEXT_TOOL" --agent-context-tool memory-read --limit 16000
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool history-read --target "#channel[:thread_id]" --limit 20
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool message-search --query "<text>" --target "#channel" --limit 20
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool attachment-info --attachment-id "<uuid>"
@@ -54,30 +53,26 @@ process inbox wakeups.
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool agent-inspect --target "@handle"
 ```
 
-Inbox, workspace, and memory commands default to the current agent. Use
+Inbox and workspace commands default to the current agent. Use
 `--target "@handle"` only when inspecting another visible agent.
 
 ## Agent Memory
 
 Each agent has a persistent working directory. By default Lantor uses
 `~/Library/Application Support/Lantor/agents/<handle>/`, but the agent profile
-can point at any directory you prefer. On first launch Lantor seeds the
-directory with `MEMORY.md` and a `notes/` subdirectory.
+can point at any directory you prefer. Lantor stores agent memory under that
+workspace's `memory/` directory.
 
-`MEMORY.md` is the recovery entry point and should stay concise and index-like.
-Detailed knowledge belongs in `notes/<topic>.md` files. Agents can also keep
-artifacts and task-specific files in their workspace when work needs durable
-context.
+Realtime continuity notes live under `memory/realtime/<agent_id>/`. Older
+realtime segments can be ingested into durable event memory under
+`memory/events/<agent_id>/`. Agents can also keep artifacts and task-specific
+files in their workspace when work needs durable context.
 
 Memory-related control events:
 
-- `memory_append`: stage a durable update in `notes/work-log.md` while keeping `MEMORY.md` as the compact recovery index.
-- `memory_compact`: replace `MEMORY.md` with a cleaned compact version.
+- `memory_run_summary`: append a concise realtime note for the current run.
 - `profile_update`: update display name, role, avatar, or description.
 
 Memory prompts intentionally follow a file-based memory model: raw dialog/tool
-output stays out of the compact index, chronological updates are staged in a work
-log, and `MEMORY.md` is periodically distilled into a restart-friendly map. When
-an agent compacts active work, it should preserve the fields that make the next
-turn recoverable: Goal, Constraints, Progress, Key Decisions, Critical Context,
-and Next Steps.
+output stays out of realtime notes, and long-term event memory is maintained by
+event ingestion from older realtime segments.

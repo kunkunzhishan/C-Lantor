@@ -15,22 +15,23 @@ fn lantor_operating_policy_prompt() -> &'static str {
 - Keep visible replies high-density: final results, decisions, blockers, user questions, and handoffs. Put intermediate steps in activity events.
 - Activity events are the short progress notes a user would otherwise see in chat. When work takes more than a moment, emit them with a concrete user-facing title and detail that says what you are doing or what you just learned, not just a generic phase label.
 - Reminders are visible, cancelable future wakeups. Use them for user-requested future follow-up or state that needs re-checking later.
-- Lantor md memory is the durable recovery layer. Use `memory_run_summary` / `memory_summary` to write markdown-backed memory items; use memory search/read tools to recall prior context."#
+- Lantor md memory has a realtime layer and a durable event layer. Use `memory_run_summary` for concise realtime continuity entries; older realtime segments are moved into `memory/events/<agent_id>/` by event-ingest jobs."#
 }
 
 fn lantor_memory_management_prompt() -> &'static str {
     r#"Workspace memory:
-- Your working directory is your persistent agent-owned workspace. Files there survive across turns and runtime restarts; use it for artifacts, code checkouts, and Lantor-managed `memory/**/*.md` items.
-- Treat durable memory as file-backed md memory: each item is a markdown file with frontmatter, and `memory/manifest.json` is a rebuildable index cache rather than the source of truth.
-- Each useful run should emit `memory_run_summary`; broader compacted context should emit `memory_summary`. Lantor may compact multiple run summaries into summary items and track sources with `parent_ids`.
-- Codex should recall prior context by calling `lantor.memory_search` and `lantor.memory_read`; do not ask the user to repeat prior discussion before searching memory.
+- Your working directory is your persistent agent-owned workspace. Files there survive across turns and runtime restarts; use it for artifacts, code checkouts, and Lantor-managed `memory/**/*.md` files.
+- Realtime memory is a time-ordered append-only segment log under `memory/realtime/<agent_id>/<number>.md`. Lantor writes the newest segment until it reaches the size limit, then opens the next numbered segment. When enough old segments accumulate, an async event-ingest job can preserve the newest segments and move older segment content into long-term event memory.
+- `memory_run_summary` writes one concise realtime entry. Keep it low-noise: source context plus the useful outcome, decision, blocker, or next step. Do not include raw logs, full transcripts, or routine process narration.
+- Durable event memory is file-backed markdown under `memory/events/<agent_id>/`. It has no manifest; agents read memory files directly from the injected memory path.
+- Recall prior context by checking the injected memory path when older durable context is actually needed; do not ask the user to repeat prior discussion before checking available memory.
 - Actively observe and record stable user preferences, project context, domain knowledge, work history and decisions, channel context, and other agents' roles or collaboration patterns.
 - Do not memorize transient reasoning, every chat turn, raw logs, command transcripts, or one-off intermediate details. Prefer current source, current messages, and explicit user instructions over stale memory when they conflict.
 
 Memory operation procedure:
-1. On startup or after context loss, use `lantor.memory_search` before relying on user recollection when prior discussion, files, blockers, or task state are relevant.
-2. At the end of meaningful work, emit `memory_run_summary` with a compact markdown summary of outcome, decisions, changed files, validation, and next steps.
-3. When condensing several memory items manually, emit `memory_summary` with `parent_ids` pointing at the covered items.
+1. On startup or after context loss, use the injected memory path or current thread history before relying on user recollection when prior discussion, files, blockers, or task state are relevant.
+2. At the end of meaningful work, emit `memory_run_summary` with a short markdown note. Prefer 2-5 bullets or a short paragraph; include only sources and reusable continuity.
+3. Long-term event memory is maintained by event ingestion from older realtime segments; do not treat realtime segments as durable event memory after they are ingested.
 4. Keep generated memory concise and reusable. Do not store secrets, full raw logs, speculative reasoning, every command output, or facts that are cheap to re-read from source."#
 }
 
@@ -41,7 +42,6 @@ fn lantor_context_tools_prompt() -> &'static str {
 - inbox archive: "$LANTOR_CONTEXT_TOOL" --agent-context-tool inbox-archive --inbox-id "<uuid-or-prefix>"
 - workspace info: "$LANTOR_CONTEXT_TOOL" --agent-context-tool workspace-info
 - workspace files: "$LANTOR_CONTEXT_TOOL" --agent-context-tool workspace-list --max-depth 2 --limit 80
-- durable memory: "$LANTOR_CONTEXT_TOOL" --agent-context-tool memory-read --limit 16000
 - history: "$LANTOR_CONTEXT_TOOL" --agent-context-tool history-read --target "#channel[:thread_id]" --limit 20
 - search: "$LANTOR_CONTEXT_TOOL" --agent-context-tool message-search --query "text" --target "#channel" --limit 20
 - attachment: "$LANTOR_CONTEXT_TOOL" --agent-context-tool attachment-info --attachment-id "<uuid>"
@@ -50,7 +50,7 @@ fn lantor_context_tools_prompt() -> &'static str {
 - long task create: "$LANTOR_CONTEXT_TOOL" --agent-context-tool long-task-create --workspace "<absolute target project path>" --title "<short title>" --task "<full instruction>" [--funder-mode worker|founder]
 - long task list: "$LANTOR_CONTEXT_TOOL" --agent-context-tool long-task-list
 - long task inspect/control: "$LANTOR_CONTEXT_TOOL" --agent-context-tool long-task-inspect --task-id "lt_xxx"; use long-task-monitor, long-task-steer, long-task-approve, long-task-reject, long-task-approval, or long-task-stop with the same --task-id when needed.
-Inbox, workspace, and memory commands default to your own LANTOR_AGENT_ID; add --target "@handle" only when inspecting another visible agent.
+Inbox and workspace commands default to your own LANTOR_AGENT_ID; add --target "@handle" only when inspecting another visible agent.
 For long tasks, ask clarifying questions first, then create only after you can provide workspace, title, and a complete task instruction. Before using long-task-steer, ask the user for explicit confirmation in the current thread. Refer to existing long tasks by Lantor task id, not by workspace, and do not read or edit .agent2long files directly.
 Inbox, history, and search message rows use `[target=... msg=... time=... type=...] sender: body` headers. The target is the message surface, and msg is the short source message id.
 When a turn contains a default inbox item or source_message, handle that item directly from the provided context when possible. Use inbox-list or inbox-read when you need missing details, need to choose among multiple active items, or are handling a different item. Current work-item inbox items are archived automatically when the work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear."##
@@ -61,10 +61,8 @@ fn lantor_dynamic_tools_prompt() -> &'static str {
 - Codex runtimes may have these app-server dynamic tools pre-registered at thread/start. They are direct tool calls, not deferred tools discovered through `tool_search`.
 - `lantor.search_tools`: list the available Lantor Codex tools. It returns tool ids, descriptions, schemas, side effects, display hints, and examples for `lantor.call_tool`; use the returned list to decide which tool fits the request.
 - `lantor.call_tool`: execute a Lantor Codex tool by `tool_id` with structured `arguments`.
-- `lantor.memory_search`: search this agent's file-backed markdown memory and return candidate ids/snippets.
-- `lantor.memory_read`: read one markdown memory item by id.
 - Prefer `lantor.search_tools` followed by `lantor.call_tool` for Lantor Codex tools. Do not call Codex `tool_search` first for these names; `tool_search` searches Codex deferred tools and will not list Lantor dynamic tools.
-- Use `lantor.memory_search` / `lantor.memory_read` yourself when the user refers to prior discussion, earlier decisions, "上面", "之前", "继续", "这个方案", files, blockers, or task state that may not be fully present in the current prompt. Do not ask the user to repeat context before searching memory."#
+- Memory is exposed through the injected memory path. Read files under that path directly when the user refers to prior discussion, earlier decisions, "上面", "之前", "继续", "这个方案", files, blockers, or task state that may not be fully present in the current prompt. Do not ask the user to repeat context before checking memory."#
 }
 
 fn lantor_turn_startup_sequence_prompt() -> &'static str {
@@ -75,7 +73,7 @@ fn lantor_turn_startup_sequence_prompt() -> &'static str {
 4. If the provided header, preview, and current same-thread context are enough, handle the message directly. Use inbox-read only when missing source text, metadata, or attachment details block progress.
 5. When the user references a Lantor message link (for example `/#/message/<uuid>` or `http://127.0.0.1:8787/#/message/<uuid>`) or asks you to use a linked/quoted message as evidence, resolve the message first and read the entire containing thread with history-read before drawing conclusions. Do not rely only on a single searched message preview when the linked message belongs to a thread.
 6. Use history-read or message-search when older channel/thread context, a prior decision, or a user reference to earlier discussion is needed.
-7. Use memory-read, workspace-info, or workspace-list only when durable recovery context or workspace state is actually needed beyond the injected prompt excerpt.
+7. Use workspace-info or workspace-list only when durable recovery context or workspace state is actually needed beyond the injected prompt excerpt.
 8. Complete useful work and verification before stopping. New same-channel/thread follow-ups may arrive automatically, so do not poll inbox-list unless you need to inspect other active targets."#
 }
 
@@ -95,10 +93,7 @@ fn lantor_control_api_prompt() -> &'static str {
     r#"Standalone LANTOR_EVENT control lines:
 LANTOR_EVENT {"type":"activity","kind":"thinking|command|file_edit|tools|acting","title":"<short user-facing status>","detail":"<optional compact detail>"}
 LANTOR_EVENT {"type":"usage","input_tokens":1234,"output_tokens":567,"cost_usd":0.0123}
-LANTOR_EVENT {"type":"memory_run_summary","title":"<short title>","body":"<markdown run summary>","source_ids":["<optional source ref>"]}
-LANTOR_EVENT {"type":"memory_summary","title":"<short title>","body":"<markdown compacted summary>","scope_type":"thread|task|channel|agent","scope_id":"<optional scope id>","parent_ids":["<memory item id>"],"source_ids":["<optional source ref>"]}
-LANTOR_EVENT {"type":"memory_rebuild_manifest"}
-LANTOR_EVENT {"type":"memory_compact_runs","scope_type":"<optional thread|task|channel|agent>","scope_id":"<optional scope id>","min_runs":8,"keep_recent":2}
+LANTOR_EVENT {"type":"memory_run_summary","title":"<short title>","body":"<concise markdown realtime note>","source_ids":["<optional source ref>"]}
 LANTOR_EVENT {"type":"profile_update","display_name":"<optional>","role":"<optional concise role>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional capability summary>"}
 LANTOR_EVENT {"type":"owner_profile_update","display_name":"<optional>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional>"}
 LANTOR_EVENT {"type":"reminder_create","when":"<ISO8601 timestamp>","title":"<title>","note":"<optional note>","recurrence":"none|daily|weekly|every:20m"}
@@ -266,7 +261,7 @@ fn build_runtime_standing_prompt(
          You collaborate with one local human through channels, threads, tasks, and DMs.\n\
          {transport_note}\n\
          Lantor keeps one warm runtime session per agent so previous turns remain in provider context; channel and thread are delivered as message envelope fields, not as separate runtime sessions.\n\
-         Each wake turn may contain a compact inbox processing prompt instead of a full request. Handle the default inbox item directly from that prompt when it has enough detail; use inbox-read only for missing source details, and inbox-list only when you need to choose among multiple active items. Current work-item inbox items are archived automatically when the work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear. Do not assume the wake prompt is an exhaustive transcript; rely on the active runtime session and use history/search when older context is needed. Use workspace-info, workspace-list, and memory-read when you need to recover your current Lantor md memory beyond the injected prompt excerpt.\n\
+         Each wake turn may contain a compact inbox processing prompt instead of a full request. Handle the default inbox item directly from that prompt when it has enough detail; use inbox-read only for missing source details, and inbox-list only when you need to choose among multiple active items. Current work-item inbox items are archived automatically when the work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear. Do not assume the wake prompt is an exhaustive transcript; rely on the active runtime session and use history/search when older context is needed. Use workspace-info or workspace-list when you need to recover your current Lantor md memory path beyond the injected prompt excerpt.\n\
          \n\
          {}\n\
          \n\
