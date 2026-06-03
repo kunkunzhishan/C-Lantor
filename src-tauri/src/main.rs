@@ -154,6 +154,7 @@ const SUPERVISOR_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS: i64 = 180_000;
 const CODEX_CONTEXT_ROTATE_MIN_INPUT_TOKENS: i64 = 50_000;
 const CODEX_CONTEXT_ROTATE_ENV: &str = "LANTOR_CODEX_CONTEXT_ROTATE_INPUT_TOKENS";
+const MEMORY_READ_ACTIVITY_TITLE: &str = "Memory read observed";
 const AGENT_WORKSPACE_PREVIEW_LIMIT: u64 = 256 * 1024;
 const DEFAULT_OWNER_DISPLAY_NAME: &str = "Me";
 const DEFAULT_OWNER_AVATAR: &str = "dicebear:dylan:owner";
@@ -12441,6 +12442,134 @@ fn codex_tool_completion_activity(value: &Value) -> Option<(&'static str, &'stat
     Some((kind, title, metadata.to_string()))
 }
 
+fn first_codex_item_output(item: &Value) -> Option<&str> {
+    first_nonempty_item_string(item, &["output", "stdout", "stderr", "result", "error"])
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn memory_read_match_from_codex_item(
+    item: &Value,
+    memory_root: &Path,
+) -> Option<(String, Vec<String>)> {
+    if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
+        return None;
+    }
+    let command = item.get("command").and_then(Value::as_str).unwrap_or("");
+    let output = first_codex_item_output(item).unwrap_or("");
+    let memory_root = memory_root.to_string_lossy();
+    let mut matched_paths = Vec::new();
+    let mut confidence = None;
+
+    for text in [command, output] {
+        if !memory_root.is_empty() && text.contains(memory_root.as_ref()) {
+            push_unique_string(&mut matched_paths, memory_root.to_string());
+            confidence = Some("direct");
+        }
+        if text.contains("memory/") {
+            push_unique_string(&mut matched_paths, "memory/");
+            confidence = Some("direct");
+        }
+        if text.contains("realtime/") {
+            push_unique_string(&mut matched_paths, "realtime/");
+            confidence.get_or_insert("weak");
+        }
+        if text.contains("events/") {
+            push_unique_string(&mut matched_paths, "events/");
+            confidence.get_or_insert("weak");
+        }
+    }
+
+    confidence.map(|confidence| (confidence.to_owned(), matched_paths))
+}
+
+fn codex_memory_read_observation_detail(item: &Value, memory_root: &Path) -> Option<String> {
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())?;
+    let (confidence, matched_paths) = memory_read_match_from_codex_item(item, memory_root)?;
+    let command = item.get("command").and_then(Value::as_str).unwrap_or("");
+    let output = first_codex_item_output(item).unwrap_or("");
+    Some(
+        json!({
+            "operation": "memory_read_observed",
+            "tool_item_id": item_id,
+            "tool_type": "commandExecution",
+            "command_preview": truncate_activity_detail(command),
+            "matched_paths": matched_paths,
+            "output_chars": output.chars().count(),
+            "output_bytes": output.len(),
+            "confidence": confidence
+        })
+        .to_string(),
+    )
+}
+
+async fn record_codex_memory_read_observation(
+    pool: &SqlitePool,
+    agent_id: Uuid,
+    run_id: Uuid,
+    item: &Value,
+) -> CommandResult<()> {
+    let Some(item_id) = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let working_directory: String =
+        sqlx::query_scalar("select working_directory from agents where id = $1")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?
+            .unwrap_or_default();
+    let working_directory = working_directory.trim();
+    if working_directory.is_empty() {
+        return Ok(());
+    }
+    let memory_root = PathBuf::from(working_directory).join("memory");
+    let Some(detail) = codex_memory_read_observation_detail(item, &memory_root) else {
+        return Ok(());
+    };
+    let duplicate: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        select id
+        from agent_activities
+        where run_id = $1
+          and title = $2
+          and metadata like $3
+        limit 1
+        "#,
+    )
+    .bind(run_id)
+    .bind(MEMORY_READ_ACTIVITY_TITLE)
+    .bind(format!("%\"tool_item_id\":\"{item_id}\"%"))
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    if duplicate.is_some() {
+        return Ok(());
+    }
+
+    record_agent_activity(
+        pool,
+        Some(agent_id),
+        Some(run_id),
+        "tools",
+        MEMORY_READ_ACTIVITY_TITLE,
+        detail,
+    )
+    .await
+}
+
 fn should_append_codex_stream_line_to_run_log(value: &Value) -> bool {
     !matches!(
         value.get("method").and_then(Value::as_str),
@@ -15857,6 +15986,9 @@ async fn handle_codex_warm_stdout_line(
                 )
                 .await?;
             }
+            if let Some(item) = value.pointer("/params/item") {
+                record_codex_memory_read_observation(pool, agent_id, run_id, item).await?;
+            }
         }
         Some("item/started") => {
             let Some(run_id) = active_run_id else {
@@ -17082,8 +17214,9 @@ mod tests {
         cleanup_failed_warm_codex_start, cleanup_stale_starting_agent_runs,
         codex_active_turn_reap_reason, codex_active_turn_schedule_state,
         codex_context_rotate_input_tokens_from_env, codex_error_notification_detail,
-        codex_item_started_activity, codex_pending_stream_key, codex_turn_id_from_value,
-        compact_chars_middle, consume_streaming_agent_control_lines,
+        codex_item_started_activity, codex_memory_read_observation_detail,
+        codex_pending_stream_key, codex_turn_id_from_value, compact_chars_middle,
+        consume_streaming_agent_control_lines,
         context_tool::{
             agent_context_agent_inspect, agent_context_artifact_read_in_pool,
             agent_context_attachment_info, agent_context_history_read, agent_context_inbox_archive,
@@ -17106,12 +17239,13 @@ mod tests {
         normalize_open_link_target, notify_ui_work_item_changed, open_dm_with_agent_in_pool,
         parse_activity_metadata, parse_tailscale_ipv4_from_text, prepend_inbox_context,
         process_due_agent_schedules, process_due_reminders, queue_mentions_as_work_items,
-        reassign_agent_work_in_pool, record_agent_activity, recover_supervisor_commands_at_startup,
-        sanitize_window_state, send_owner_message_in_pool, set_channel_agent_membership_in_pool,
-        should_append_codex_stream_line_to_run_log, should_keep_ui_refresh_metric_line,
-        silent_reply_reason, split_complete_streaming_agent_event_lines,
-        split_streaming_agent_event_lines, split_terminal_streaming_agent_event_lines,
-        streaming_message_body_is_empty, supervisor_start_codex_streaming_agent,
+        reassign_agent_work_in_pool, record_agent_activity, record_codex_memory_read_observation,
+        recover_supervisor_commands_at_startup, sanitize_window_state, send_owner_message_in_pool,
+        set_channel_agent_membership_in_pool, should_append_codex_stream_line_to_run_log,
+        should_keep_ui_refresh_metric_line, silent_reply_reason,
+        split_complete_streaming_agent_event_lines, split_streaming_agent_event_lines,
+        split_terminal_streaming_agent_event_lines, streaming_message_body_is_empty,
+        supervisor_start_codex_streaming_agent,
         tools::ToolHost,
         trim_ui_refresh_metric_lines_to_size, try_claim_unassigned_task, update_channel_in_pool,
         update_owner_profile_in_pool, upsert_agent_thread_subscription, upsert_runtime_thread_id,
@@ -17122,8 +17256,8 @@ mod tests {
         InboxWakeSummary, MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState,
         WarmCodexRegistry, WarmCodexRuntime, WarmCodexState, WindowMonitorBounds, WindowState,
         CODEX_ACTIVE_TURN_IDLE_TIMEOUT, CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS,
-        CODEX_TURN_START_TIMEOUT, STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER,
-        UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
+        CODEX_TURN_START_TIMEOUT, MEMORY_READ_ACTIVITY_TITLE, STREAMING_MESSAGE_BODY_LIMIT,
+        STREAMING_TRUNCATION_MARKER, UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
     };
     use chrono::NaiveDate;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -19982,6 +20116,105 @@ inline `@kunk` and after @longbaby
             })),
             None
         );
+    }
+
+    #[test]
+    fn detects_codex_memory_read_from_command_completion() {
+        let memory_root = std::env::temp_dir()
+            .join("lantor-memory-read-detector")
+            .join("memory");
+        let detail = codex_memory_read_observation_detail(
+            &json!({
+                "id": "tool-1",
+                "type": "commandExecution",
+                "command": format!("rg reminder {}", memory_root.display()),
+                "output": "memory/realtime/kunk/000001.md: remembered calendar work"
+            }),
+            &memory_root,
+        )
+        .expect("memory read observation");
+        let value: Value = serde_json::from_str(&detail).expect("json detail");
+        assert_eq!(
+            value.get("operation").and_then(Value::as_str),
+            Some("memory_read_observed")
+        );
+        assert_eq!(
+            value.get("tool_item_id").and_then(Value::as_str),
+            Some("tool-1")
+        );
+        assert_eq!(
+            value.get("confidence").and_then(Value::as_str),
+            Some("direct")
+        );
+        assert!(
+            value
+                .get("output_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn records_codex_memory_read_observation_once_per_tool_item() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "memory-read-observer").await?;
+            let workspace =
+                std::env::temp_dir().join(format!("lantor-memory-read-{}", Uuid::new_v4()));
+            std_fs::create_dir_all(workspace.join("memory").join("realtime"))
+                .map_err(|err| err.to_string())?;
+            sqlx::query("update agents set working_directory = $2 where id = $1")
+                .bind(agent_id)
+                .bind(workspace.to_string_lossy().to_string())
+                .execute(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            let run_id: Uuid = sqlx::query_scalar(
+                "insert into agent_runs (agent_id, command, status) values ($1, 'codex', 'running') returning id",
+            )
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let item = json!({
+                "id": "tool-memory-1",
+                "type": "commandExecution",
+                "command": "cat memory/realtime/000001.md",
+                "output": "known memory"
+            });
+            record_codex_memory_read_observation(&pool, agent_id, run_id, &item).await?;
+            record_codex_memory_read_observation(&pool, agent_id, run_id, &item).await?;
+            let count: i64 = sqlx::query_scalar(
+                "select count(*) from agent_activities where run_id = $1 and title = $2",
+            )
+            .bind(run_id)
+            .bind(MEMORY_READ_ACTIVITY_TITLE)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(count, 1);
+            let metadata: String = sqlx::query_scalar(
+                "select metadata from agent_activities where run_id = $1 and title = $2",
+            )
+            .bind(run_id)
+            .bind(MEMORY_READ_ACTIVITY_TITLE)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let metadata: Value = serde_json::from_str(&metadata).map_err(|err| err.to_string())?;
+            assert_eq!(
+                metadata.get("output_bytes").and_then(Value::as_u64),
+                Some("known memory".len() as u64)
+            );
+            let _ = std_fs::remove_dir_all(workspace);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
