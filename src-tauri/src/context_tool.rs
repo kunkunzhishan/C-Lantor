@@ -637,6 +637,144 @@ pub(crate) async fn agent_context_agent_inspect(
     Ok(output.join("\n"))
 }
 
+async fn resolve_agent_context_run_id(pool: &SqlitePool, raw_id: &str) -> CommandResult<Uuid> {
+    let raw_id = raw_id.trim().trim_start_matches("run:");
+    if raw_id.is_empty() {
+        return Err("run id is empty".to_owned());
+    }
+    if let Ok(run_id) = Uuid::parse_str(raw_id) {
+        let exists: Option<Uuid> = sqlx::query_scalar("select id from agent_runs where id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?;
+        return exists.ok_or_else(|| format!("unknown run id: {run_id}"));
+    }
+
+    let rows = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select id
+        from agent_runs
+        where lower(hex(id)) like replace(lower($1), '-', '')
+        order by started_at desc
+        limit 2
+        "#,
+    )
+    .bind(format!("{raw_id}%"))
+    .fetch_all(pool)
+    .await
+    .map_err(to_string)?;
+    match rows.as_slice() {
+        [id] => Ok(*id),
+        [] => Err(format!("unknown run id prefix: {raw_id}")),
+        _ => Err(format!("ambiguous run id prefix: {raw_id}")),
+    }
+}
+
+pub(crate) async fn agent_context_run_read(
+    pool: &SqlitePool,
+    args: &[String],
+) -> CommandResult<String> {
+    let raw_id = arg_value(args, "--run-id")
+        .or_else(|| arg_value(args, "--id"))
+        .ok_or_else(|| "run-read requires --run-id <uuid-or-prefix>".to_owned())?;
+    let limit = parse_context_tool_usize_limit(args, 12_000, 60_000)?;
+    let run_id = resolve_agent_context_run_id(pool, &raw_id).await?;
+    let row = sqlx::query(
+        r#"
+        select
+            r.id,
+            r.agent_id,
+            a.handle as agent_handle,
+            r.work_item_id,
+            w.title as work_item_title,
+            r.command,
+            r.working_directory,
+            r.status,
+            r.exit_code,
+            r.pid,
+            r.input_tokens,
+            r.output_tokens,
+            r.cost_micros,
+            r.started_at,
+            r.stopped_at,
+            r.log
+        from agent_runs r
+        join agents a on a.id = r.agent_id
+        left join agent_work_items w on w.id = r.work_item_id
+        where r.id = $1
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .map_err(to_string)?;
+
+    let started_at: DateTime<Utc> = row.get("started_at");
+    let stopped_at: Option<DateTime<Utc>> = row.get("stopped_at");
+    let log: String = row.get("log");
+    let log_chars = log.chars().count();
+    let clipped_log = compact_chars_middle(&log, limit);
+    let mut output = vec![
+        format!("Lantor run {}", row.get::<Uuid, _>("id")),
+        format!(
+            "agent=@{} agent_id={}",
+            row.get::<String, _>("agent_handle"),
+            row.get::<Uuid, _>("agent_id")
+        ),
+        format!("status={}", row.get::<String, _>("status")),
+        format!(
+            "command=\"{}\"",
+            compact_chars_middle(&row.get::<String, _>("command"), 240).replace('"', "\\\"")
+        ),
+        format!(
+            "working_directory=\"{}\"",
+            row.get::<String, _>("working_directory")
+                .replace('"', "\\\"")
+        ),
+        format!("started_at={}", started_at.to_rfc3339()),
+        format!(
+            "stopped_at={}",
+            stopped_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "active".to_owned())
+        ),
+        format!(
+            "exit_code={}",
+            row.get::<Option<i64>, _>("exit_code")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "pid={}",
+            row.get::<Option<i64>, _>("pid")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "tokens={}/{} cost=${:.4}",
+            row.get::<i64, _>("input_tokens"),
+            row.get::<i64, _>("output_tokens"),
+            row.get::<i64, _>("cost_micros") as f64 / 1_000_000.0
+        ),
+        format!(
+            "log_chars={log_chars} log_returned_chars={}",
+            clipped_log.chars().count()
+        ),
+    ];
+    if let Some(work_item_id) = row.get::<Option<Uuid>, _>("work_item_id") {
+        output.push(format!(
+            "work_item={} title={:?}",
+            work_item_id,
+            row.get::<Option<String>, _>("work_item_title")
+                .unwrap_or_else(|| "untitled".to_owned())
+        ));
+    }
+    output.push("log:".to_owned());
+    output.push(clipped_log);
+    Ok(output.join("\n"))
+}
+
 pub(crate) async fn agent_context_artifact_read_in_pool(
     pool: &SqlitePool,
     args: &[String],
@@ -1341,7 +1479,7 @@ pub(crate) async fn agent_context_inbox_archive(
 pub(crate) async fn run_agent_context_tool(args: &[String]) -> CommandResult<String> {
     if args.is_empty() || has_arg(args, "--help") || has_arg(args, "-h") {
         return Ok(
-            "Lantor agent context tool\n\nCommands:\n  inbox-list [--state active|unread|processing|archived|all] [--limit 20]\n  inbox-read --inbox-id <uuid-or-prefix>\n  inbox-archive --inbox-id <uuid-or-prefix>\n  workspace-info [--target @handle]\n  workspace-list [--target @handle] [--max-depth 2] [--limit 80]\n  history-read --target \"#channel[:thread]\" [--limit 30]\n  message-search --query <text> [--target \"#channel\"] [--limit 30]\n  attachment-info --attachment-id <uuid>\n  artifact-read --artifact-id <uuid>\n  call-utterance-read --utterance-id <uuid>\n  agent-inspect --target @handle\n  long-task-create --workspace <absolute-path> --title <title> --task <instruction> [--max-loops 20] [--task-mode restart|continue] [--funder-mode worker|founder] [--no-approval]\n  long-task-list\n  long-task-monitor --task-id lt_xxx\n  long-task-inspect --task-id lt_xxx\n  long-task-steer --task-id lt_xxx --instruction <text>\n  long-task-approve --task-id lt_xxx\n  long-task-reject --task-id lt_xxx --reason <text>\n  long-task-approval --task-id lt_xxx --mode auto|manual\n  long-task-stop --task-id lt_xxx\n\nTargets may be #channel, #channel:<message-id-prefix>, dm:@agent, channel UUID, or channel UUID:<message-id-prefix>. Inbox and workspace commands default to the current LANTOR_AGENT_ID when invoked by an agent. Long task commands use Lantor task ids and do not require agents to remember workspaces."
+            "Lantor agent context tool\n\nCommands:\n  inbox-list [--state active|unread|processing|archived|all] [--limit 20]\n  inbox-read --inbox-id <uuid-or-prefix>\n  inbox-archive --inbox-id <uuid-or-prefix>\n  workspace-info [--target @handle]\n  workspace-list [--target @handle] [--max-depth 2] [--limit 80]\n  history-read --target \"#channel[:thread]\" [--limit 30]\n  message-search --query <text> [--target \"#channel\"] [--limit 30]\n  attachment-info --attachment-id <uuid>\n  artifact-read --artifact-id <uuid>\n  call-utterance-read --utterance-id <uuid>\n  run-read --run-id <uuid-or-prefix> [--limit 12000]\n  agent-inspect --target @handle\n  long-task-create --workspace <absolute-path> --title <title> --task <instruction> [--max-loops 20] [--task-mode restart|continue] [--funder-mode worker|founder] [--no-approval]\n  long-task-list\n  long-task-monitor --task-id lt_xxx\n  long-task-inspect --task-id lt_xxx\n  long-task-steer --task-id lt_xxx --instruction <text>\n  long-task-approve --task-id lt_xxx\n  long-task-reject --task-id lt_xxx --reason <text>\n  long-task-approval --task-id lt_xxx --mode auto|manual\n  long-task-stop --task-id lt_xxx\n\nTargets may be #channel, #channel:<message-id-prefix>, dm:@agent, channel UUID, or channel UUID:<message-id-prefix>. Inbox and workspace commands default to the current LANTOR_AGENT_ID when invoked by an agent. Long task commands use Lantor task ids and do not require agents to remember workspaces."
                 .to_owned(),
         );
     }
@@ -1376,6 +1514,7 @@ pub(crate) async fn run_agent_context_tool(args: &[String]) -> CommandResult<Str
         "call-utterance-read" | "call-utterance" | "utterance-read" => {
             agent_context_call_utterance_read_in_pool(&pool, args).await
         }
+        "run-read" | "read-run" | "run" => agent_context_run_read(&pool, args).await,
         other => Err(format!("unknown agent context tool command: {other}")),
     }
 }

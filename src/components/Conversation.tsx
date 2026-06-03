@@ -1,4 +1,5 @@
 import {
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
   Activity,
@@ -421,6 +422,7 @@ export function Conversation({
   const [isComposerDragOver, setIsComposerDragOver] = useState(false);
   const [showChannelActions, setShowChannelActions] = useState(false);
   const [messageMenu, setMessageMenu] = useState<MessageMenuState>(null);
+  const [showMessageBackToBottom, setShowMessageBackToBottom] = useState(false);
   const [longTaskApprovalCount, setLongTaskApprovalCount] = useState(0);
   const [expandedChannelMessageIds, setExpandedChannelMessageIds] = useState<Set<string>>(() => new Set());
   const [callDurationNow, setCallDurationNow] = useState(() => Date.now());
@@ -555,6 +557,7 @@ export function Conversation({
     shouldFollowMessagesRef.current = false;
     cancelPendingMessageBottomScroll();
     if (element) rememberMessageListMetrics(element);
+    setShowMessageBackToBottom(Boolean(channel) && element ? !isMessageListAtBottom(element) : false);
   }
 
   function isPointerOnMessageListScrollbar(event: ReactPointerEvent<HTMLDivElement>) {
@@ -569,6 +572,7 @@ export function Conversation({
     if (!element) return;
     userMessageScrollUntilRef.current = 0;
     element.scrollTo({ top: element.scrollHeight, behavior });
+    setShowMessageBackToBottom(false);
     if (behavior === "auto") {
       shouldFollowMessagesRef.current = true;
       rememberMessageListMetrics(element);
@@ -611,11 +615,17 @@ export function Conversation({
       messageListMetricsRef.current.scrollHeight !== element.scrollHeight
       || messageListMetricsRef.current.clientHeight !== element.clientHeight;
     const userScrolling = isUserScrollingMessages();
-    if (atBottom && !userScrolling) {
+    const reachedScrollEnd = Math.abs(messageListDistanceFromBottom(element)) <= 1;
+    let shouldShowBackToBottom = Boolean(channel) && !atBottom && !shouldFollowMessagesRef.current;
+    if (atBottom && (!userScrolling || reachedScrollEnd)) {
+      userMessageScrollUntilRef.current = 0;
       shouldFollowMessagesRef.current = true;
+      shouldShowBackToBottom = false;
     } else if (!userScrolling && shouldFollowMessagesRef.current && layoutChanged && wasMessageListPreviouslyAtBottom()) {
       scrollMessagesToBottom();
+      shouldShowBackToBottom = false;
     }
+    setShowMessageBackToBottom((current) => current === shouldShowBackToBottom ? current : shouldShowBackToBottom);
     rememberMessageListMetrics(element);
   }
 
@@ -636,6 +646,17 @@ export function Conversation({
   function handleMessageListContentLoad() {
     if (!shouldFollowMessagesRef.current) return;
     scrollMessagesToBottom();
+  }
+
+  function returnMessagesToBottom() {
+    shouldFollowMessagesRef.current = true;
+    setShowMessageBackToBottom(false);
+    scrollMessagesToBottom("smooth");
+    window.requestAnimationFrame(() => {
+      scrollMessagesToBottom();
+      shouldFollowMessagesRef.current = true;
+      setShowMessageBackToBottom(false);
+    });
   }
 
   function hasSelectedText() {
@@ -869,6 +890,7 @@ export function Conversation({
 
   useLayoutEffect(() => {
     shouldFollowMessagesRef.current = true;
+    setShowMessageBackToBottom(false);
     scrollMessagesToBottom();
   }, [channel?.id]);
 
@@ -933,7 +955,17 @@ export function Conversation({
   useEffect(() => {
     if (!focusedMessageId) return;
     const element = messageListRef.current?.querySelector<HTMLElement>(`[data-message-id="${focusedMessageId}"]`);
-    element?.scrollIntoView({ block: "center" });
+    if (!element) return;
+    shouldFollowMessagesRef.current = false;
+    userMessageScrollUntilRef.current = Date.now() + 650;
+    cancelPendingMessageBottomScroll();
+    element.scrollIntoView({ block: "center" });
+    window.requestAnimationFrame(() => {
+      const list = messageListRef.current;
+      if (!list) return;
+      rememberMessageListMetrics(list);
+      setShowMessageBackToBottom(!isMessageListAtBottom(list));
+    });
   }, [channel?.id, focusedMessageId]);
 
   const showVoiceCaptureBar = voiceInput.isRecordedInput
@@ -1431,6 +1463,12 @@ export function Conversation({
               }}
               onClose={() => setMessageMenu(null)}
             />
+          )}
+          {channel && showMessageBackToBottom && (
+            <button type="button" className="message-back-to-bottom" onClick={returnMessagesToBottom}>
+              <ArrowDown size={15} />
+              Back to bottom
+            </button>
           )}
         </div>
       ) : activeTab === "tasks" ? (

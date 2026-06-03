@@ -3,11 +3,12 @@ import { useEffect, useRef } from "react";
 import { Modal } from "./Modal";
 import {
   AgentForm,
-  CODEX_REASONING_EFFORTS,
   CODEX_SERVICE_TIERS,
   RuntimeCheck,
   modelLabel,
   modelOptionsForRuntime,
+  normalizedReasoningEffortForRuntime,
+  reasoningEffortsForRuntime,
 } from "../types";
 import { randomCuteAvatarSpec } from "../avatar-utils";
 import { APP_DISPLAY_NAME } from "../branding";
@@ -67,6 +68,8 @@ export function AgentFormModal({
 }: AgentFormModalProps) {
   const nameInputRef = useRef<HTMLInputElement | null>(null);
   const isCodex = form.runtime === "codex";
+  const supportsReasoningEffort = form.runtime === "codex" || form.runtime === "claude";
+  const reasoningEfforts = reasoningEffortsForRuntime(form.runtime);
   const previewHandle = (form.handle || form.displayName || "agent").trim().replace(/^@/, "") || "agent";
   const previewName = form.displayName.trim() || form.handle.trim().replace(/^@/, "") || "New agent";
   const previewAgent = {
@@ -110,22 +113,25 @@ export function AgentFormModal({
       </div>
     </label>
   );
+  const reasoningEffortControl = supportsReasoningEffort && (
+    <label className="agent-select-field">
+      <span>Intelligence</span>
+      <div className="agent-select-control">
+        <select
+          value={normalizedReasoningEffortForRuntime(form.runtime, form.reasoningEffort)}
+          onChange={(event) => onChange({ ...form, reasoningEffort: event.target.value })}
+        >
+          {reasoningEfforts.map((effort) => (
+            <option key={effort.value} value={effort.value}>{effort.label}</option>
+          ))}
+        </select>
+        <ChevronDown size={16} aria-hidden="true" />
+      </div>
+    </label>
+  );
   const codexControls = isCodex && (
     <>
-      <label className="agent-select-field">
-        <span>Intelligence</span>
-        <div className="agent-select-control">
-          <select
-            value={form.reasoningEffort}
-            onChange={(event) => onChange({ ...form, reasoningEffort: event.target.value })}
-          >
-            {CODEX_REASONING_EFFORTS.map((effort) => (
-              <option key={effort.value} value={effort.value}>{effort.label}</option>
-            ))}
-          </select>
-          <ChevronDown size={16} aria-hidden="true" />
-        </div>
-      </label>
+      {reasoningEffortControl}
       <label className="agent-select-field">
         <span>Speed</span>
         <div className="agent-select-control">
@@ -198,7 +204,7 @@ export function AgentFormModal({
             </div>
             <div className={isCodex ? "three-col" : "two-col"}>
               {modelSelect}
-              {codexControls}
+              {isCodex ? codexControls : reasoningEffortControl}
             </div>
             <RuntimePreflight check={runtimeChecks[form.runtime]} />
             <details className="agent-advanced-settings">
@@ -238,6 +244,7 @@ export function AgentFormModal({
               {modelSelect}
             </div>
             {isCodex && <div className="two-col">{codexControls}</div>}
+            {!isCodex && supportsReasoningEffort && <div className="two-col">{reasoningEffortControl}</div>}
             <RuntimePreflight check={runtimeChecks[form.runtime]} />
             {showNotes && (
               <label>

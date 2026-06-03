@@ -29,14 +29,22 @@ import { DiagnosticsModal, type RefreshMetricsSnapshot } from "./components/Diag
 import { OwnerProfileModal, ownerProfileToForm, type OwnerProfileForm } from "./components/OwnerProfileModal";
 import { SavedMessagesModal } from "./components/SavedMessagesModal";
 import { SearchModal } from "./components/SearchModal";
-import { SettingsModal, type ChatTextSize } from "./components/SettingsModal";
+import { SettingsModal } from "./components/SettingsModal";
 import { Sidebar } from "./components/Sidebar";
 import { ThreadPanel } from "./components/ThreadPanel";
 import { ToolBrowserPanel } from "./components/ToolBrowserPanel";
 import type { LocalEntityLinkTarget } from "./components/MessageMarkdown";
+import {
+  CHAT_TEXT_SIZE_STORAGE_KEY,
+  CHAT_TEXT_SIZE_STYLES,
+  stepChatTextSize,
+  storedChatTextSize,
+  type ChatTextSize,
+} from "./chatTextSize";
 import { isProgressOnlyMessage } from "./message-grouping";
 import { agentMentionBinding, serializeAgentDisplayMentions, type AgentMentionBinding } from "./mentions";
 import { isToolBrowserToggleEvent, TOOL_BROWSER_TOGGLE_EVENT } from "./toolBrowserEvents";
+import { compareThreadsByLatestActivity, threadLatestActivityAt } from "./threadActivity";
 import {
   ACTIVE_RUN_STATUSES,
   Agent,
@@ -49,6 +57,7 @@ import {
   CallDispatch,
   CallSession,
   CallUtterance,
+  ChannelMember,
   DraftAttachment,
   EMPTY_AGENT_FORM,
   ActivityFeedItem,
@@ -64,6 +73,7 @@ import {
   ThreadActivity,
   ThreadReplySummary,
   TodoItem,
+  normalizedReasoningEffortForRuntime,
 } from "./types";
 import { agentRequestSourceLabel, buildPresetCommand, displayNameForSender, firstLines, formatTime, timestampMs, visibleChannelDescription } from "./ui-utils";
 import "./styles.css";
@@ -103,6 +113,8 @@ function createRefreshMetrics(): RefreshMetrics {
     stateUpdateByReason: {},
     lastBootstrapAt: null,
     lastBootstrapReason: null,
+    lastBootstrapDurationMs: null,
+    averageBootstrapDurationMs: null,
     lastSummaryAt: now,
   };
 }
@@ -140,6 +152,8 @@ function refreshMetricsSnapshot(metrics: RefreshMetrics): RefreshMetricsSnapshot
     stateUpdateByReason: { ...metrics.stateUpdateByReason },
     lastBootstrapAt: metrics.lastBootstrapAt,
     lastBootstrapReason: metrics.lastBootstrapReason,
+    lastBootstrapDurationMs: metrics.lastBootstrapDurationMs,
+    averageBootstrapDurationMs: metrics.averageBootstrapDurationMs,
   };
 }
 
@@ -195,46 +209,6 @@ const TOOL_BROWSER_PANEL_WIDTH_STORAGE_KEY = "lantor.toolBrowserEmbeddedPanelWid
 const TOOL_BROWSER_LAST_TARGET_STORAGE_KEY = "lantor.toolBrowserLastTarget";
 const DEFAULT_TOOL_BROWSER_TARGET = "https://www.bilibili.com/";
 const SIDEBAR_WIDTH_STORAGE_KEY = "lantor.sidebarWidth";
-const CHAT_TEXT_SIZE_STORAGE_KEY = "lantor.chatTextSize";
-const CHAT_TEXT_SIZE_OPTIONS: ChatTextSize[] = ["compact", "default", "large", "xlarge"];
-const CHAT_TEXT_SIZE_STYLES: Record<ChatTextSize, Record<string, string>> = {
-  compact: {
-    "--type-size-caption": "10px",
-    "--type-size-meta": "11px",
-    "--type-size-body": "13px",
-    "--type-size-message": "14px",
-    "--type-size-control": "15px",
-    "--type-size-title": "17px",
-    "--type-size-display": "20px",
-  },
-  default: {
-    "--type-size-caption": "11px",
-    "--type-size-meta": "12px",
-    "--type-size-body": "13px",
-    "--type-size-message": "15px",
-    "--type-size-control": "16px",
-    "--type-size-title": "20px",
-    "--type-size-display": "22px",
-  },
-  large: {
-    "--type-size-caption": "12px",
-    "--type-size-meta": "13px",
-    "--type-size-body": "14px",
-    "--type-size-message": "16px",
-    "--type-size-control": "17px",
-    "--type-size-title": "22px",
-    "--type-size-display": "24px",
-  },
-  xlarge: {
-    "--type-size-caption": "13px",
-    "--type-size-meta": "14px",
-    "--type-size-body": "15px",
-    "--type-size-message": "18px",
-    "--type-size-control": "19px",
-    "--type-size-title": "24px",
-    "--type-size-display": "26px",
-  },
-};
 const MOBILE_EDGE_SWIPE_START_PX = 24;
 const MOBILE_EDGE_SWIPE_OPEN_PX = 72;
 const MOBILE_EDGE_SWIPE_MAX_VERTICAL_PX = 48;
@@ -294,6 +268,8 @@ type UiBackendEvent =
   | { type: "call_utterance_upsert"; reason?: string; utterance: CallUtterance }
   | { type: "call_dispatch_upsert"; reason?: string; dispatch: CallDispatch }
   | { type: "artifact_upsert"; reason?: string; artifact: Artifact }
+  | { type: "channel_member_upsert"; reason?: string; member: ChannelMember }
+  | { type: "channel_member_delete"; reason?: string; channel_id: string; agent_id: string }
   | { type: "tool_browser_open"; reason?: string; target: string };
 
 type FlatUiBackendEvent = Exclude<UiBackendEvent, { type: "batch" }>;
@@ -613,17 +589,7 @@ function getStoredNumber(key: string, fallback: number) {
 }
 
 function getStoredChatTextSize(): ChatTextSize {
-  const stored = window.localStorage.getItem(CHAT_TEXT_SIZE_STORAGE_KEY);
-  return CHAT_TEXT_SIZE_OPTIONS.includes(stored as ChatTextSize) ? stored as ChatTextSize : "default";
-}
-
-function stepChatTextSize(current: ChatTextSize, delta: number) {
-  const index = CHAT_TEXT_SIZE_OPTIONS.indexOf(current);
-  const nextIndex = Math.min(
-    CHAT_TEXT_SIZE_OPTIONS.length - 1,
-    Math.max(0, index + delta),
-  );
-  return CHAT_TEXT_SIZE_OPTIONS[nextIndex] ?? "default";
+  return storedChatTextSize(window.localStorage);
 }
 
 async function attachmentUploads(attachments: DraftAttachment[]) {
@@ -1122,6 +1088,12 @@ function App() {
     metrics.bootstrapCount += 1;
     metrics.lastBootstrapAt = now;
     metrics.lastBootstrapReason = request.reason;
+    const roundedDurationMs = Number(durationMs.toFixed(1));
+    const previousAverage = metrics.averageBootstrapDurationMs ?? 0;
+    metrics.lastBootstrapDurationMs = roundedDurationMs;
+    metrics.averageBootstrapDurationMs = Number((
+      ((previousAverage * (metrics.bootstrapCount - 1)) + roundedDurationMs) / metrics.bootstrapCount
+    ).toFixed(1));
     incrementMetric(metrics.bootstrapByReason, request.reason);
     incrementMetric(metrics.bootstrapBySource, request.source);
     publishRefreshMetrics();
@@ -1130,7 +1102,8 @@ function App() {
       count: metrics.bootstrapCount,
       reason: request.reason,
       source: request.source,
-      durationMs: Number(durationMs.toFixed(1)),
+      durationMs: roundedDurationMs,
+      averageDurationMs: metrics.averageBootstrapDurationMs,
       intervalMs: previousBootstrapAt === null ? null : now - previousBootstrapAt,
       perMinute: metricRatePerMinute(metrics.bootstrapCount, metrics.startedAt, now),
     };
@@ -1153,6 +1126,8 @@ function App() {
         byReason: topMetricEntries(metrics.bootstrapByReason),
         bySource: topMetricEntries(metrics.bootstrapBySource),
         lastReason: metrics.lastBootstrapReason,
+        lastDurationMs: metrics.lastBootstrapDurationMs,
+        averageDurationMs: metrics.averageBootstrapDurationMs,
       },
       requests: {
         count: metrics.requestCount,
@@ -1288,11 +1263,17 @@ function App() {
       }
       let missing = false;
       let changed = false;
+      const updatedAt = new Date().toISOString();
       const messages = current.messages.map((item) => {
         const delta = deltas.get(item.id);
         if (!delta) return item;
         changed = true;
-        return { ...item, body: `${item.body}${delta.append}`, delivery_state: delta.deliveryState };
+        return {
+          ...item,
+          body: `${item.body}${delta.append}`,
+          delivery_state: delta.deliveryState,
+          updated_at: updatedAt,
+        };
       });
       for (const messageId of deltas.keys()) {
         if (!current.messages.some((item) => item.id === messageId)) {
@@ -1442,6 +1423,8 @@ function App() {
       || event.type === "call_session_upsert"
       || event.type === "call_utterance_upsert"
       || event.type === "call_dispatch_upsert"
+      || event.type === "channel_member_upsert"
+      || event.type === "channel_member_delete"
       || event.type === "artifact_upsert");
     if (stateEvents.length === 0) return;
 
@@ -1466,6 +1449,7 @@ function App() {
       let callSessions = current.call_sessions ?? [];
       let callUtterances = current.call_utterances ?? [];
       let callDispatches = current.call_dispatches ?? [];
+      let channelMembers = current.channel_members;
       let artifacts = Array.isArray(current.artifacts) ? current.artifacts : [];
       let messagesChanged = false;
       let agentsChanged = false;
@@ -1475,6 +1459,7 @@ function App() {
       let callSessionsChanged = false;
       let callUtterancesChanged = false;
       let callDispatchesChanged = false;
+      let channelMembersChanged = false;
       let artifactsChanged = false;
 
       for (const event of stateEvents) {
@@ -1542,6 +1527,17 @@ function App() {
             ? callDispatches.map((item) => item.id === dispatch.id ? dispatch : item)
             : [...callDispatches, dispatch];
           callDispatchesChanged = true;
+        } else if (event.type === "channel_member_upsert") {
+          const member = event.member;
+          channelMembers = channelMembers.some((item) => item.channel_id === member.channel_id && item.agent_id === member.agent_id)
+            ? channelMembers.map((item) => item.channel_id === member.channel_id && item.agent_id === member.agent_id ? member : item)
+            : [...channelMembers, member];
+          channelMembersChanged = true;
+        } else if (event.type === "channel_member_delete") {
+          const nextMembers = channelMembers.filter((item) =>
+            item.channel_id !== event.channel_id || item.agent_id !== event.agent_id);
+          channelMembersChanged = nextMembers.length !== channelMembers.length;
+          channelMembers = nextMembers;
         } else if (event.type === "artifact_upsert") {
           const artifact = event.artifact;
           if (!artifact || typeof artifact.id !== "string" || typeof artifact.message_id !== "string") {
@@ -1603,6 +1599,13 @@ function App() {
           ? {
               call_dispatches: [...callDispatches]
                 .sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime()),
+            }
+          : null),
+        ...(channelMembersChanged
+          ? {
+              channel_members: [...channelMembers]
+                .sort((left, right) =>
+                  left.channel_id.localeCompare(right.channel_id) || left.agent_handle.localeCompare(right.agent_handle)),
             }
           : null),
         ...(artifactsChanged ? { artifacts } : null),
@@ -1677,6 +1680,8 @@ function App() {
           case "call_session_upsert":
           case "call_utterance_upsert":
           case "call_dispatch_upsert":
+          case "channel_member_upsert":
+          case "channel_member_delete":
           case "artifact_upsert":
             immediateStateEvents.push(event);
             break;
@@ -2477,9 +2482,7 @@ function App() {
         (message.thread_followed || (threadUnreadCounts[message.id] ?? 0) > 0) &&
         !locallyUnfollowedThreadIds.has(message.id))
       .sort((left, right) => {
-        const rightLatest = threadReplySummaries[right.id]?.latest?.created_at ?? threadActivityByRoot.get(right.id)?.latest_visible_at;
-        const leftLatest = threadReplySummaries[left.id]?.latest?.created_at ?? threadActivityByRoot.get(left.id)?.latest_visible_at;
-        return timestampMs(rightLatest) - timestampMs(leftLatest);
+        return compareThreadsByLatestActivity(left, right, threadReplySummaries, threadActivityByRoot);
       });
   }, [visibleMessages, locallyUnfollowedThreadIds, threadActivityByRoot, threadReplyCounts, threadReplySummaries, threadUnreadCounts]);
 
@@ -2553,6 +2556,7 @@ function App() {
       const latestReply = threadReplySummaries[root.id]?.latest
         ?? (replies.length > 0 ? replies[replies.length - 1] : null);
       const currentMessage = latestReply ?? root;
+      const latestActivityAt = threadLatestActivityAt(root, threadReplySummaries[root.id], threadActivityByRoot.get(root.id));
       const unread = unreadCount > 0;
       items.push({
         id: `thread:${root.id}`,
@@ -2562,7 +2566,7 @@ function App() {
         excerpt: currentMessage.body,
         surface: channelLabel(root.channel_id),
         actor: displayNameForSender(currentMessage, data.owner_profile),
-        timestamp: timestamp(currentMessage.created_at),
+        timestamp: timestamp(latestActivityAt),
         unread,
         actorAgentId: currentMessage.sender_agent_id,
         actorRole: currentMessage.sender_role,
@@ -2969,6 +2973,13 @@ function App() {
     ? duplicateChannelNameMessage(normalizedNewChannelName)
     : null;
   const newChannelNameError = newChannelDuplicateError || newChannelNameSubmitError;
+  const normalizedChannelNameDraft = normalizedChannelNameInput(channelNameDraft);
+  const channelSettingsNameError = channel &&
+    channel.kind !== "dm" &&
+    normalizedChannelNameDraft &&
+    channelNameExists(normalizedChannelNameDraft, channel.id)
+    ? duplicateChannelNameMessage(normalizedChannelNameDraft)
+    : null;
 
   useEffect(() => {
     setChannelNameDraft(channel?.name ?? "");
@@ -3048,7 +3059,7 @@ function App() {
       return;
     }
     if (channelNameExists(name, channel.id)) {
-      setAppError(`Channel #${name} already exists`);
+      setAppError(null);
       return;
     }
     await mutate("update_channel", {
@@ -3205,6 +3216,11 @@ function App() {
       delete next[threadId];
       return next;
     });
+  }
+
+  function focusMessage(messageId: string) {
+    setFocusedMessageId(null);
+    window.requestAnimationFrame(() => setFocusedMessageId(messageId));
   }
 
   function revealThread(threadId: string | null, channelId = activeChannelId) {
@@ -3546,7 +3562,9 @@ function App() {
       ...agentDraft,
       runtime,
       model: preset && shouldReplaceModel ? preset.defaultModel : agentDraft.model,
-      reasoningEffort: runtime === "codex" ? agentDraft.reasoningEffort || "medium" : agentDraft.reasoningEffort,
+      reasoningEffort: runtime === "codex" || runtime === "claude"
+        ? normalizedReasoningEffortForRuntime(runtime, agentDraft.reasoningEffort)
+        : agentDraft.reasoningEffort,
       serviceTier: runtime === "codex" ? agentDraft.serviceTier : "",
     });
   }
@@ -3562,7 +3580,9 @@ function App() {
       ...agentEdit,
       runtime,
       model: preset && shouldReplaceModel ? preset.defaultModel : agentEdit.model,
-      reasoningEffort: runtime === "codex" ? agentEdit.reasoningEffort || "medium" : agentEdit.reasoningEffort,
+      reasoningEffort: runtime === "codex" || runtime === "claude"
+        ? normalizedReasoningEffortForRuntime(runtime, agentEdit.reasoningEffort)
+        : agentEdit.reasoningEffort,
       serviceTier: runtime === "codex" ? agentEdit.serviceTier : "",
     });
   }
@@ -3748,6 +3768,7 @@ function App() {
   function openTask(task: Task) {
     setActiveChannelId(task.channel_id);
     revealThread(task.message_id, task.channel_id);
+    focusMessage(task.message_id);
     setActiveTab("chat");
   }
 
@@ -3776,9 +3797,21 @@ function App() {
   function revealMessage(message: Message) {
     selectChannel(message.channel_id);
     revealThread(message.thread_root_id ?? message.id, message.channel_id);
-    setFocusedMessageId(message.id);
+    focusMessage(message.id);
     setSelectedAgentId(null);
     setActiveTab("chat");
+  }
+
+  function locateThreadRoot(message: Message) {
+    setActiveChannelId(message.channel_id);
+    setActiveTab("chat");
+    setSelectedAgentId(null);
+    focusMessage(message.id);
+    if (isMobileViewport()) {
+      setShowThread(false);
+    } else {
+      setShowThread(true);
+    }
   }
 
   function openChannelTimeline(channelId: string) {
@@ -3929,8 +3962,10 @@ function App() {
   }
 
   function threadReadCutoff(threadId: string) {
-    const latestAt = threadReplySummaries[threadId]?.latest?.created_at
-      ?? threadActivityByRoot.get(threadId)?.latest_visible_at;
+    const root = visibleMessageById.get(threadId);
+    const latestAt = root
+      ? threadLatestActivityAt(root, threadReplySummaries[threadId], threadActivityByRoot.get(threadId))
+      : threadReplySummaries[threadId]?.latest?.created_at ?? threadActivityByRoot.get(threadId)?.latest_visible_at;
     const latestTime = latestAt ? timestampMs(latestAt) : 0;
     const cutoffTime = Math.max(Date.now(), Number.isFinite(latestTime) ? latestTime : 0);
     return new Date(cutoffTime).toISOString();
@@ -4732,6 +4767,7 @@ function App() {
           focusedMessageId={focusedMessageId}
           onToggleMessageSaved={setMessageSaved}
           onToggleMessageTodo={setMessageTodo}
+          onLocateRoot={locateThreadRoot}
           onResizeStart={startThreadResize}
         />
       )}
@@ -4843,6 +4879,7 @@ function App() {
         channelMemberIds={channelMemberIds}
         nameDraft={channelNameDraft}
         descriptionDraft={channelDescriptionDraft}
+        nameError={channelSettingsNameError}
         onNameChange={setChannelNameDraft}
         onDescriptionChange={setChannelDescriptionDraft}
         onSetMember={setChannelMember}

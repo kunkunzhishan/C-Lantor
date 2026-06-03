@@ -46,6 +46,7 @@ fn lantor_context_tools_prompt() -> &'static str {
 - search: "$LANTOR_CONTEXT_TOOL" --agent-context-tool message-search --query "text" --target "#channel" --limit 20
 - attachment: "$LANTOR_CONTEXT_TOOL" --agent-context-tool attachment-info --attachment-id "<uuid>"
 - artifact: "$LANTOR_CONTEXT_TOOL" --agent-context-tool artifact-read --artifact-id "<uuid>"
+- run: "$LANTOR_CONTEXT_TOOL" --agent-context-tool run-read --run-id "<uuid-or-prefix>" --limit 12000
 - agent introspection: "$LANTOR_CONTEXT_TOOL" --agent-context-tool agent-inspect --target "@handle"
 - long task create: "$LANTOR_CONTEXT_TOOL" --agent-context-tool long-task-create --workspace "<absolute target project path>" --title "<short title>" --task "<full instruction>" [--funder-mode worker|founder]
 - long task list: "$LANTOR_CONTEXT_TOOL" --agent-context-tool long-task-list

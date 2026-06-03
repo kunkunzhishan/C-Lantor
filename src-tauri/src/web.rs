@@ -54,12 +54,13 @@ use crate::{
     create_agent_in_pool, create_channel_in_pool, create_todo_item_in_pool, delete_agent_in_pool,
     delete_channel_in_pool, delete_todo_item_in_pool, dismiss_inbox_items_in_pool,
     fetch_messages_in_pool, forward_task_in_pool, load_artifact, load_bootstrap,
-    mark_all_owner_inbox_read_in_pool, mark_channel_read_in_pool, mark_inbox_items_read_in_pool,
-    notify_ui_refresh, open_dm_with_agent_in_pool, reassign_agent_work_in_pool,
-    retry_agent_work_in_pool, send_owner_message_in_pool, set_channel_agent_membership_in_pool,
-    set_message_saved_in_pool, set_message_todo_in_pool, to_string, ui_backend_event_payload,
-    update_agent_in_pool, update_channel_in_pool, update_owner_profile_in_pool,
-    update_task_status_in_pool, update_task_title_in_pool, FetchMessagesRequest,
+    load_ui_backend_event_payload, mark_all_owner_inbox_read_in_pool, mark_channel_read_in_pool,
+    mark_inbox_items_read_in_pool, notify_ui_refresh, open_dm_with_agent_in_pool,
+    reassign_agent_work_in_pool, retry_agent_work_in_pool, send_owner_message_in_pool,
+    set_channel_agent_membership_in_pool, set_message_saved_in_pool, set_message_todo_in_pool,
+    start_agent_in_pool, to_string, update_agent_in_pool, update_channel_in_pool,
+    update_owner_profile_in_pool, update_task_status_in_pool, update_task_title_in_pool,
+    FetchMessagesRequest,
 };
 
 const WEB_SEND_MESSAGE_BODY_LIMIT: usize = 128 * 1024 * 1024;
@@ -468,6 +469,7 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
         .route("/api/create_agent", post(api_create_agent))
         .route("/api/update_agent", post(api_update_agent))
         .route("/api/delete_agent", post(api_delete_agent))
+        .route("/api/start_agent", post(api_start_agent))
         .route(
             "/api/set_channel_agent_membership",
             post(api_set_channel_agent_membership),
@@ -1860,6 +1862,16 @@ async fn api_delete_agent(
         .map_err(api_error)
 }
 
+async fn api_start_agent(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<AgentIdRequest>,
+) -> Result<impl IntoResponse, Response> {
+    start_agent_in_pool(&state.pool, request.agent_id)
+        .await
+        .map(|_| Json(json!({ "ok": true })))
+        .map_err(api_error)
+}
+
 async fn api_set_channel_agent_membership(
     State(state): State<Arc<WebState>>,
     Json(request): Json<SetChannelAgentMembershipRequest>,
@@ -2247,32 +2259,16 @@ async fn api_events(State(state): State<Arc<WebState>>) -> Result<impl IntoRespo
             .await
             .unwrap_or(0);
         loop {
-            match sqlx::query(
-                r#"
-                select id, event_json
-                from ui_events
-                where id > $1
-                order by id asc
-                limit 80
-                "#,
-            )
-            .bind(last_id)
-            .fetch_all(&pool)
-            .await {
-                Ok(rows) if rows.is_empty() => {
+            match load_ui_backend_event_payload(&pool, &mut last_id, 80, Duration::from_millis(40))
+                .await
+            {
+                Ok(None) => {
                     sleep(Duration::from_millis(500)).await;
                 }
-                Ok(rows) => {
-                    let mut payloads = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        last_id = row.get("id");
-                        payloads.push(row.get::<String, _>("event_json"));
-                    }
-                    if let Some(payload) = ui_backend_event_payload(payloads) {
-                        yield Ok::<Event, Infallible>(
-                            Event::default().event("lantor").data(payload)
-                        );
-                    }
+                Ok(Some(payload)) => {
+                    yield Ok::<Event, Infallible>(
+                        Event::default().event("lantor").data(payload)
+                    );
                 },
                 Err(err) => {
                     yield Ok(Event::default().event("error").data(err.to_string()));

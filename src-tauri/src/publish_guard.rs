@@ -573,6 +573,9 @@ async fn upsert_interrupted_action(
             set title = $2,
                 body_preview = $3,
                 payload = $4,
+                state = 'unread',
+                archived_at = null,
+                work_item_id = $5,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
             where id = $1
             "#,
@@ -581,6 +584,7 @@ async fn upsert_interrupted_action(
         .bind(title)
         .bind(reason)
         .bind(payload.to_string())
+        .bind(work_item_id)
         .execute(pool)
         .await
         .map_err(to_string)?;
@@ -607,6 +611,116 @@ async fn upsert_interrupted_action(
     .await
     .map_err(to_string)?;
     Ok(())
+}
+
+pub(crate) async fn recover_orphaned_interrupted_actions(pool: &SqlitePool) -> CommandResult<u64> {
+    let rows = sqlx::query(
+        r#"
+        select
+            b.stream_key,
+            b.agent_id,
+            b.run_id,
+            b.work_item_id,
+            b.channel_id,
+            b.thread_root_id,
+            b.reason,
+            b.base_version,
+            b.current_version,
+            b.body,
+            b.held_visible_events
+        from agent_output_buffers b
+        left join agent_work_items w on w.id = b.work_item_id
+        where b.state = 'held'
+          and (
+              b.work_item_id is null
+              or w.id is null
+              or w.status in ('cancelled', 'failed', 'done', 'silent')
+          )
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(to_string)?;
+
+    let mut recovered = 0;
+    for row in rows {
+        let stream_key: String = row.get("stream_key");
+        let agent_id: Uuid = row.get("agent_id");
+        let run_id: Option<Uuid> = row.get("run_id");
+        let dead_work_item_id: Option<Uuid> = row.get("work_item_id");
+        let channel_id: Uuid = row.get("channel_id");
+        let thread_root_id: Option<Uuid> = row.get("thread_root_id");
+        let reason: String = row.get("reason");
+        let base_version: i64 = row.get("base_version");
+        let current_version: i64 = row.get("current_version");
+        let body: String = row.get("body");
+        let held_visible_events_raw: String = row.get("held_visible_events");
+        let held_visible_events =
+            serde_json::from_str::<Vec<String>>(&held_visible_events_raw).unwrap_or_default();
+        let kind = InterruptedActionKind::from_buffer(&body, held_visible_events.len());
+        let action_kind = match kind {
+            InterruptedActionKind::PublicReply => PublishActionKind::ReplyText.as_str(),
+            InterruptedActionKind::VisibleControlEvent => "visible_control_event",
+        };
+        let payload = json!({
+            "interrupted_action": kind.as_str(),
+            "reason": reason,
+            "draft_body": body,
+            "base_version": base_version,
+            "current_version": current_version,
+            "base_thread_version": current_version,
+            "stream_key": stream_key,
+            "action_kind": action_kind,
+            "held_visible_events": held_visible_events,
+            "allowed_actions": kind.allowed_actions(),
+            "orphaned_work_item_id": dead_work_item_id,
+        });
+
+        sqlx::query(
+            r#"
+            update agent_output_buffers
+            set work_item_id = null,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+            where stream_key = $1
+              and state = 'held'
+            "#,
+        )
+        .bind(&stream_key)
+        .execute(pool)
+        .await
+        .map_err(to_string)?;
+
+        upsert_interrupted_action(
+            pool,
+            agent_id,
+            None,
+            channel_id,
+            thread_root_id,
+            &stream_key,
+            &reason,
+            payload,
+        )
+        .await?;
+        record_agent_activity(
+            pool,
+            Some(agent_id),
+            run_id,
+            "decision",
+            "Orphaned interrupted action recovered",
+            json!({
+                "stream_key": stream_key,
+                "work_item_id": dead_work_item_id,
+            })
+            .to_string(),
+        )
+        .await?;
+        recovered += 1;
+    }
+
+    if recovered > 0 {
+        notify_ui_refresh(pool, "orphaned_interrupted_actions_recovered").await?;
+    }
+    Ok(recovered)
 }
 
 #[allow(clippy::too_many_arguments)]
