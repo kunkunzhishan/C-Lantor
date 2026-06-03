@@ -17112,6 +17112,7 @@ mod tests {
         silent_reply_reason, split_complete_streaming_agent_event_lines,
         split_streaming_agent_event_lines, split_terminal_streaming_agent_event_lines,
         streaming_message_body_is_empty, supervisor_start_codex_streaming_agent,
+        tools::ToolHost,
         trim_ui_refresh_metric_lines_to_size, try_claim_unassigned_task, update_channel_in_pool,
         update_owner_profile_in_pool, upsert_agent_thread_subscription, upsert_runtime_thread_id,
         usage::{usage_from_run_log, usage_from_runtime_event},
@@ -17124,6 +17125,7 @@ mod tests {
         CODEX_TURN_START_TIMEOUT, STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER,
         UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
     };
+    use chrono::NaiveDate;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use serde_json::{json, Value};
     use sha2::Digest;
@@ -27376,6 +27378,47 @@ inline `@kunk` and after @longbaby
             .await
             .map_err(|err| err.to_string())?;
             assert!(system_body.contains("Next reminder:"));
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn calendar_shows_next_daily_reminder_without_expanding_month_range() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let channel_id = insert_test_channel(&pool, "calendar-daily-reminders").await?;
+            sqlx::query(
+                r#"
+                insert into reminders (channel_id, title, note, due_at, recurrence, status)
+                values ($1, 'Daily standup', 'Bring notes', '2026-06-04T09:00:00+00:00', 'daily', 'scheduled')
+                "#,
+            )
+            .bind(channel_id)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            let events = ToolHost::new(&pool)
+                .query_calendar_events(
+                    NaiveDate::from_ymd_opt(2026, 6, 4).unwrap(),
+                    NaiveDate::from_ymd_opt(2026, 6, 6).unwrap(),
+                )
+                .await?;
+            let daily_dates = events
+                .iter()
+                .filter(|event| event.title == "Daily standup")
+                .map(|event| event.date)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                daily_dates,
+                vec![NaiveDate::from_ymd_opt(2026, 6, 4).unwrap()]
+            );
+            assert!(events.iter().all(|event| event.kind == "repeat"));
             Ok(())
         }
         .await;

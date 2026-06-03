@@ -146,7 +146,7 @@ impl<'a> ToolHost<'a> {
                 ),
             }
         }));
-        events.sort_by_key(|event| event.date);
+        events.sort_by_key(|event| (event.date, event.time_label.clone()));
         Ok(events.into_iter().take(160).collect())
     }
 }

@@ -700,9 +700,18 @@ fn calendar_preview_html(
         agenda_events
             .iter()
             .map(|event| {
+                let recurrence_label = calendar_agenda_recurrence_label(event)
+                    .map(|label| {
+                        format!(
+                            r#"<span class="agenda-repeat-label">{}</span>"#,
+                            html_escape(label)
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    r#"<section class="agenda-row"><time>{}</time>{}</section>"#,
+                    r#"<section class="agenda-row"><div class="agenda-row-meta"><time>{}</time>{}</div>{}</section>"#,
                     html_escape(&event.date.format("%b %-d").to_string()),
+                    recurrence_label,
                     render_calendar_events(&[*event], true)
                 )
             })
@@ -1173,6 +1182,20 @@ body {{
   padding-top: 9px;
   text-transform: uppercase;
 }}
+.agenda-row-meta {{
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+}}
+.agenda-repeat-label {{
+  border: 1px solid rgba(15, 118, 110, 0.28);
+  border-radius: 999px;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1;
+  padding: 4px 7px;
+}}
 .empty-state {{
   color: var(--muted);
   border: 1px dashed var(--line);
@@ -1410,6 +1433,22 @@ fn calendar_event_detail(event: &CalendarPreviewEvent) -> String {
         event.title.trim().to_owned()
     } else {
         format!("{} · {}", event.title.trim(), event.detail.trim())
+    }
+}
+
+fn calendar_agenda_recurrence_label(event: &CalendarPreviewEvent) -> Option<&'static str> {
+    if event.kind != "repeat" {
+        return None;
+    }
+    let detail = event.detail.to_ascii_lowercase();
+    if detail.contains("repeats daily") {
+        Some("每日")
+    } else if detail.contains("repeats weekly") {
+        Some("每周")
+    } else if detail.contains("repeats ") {
+        Some("重复")
+    } else {
+        None
     }
 }
 
