@@ -98,6 +98,7 @@ const LANTOR_CONTEXT_TOOLS = [
   '- search: "$LANTOR_CONTEXT_TOOL" --agent-context-tool message-search --query "text" --target "#channel" --limit 20',
   '- attachment: "$LANTOR_CONTEXT_TOOL" --agent-context-tool attachment-info --attachment-id "<uuid>"',
   '- artifact: "$LANTOR_CONTEXT_TOOL" --agent-context-tool artifact-read --artifact-id "<uuid>"',
+  '- run: "$LANTOR_CONTEXT_TOOL" --agent-context-tool run-read --run-id "<uuid-or-prefix>" --limit 12000',
   '- agent introspection: "$LANTOR_CONTEXT_TOOL" --agent-context-tool agent-inspect --target "@handle"',
   'Inbox and workspace commands default to your own LANTOR_AGENT_ID; add --target "@handle" only when inspecting another visible agent.',
   "On inbox wake turns, list/read active inbox items first and archive handled or intentionally ignored items.",

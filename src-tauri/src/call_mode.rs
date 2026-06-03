@@ -6498,14 +6498,14 @@ else:
         let utterances = load_call_utterances(&pool).await.unwrap();
         let dispatches = load_call_dispatches(&pool).await.unwrap();
 
-        assert_eq!(utterances.len(), 405);
-        assert_eq!(utterances.first().unwrap().sequence, 1);
+        assert_eq!(utterances.len(), CALL_BOOTSTRAP_UTTERANCE_LIMIT as usize);
+        assert_eq!(utterances.first().unwrap().sequence, 246);
         assert_eq!(utterances.last().unwrap().sequence, 405);
-        assert_eq!(utterances.first().unwrap().transcript, "utterance 1");
+        assert_eq!(utterances.first().unwrap().transcript, "utterance 246");
         assert_eq!(utterances.last().unwrap().transcript, "utterance 405");
 
-        assert_eq!(dispatches.len(), 405);
-        assert_eq!(dispatches.first().unwrap().ack_text, "ack 1");
+        assert_eq!(dispatches.len(), CALL_BOOTSTRAP_DISPATCH_LIMIT as usize);
+        assert_eq!(dispatches.first().unwrap().ack_text, "ack 246");
         assert_eq!(dispatches.last().unwrap().ack_text, "ack 405");
     }
 }

@@ -373,8 +373,13 @@ function codexServiceTierLabel(value: string) {
 
 function agentModelSummary(agent: Agent) {
   const base = `${runtimeLabel(agent.runtime)} · ${modelLabel(agent.model)}`;
-  if (agent.runtime !== "codex") return base;
-  return `${base} · ${codexReasoningEffortLabel(agent.reasoning_effort)} intelligence · ${codexServiceTierLabel(agent.service_tier)} speed`;
+  if (agent.runtime === "codex") {
+    return `${base} · ${codexReasoningEffortLabel(agent.reasoning_effort)} intelligence · ${codexServiceTierLabel(agent.service_tier)} speed`;
+  }
+  if (agent.runtime === "claude") {
+    return `${base} · ${codexReasoningEffortLabel(agent.reasoning_effort)} intelligence`;
+  }
+  return base;
 }
 
 function isMarkdownWorkspaceFile(file: AgentWorkspaceFile) {
@@ -538,6 +543,7 @@ export function AgentDetailDrawer({
 
   function renderProfilePanel() {
     const isCodex = agent.runtime === "codex";
+    const supportsReasoningEffort = agent.runtime === "codex" || agent.runtime === "claude";
     return (
       <>
         <section className="detail-section model-section">
@@ -554,16 +560,18 @@ export function AgentDetailDrawer({
               <span>Model</span>
               <code>{modelLabel(agent.model)}</code>
             </div>
-            {isCodex && (
+            {supportsReasoningEffort && (
               <>
                 <div>
                   <span>Intelligence</span>
                   <code>{codexReasoningEffortLabel(agent.reasoning_effort)}</code>
                 </div>
-                <div>
-                  <span>Speed</span>
-                  <code>{codexServiceTierLabel(agent.service_tier)}</code>
-                </div>
+                {isCodex && (
+                  <div>
+                    <span>Speed</span>
+                    <code>{codexServiceTierLabel(agent.service_tier)}</code>
+                  </div>
+                )}
               </>
             )}
           </div>

@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowLeft, Bookmark, CheckCircle2, Hash, ListTodo, MessageSquare, Mic, Paperclip, RotateCcw, Send, Square, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, Bookmark, CheckCircle2, Crosshair, Hash, ListTodo, MessageSquare, Mic, Paperclip, RotateCcw, Send, Square, X } from "lucide-react";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from "react";
 import { useAutoGrowTextarea } from "../hooks/useAutoGrowTextarea";
 import { useMentionPicker } from "../hooks/useMentionPicker";
@@ -117,6 +117,7 @@ type ThreadPanelProps = {
   focusedMessageId: string | null;
   onToggleMessageSaved: (message: Message, saved: boolean) => void;
   onToggleMessageTodo: (message: Message, todo: boolean) => void;
+  onLocateRoot: (message: Message) => void;
   onResizeStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 };
 
@@ -162,6 +163,7 @@ export function ThreadPanel({
   focusedMessageId,
   onToggleMessageSaved,
   onToggleMessageTodo,
+  onLocateRoot,
   onResizeStart,
 }: ThreadPanelProps) {
   const [isReplyDragOver, setIsReplyDragOver] = useState(false);
@@ -277,6 +279,7 @@ export function ThreadPanel({
     shouldFollowThreadRef.current = false;
     cancelPendingThreadBottomScroll();
     if (element) rememberThreadScrollMetrics(element);
+    setShowBackToBottom(Boolean(activeRoot) && element ? !isThreadScrollAtBottom(element) : false);
   }
 
   function isPointerOnThreadScrollbar(event: ReactPointerEvent<HTMLDivElement>) {
@@ -291,6 +294,7 @@ export function ThreadPanel({
     if (!element) return;
     userThreadScrollUntilRef.current = 0;
     element.scrollTo({ top: element.scrollHeight, behavior });
+    setShowBackToBottom(false);
     if (behavior === "auto") {
       shouldFollowThreadRef.current = true;
       rememberThreadScrollMetrics(element);
@@ -355,7 +359,7 @@ export function ThreadPanel({
   function returnThreadToBottom() {
     shouldFollowThreadRef.current = true;
     setShowBackToBottom(false);
-    scrollThreadToBottom();
+    scrollThreadToBottom("smooth");
     window.requestAnimationFrame(() => {
       scrollThreadToBottom();
       shouldFollowThreadRef.current = true;
@@ -622,6 +626,19 @@ export function ThreadPanel({
             Thread <span>{channel ? isDm ? `- @${dmAgent?.handle || "agent"}` : `- #${channel.name}` : "- no channel"}</span>
           </h2>
         </div>
+        <button
+          type="button"
+          className="thread-locate-root"
+          onClick={() => {
+            if (activeRoot) onLocateRoot(activeRoot);
+          }}
+          disabled={!activeRoot}
+          data-tooltip="Show root in channel"
+          title="Show root in channel"
+          aria-label="Show thread root in channel"
+        >
+          <Crosshair size={18} />
+        </button>
         <button type="button" className="thread-close" onClick={onClose} aria-label="Close thread panel"><X size={18} /></button>
       </header>
 

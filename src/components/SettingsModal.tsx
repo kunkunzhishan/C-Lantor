@@ -1,7 +1,6 @@
 import { Type } from "lucide-react";
+import { CHAT_TEXT_SIZE_LABELS, CHAT_TEXT_SIZE_OPTIONS, type ChatTextSize } from "../chatTextSize";
 import { Modal } from "./Modal";
-
-export type ChatTextSize = "compact" | "default" | "large" | "xlarge";
 
 type SettingsModalProps = {
   open: boolean;
@@ -9,17 +8,6 @@ type SettingsModalProps = {
   onChatTextSizeChange: (value: ChatTextSize) => void;
   onClose: () => void;
 };
-
-const CHAT_TEXT_SIZE_OPTIONS: Array<{
-  value: ChatTextSize;
-  label: string;
-  detail: string;
-}> = [
-  { value: "compact", label: "Small", detail: "Compact UI" },
-  { value: "default", label: "Default", detail: "Current scale" },
-  { value: "large", label: "Large", detail: "More readable" },
-  { value: "xlarge", label: "Extra", detail: "Largest" },
-];
 
 export function SettingsModal({
   open,
@@ -36,21 +24,24 @@ export function SettingsModal({
         <fieldset className="settings-fieldset">
           <legend>Text size</legend>
           <div className="chat-text-size-grid">
-            {CHAT_TEXT_SIZE_OPTIONS.map((option) => (
-              <button
-                type="button"
-                key={option.value}
-                className={chatTextSize === option.value ? "selected" : ""}
-                aria-pressed={chatTextSize === option.value}
-                onClick={() => onChatTextSizeChange(option.value)}
-              >
-                <Type size={17} />
-                <span>
-                  <strong>{option.label}</strong>
-                  <small>{option.detail}</small>
-                </span>
-              </button>
-            ))}
+            {CHAT_TEXT_SIZE_OPTIONS.map((value) => {
+              const option = CHAT_TEXT_SIZE_LABELS[value];
+              return (
+                <button
+                  type="button"
+                  key={value}
+                  className={chatTextSize === value ? "selected" : ""}
+                  aria-pressed={chatTextSize === value}
+                  onClick={() => onChatTextSizeChange(value)}
+                >
+                  <Type size={17} />
+                  <span>
+                    <strong>{option.label}</strong>
+                    <small>{option.detail}</small>
+                  </span>
+                </button>
+              );
+            })}
           </div>
           <p className="settings-hint">Applies across messages, inputs, panels, and modals. Use Command/Ctrl+, to open Settings, Command/Ctrl +/- to adjust, and Command/Ctrl+0 to reset.</p>
         </fieldset>

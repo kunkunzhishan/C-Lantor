@@ -16,6 +16,8 @@ export type RefreshMetricsSnapshot = {
   stateUpdateByReason: Record<string, number>;
   lastBootstrapAt: number | null;
   lastBootstrapReason: string | null;
+  lastBootstrapDurationMs: number | null;
+  averageBootstrapDurationMs: number | null;
 };
 
 type DiagnosticsModalProps = {
@@ -41,6 +43,12 @@ function formatRuntime(startedAt: number) {
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   return minutes > 0 ? `${minutes}m ${remainder}s` : `${remainder}s`;
+}
+
+function formatDuration(value: number | null | undefined) {
+  if (typeof value !== "number") return "none";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return `${(value / 1000).toFixed(1)}s`;
 }
 
 export function DiagnosticsModal({
@@ -91,6 +99,14 @@ export function DiagnosticsModal({
           <span>
             <strong>{metrics?.stateUpdateCount ?? 0}</strong>
             <small>State updates</small>
+          </span>
+          <span>
+            <strong>{formatDuration(metrics?.averageBootstrapDurationMs)}</strong>
+            <small>Avg duration</small>
+          </span>
+          <span>
+            <strong>{formatDuration(metrics?.lastBootstrapDurationMs)}</strong>
+            <small>Last duration</small>
           </span>
         </div>
 

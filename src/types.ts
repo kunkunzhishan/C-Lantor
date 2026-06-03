@@ -562,6 +562,19 @@ export const CODEX_REASONING_EFFORTS = [
   { value: "xhigh", label: "Extra High" },
 ] as const;
 
+export const CLAUDE_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.filter((effort) => effort.value !== "xhigh");
+
+export function reasoningEffortsForRuntime(runtime: string) {
+  return runtime === "claude" ? CLAUDE_REASONING_EFFORTS : CODEX_REASONING_EFFORTS;
+}
+
+export function normalizedReasoningEffortForRuntime(runtime: string, value: string) {
+  const options = reasoningEffortsForRuntime(runtime);
+  const normalized = value.trim() || "medium";
+  if (options.some((effort) => effort.value === normalized)) return normalized;
+  return "medium";
+}
+
 export const CODEX_SERVICE_TIERS = [
   { value: "", label: "Standard" },
   { value: "fast", label: "Fast" },

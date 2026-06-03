@@ -9,6 +9,7 @@ type ChannelSettingsModalProps = {
   channelMemberIds: Set<string>;
   nameDraft: string;
   descriptionDraft: string;
+  nameError?: string | null;
   onNameChange: (value: string) => void;
   onDescriptionChange: (value: string) => void;
   onSetMember: (agentId: string, member: boolean) => void;
@@ -24,6 +25,7 @@ export function ChannelSettingsModal({
   channelMemberIds,
   nameDraft,
   descriptionDraft,
+  nameError,
   onNameChange,
   onDescriptionChange,
   onSetMember,
@@ -48,8 +50,15 @@ export function ChannelSettingsModal({
               value={nameDraft}
               onChange={(event) => onNameChange(event.target.value)}
               placeholder="channel-name"
+              aria-invalid={nameError ? true : undefined}
+              aria-describedby={nameError ? "channel-settings-name-error" : undefined}
             />
           </label>
+          {nameError && (
+            <p id="channel-settings-name-error" className="modal-field-error">
+              {nameError}
+            </p>
+          )}
           <label>
             <span>Description</span>
             <textarea
@@ -87,7 +96,7 @@ export function ChannelSettingsModal({
             <button type="button" className="danger" onClick={onDelete}>Delete Channel</button>
             <div>
               <button type="button" onClick={onCancel}>Cancel</button>
-              <button type="button" className="primary" disabled={!nameDraft.trim()} onClick={onSave}>Save</button>
+              <button type="button" className="primary" disabled={!nameDraft.trim() || Boolean(nameError)} onClick={onSave}>Save</button>
             </div>
           </div>
         </div>

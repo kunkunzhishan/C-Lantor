@@ -1,7 +1,7 @@
 # Agent Runtime Model
 
 Lantor runs agents as local processes. Each agent profile stores runtime
-configuration, a model, Codex reasoning and speed preferences, an optional
+configuration, a model, runtime reasoning preferences, Codex speed preferences, an optional
 custom launch command, an optional working directory, and profile metadata. The
 desktop app starts the same binary in
 `--supervisor` mode; the supervisor owns process launch, stop commands, run
@@ -50,6 +50,7 @@ process inbox wakeups.
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool attachment-info --attachment-id "<uuid>"
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool artifact-read --artifact-id "<uuid>"
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool call-utterance-read --utterance-id "<uuid>"
+"$LANTOR_CONTEXT_TOOL" --agent-context-tool run-read --run-id "<uuid-or-prefix>" --limit 12000
 "$LANTOR_CONTEXT_TOOL" --agent-context-tool agent-inspect --target "@handle"
 ```
 
