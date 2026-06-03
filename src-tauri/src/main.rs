@@ -12021,7 +12021,11 @@ async fn wait_for_agent_run(
             "cancelled"
         } else if current_status.as_deref() == Some("silent") && run_status == "exited" {
             "silent"
-        } else if run_status == "exited" {
+        } else if run_status == "exited"
+            && run_has_visible_message_result(&pool, run_id)
+                .await
+                .unwrap_or(false)
+        {
             "done"
         } else {
             "failed"
@@ -12063,6 +12067,23 @@ async fn wait_for_agent_run(
         log_line.trim(),
     )
     .await;
+}
+
+async fn run_has_visible_message_result(pool: &SqlitePool, run_id: Uuid) -> CommandResult<bool> {
+    let stream_prefix = format!("{run_id}:%");
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)
+        from messages
+        where trim(body) <> ''
+          and stream_key like $1
+        "#,
+    )
+    .bind(stream_prefix)
+    .fetch_one(pool)
+    .await
+    .map_err(to_string)?;
+    Ok(count > 0)
 }
 
 fn effective_launch_command(
@@ -14187,21 +14208,6 @@ async fn supervisor_start_codex_streaming_agent(
     .await?;
 
     let pending_stream_key = codex_pending_stream_key(run_id);
-    if let Some(channel_id) = channel_id {
-        if let Err(err) = ensure_streaming_agent_message(
-            pool,
-            agent_id,
-            channel_id,
-            thread_root_id,
-            &pending_stream_key,
-        )
-        .await
-        {
-            cleanup_failed_warm_codex_start(pool, agent_id, run_id, work_item_id, &err, false)
-                .await?;
-            return Err(err);
-        }
-    }
 
     let cwd = match effective_codex_cwd(&working_directory) {
         Ok(cwd) => cwd,
@@ -17109,11 +17115,11 @@ mod tests {
         trim_ui_refresh_metric_lines_to_size, try_claim_unassigned_task, update_channel_in_pool,
         update_owner_profile_in_pool, upsert_agent_thread_subscription, upsert_runtime_thread_id,
         usage::{usage_from_run_log, usage_from_runtime_event},
-        validate_event_ingest_work_item_done, AgentAttachmentFile, AgentEvent, AgentInboxItemInput,
-        AgentMessageControlDemuxState, ClaudeActiveTurn, ClaudeSurface, CodexActiveTurn,
-        CodexActiveTurnReapReason, CodexActiveTurnScheduleState, InboxWakeItem, InboxWakeSummary,
-        MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState, WarmCodexRegistry,
-        WarmCodexRuntime, WarmCodexState, WindowMonitorBounds, WindowState,
+        validate_event_ingest_work_item_done, wait_for_agent_run, AgentAttachmentFile, AgentEvent,
+        AgentInboxItemInput, AgentMessageControlDemuxState, ClaudeActiveTurn, ClaudeSurface,
+        CodexActiveTurn, CodexActiveTurnReapReason, CodexActiveTurnScheduleState, InboxWakeItem,
+        InboxWakeSummary, MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState,
+        WarmCodexRegistry, WarmCodexRuntime, WarmCodexState, WindowMonitorBounds, WindowState,
         CODEX_ACTIVE_TURN_IDLE_TIMEOUT, CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS,
         CODEX_TURN_START_TIMEOUT, STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER,
         UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
@@ -20233,6 +20239,61 @@ inline `@kunk` and after @longbaby
         .map_err(|err| err.to_string())
     }
 
+    async fn insert_running_work_item_with_run(
+        pool: &SqlitePool,
+        agent_id: Uuid,
+        channel_id: Uuid,
+        title: &str,
+    ) -> Result<(Uuid, Uuid), String> {
+        let source_message_id: Uuid = sqlx::query_scalar(
+            r#"
+            insert into messages (channel_id, sender_name, sender_role, body)
+            values ($1, 'Dylan', 'owner', $2)
+            returning id
+            "#,
+        )
+        .bind(channel_id)
+        .bind(title)
+        .fetch_one(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+        let work_item_id: Uuid = sqlx::query_scalar(
+            r#"
+            insert into agent_work_items (
+                agent_id, channel_id, thread_root_id, source_message_id, source_kind, title, context, status
+            )
+            values ($1, $2, $3, $3, 'mention', $4, $4, 'running')
+            returning id
+            "#,
+        )
+        .bind(agent_id)
+        .bind(channel_id)
+        .bind(source_message_id)
+        .bind(title)
+        .fetch_one(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+        let run_id: Uuid = sqlx::query_scalar(
+            r#"
+            insert into agent_runs (agent_id, work_item_id, command, status)
+            values ($1, $2, 'codex app-server', 'running')
+            returning id
+            "#,
+        )
+        .bind(agent_id)
+        .bind(work_item_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|err| err.to_string())?;
+        sqlx::query("update agent_work_items set run_id = $2 where id = $1")
+            .bind(work_item_id)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok((work_item_id, run_id))
+    }
+
     async fn insert_publish_gate_work(
         pool: &SqlitePool,
         agent_id: Uuid,
@@ -23010,6 +23071,191 @@ inline `@kunk` and after @longbaby
             let reminders = load_reminders(&pool).await?;
             assert_eq!(reminders.len(), 1);
             assert_eq!(reminders[0].recurrence, "every:20m");
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn hidden_only_control_event_run_does_not_complete_work_item() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "hidden-only-agent").await?;
+            let channel_id = insert_test_channel(&pool, "hidden-only-control").await?;
+            let (work_item_id, run_id) =
+                insert_running_work_item_with_run(&pool, agent_id, channel_id, "inspect memory")
+                    .await?;
+            let stream_key = format!("{run_id}:item-1");
+            let event = json!({
+                "type": "activity",
+                "kind": "command",
+                "title": "Checking",
+                "detail": "hidden progress only"
+            });
+            append_streaming_agent_message(
+                &pool,
+                agent_id,
+                channel_id,
+                None,
+                &stream_key,
+                &format!("LANTOR_EVENT {event}"),
+            )
+            .await?;
+
+            consume_streaming_agent_control_lines(
+                &pool,
+                agent_id,
+                run_id,
+                Some(work_item_id),
+                &stream_key,
+            )
+            .await?;
+
+            let child = Command::new("true")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|err| err.to_string())?;
+            wait_for_agent_run(
+                pool.clone(),
+                agent_id,
+                run_id,
+                Some(work_item_id),
+                vec![],
+                child,
+            )
+            .await;
+
+            let status: String =
+                sqlx::query_scalar("select status from agent_work_items where id = $1")
+                    .bind(work_item_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(status, "failed");
+
+            let visible_messages: i64 = sqlx::query_scalar(
+                "select count(*) from messages where sender_agent_id = $1 and stream_key = $2",
+            )
+            .bind(agent_id)
+            .bind(&stream_key)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(visible_messages, 0);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn visible_reply_run_completes_work_item() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "visible-reply-agent").await?;
+            let channel_id = insert_test_channel(&pool, "visible-reply-control").await?;
+            let (work_item_id, run_id) =
+                insert_running_work_item_with_run(&pool, agent_id, channel_id, "answer me")
+                    .await?;
+            let stream_key = format!("{run_id}:item-1");
+            sqlx::query(
+                r#"
+                insert into messages (
+                    channel_id, sender_agent_id, sender_name, sender_role, body, delivery_state, stream_key
+                )
+                values ($1, $2, 'visible-reply-agent', 'agent', 'Visible reply', 'complete', $3)
+                "#,
+            )
+            .bind(channel_id)
+            .bind(agent_id)
+            .bind(&stream_key)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            let child = Command::new("true")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|err| err.to_string())?;
+            wait_for_agent_run(pool.clone(), agent_id, run_id, Some(work_item_id), vec![], child)
+                .await;
+
+            let status: String =
+                sqlx::query_scalar("select status from agent_work_items where id = $1")
+                    .bind(work_item_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(status, "done");
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn explicit_silent_reply_run_stays_silent() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "silent-reply-agent").await?;
+            let channel_id = insert_test_channel(&pool, "silent-reply-control").await?;
+            let (work_item_id, run_id) =
+                insert_running_work_item_with_run(&pool, agent_id, channel_id, "maybe ignore")
+                    .await?;
+            let stream_key = format!("{run_id}:item-1");
+            append_streaming_agent_message(
+                &pool,
+                agent_id,
+                channel_id,
+                None,
+                &stream_key,
+                "LANTOR_SILENT_REPLY: no visible response needed",
+            )
+            .await?;
+
+            consume_streaming_agent_control_lines(
+                &pool,
+                agent_id,
+                run_id,
+                Some(work_item_id),
+                &stream_key,
+            )
+            .await?;
+
+            let child = Command::new("true")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|err| err.to_string())?;
+            wait_for_agent_run(
+                pool.clone(),
+                agent_id,
+                run_id,
+                Some(work_item_id),
+                vec![],
+                child,
+            )
+            .await;
+
+            let status: String =
+                sqlx::query_scalar("select status from agent_work_items where id = $1")
+                    .bind(work_item_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(status, "silent");
             Ok(())
         }
         .await;
@@ -25983,7 +26229,7 @@ inline `@kunk` and after @longbaby
     }
 
     #[tokio::test]
-    async fn supervisor_warm_codex_pre_active_failure_records_task_activity() {
+    async fn supervisor_warm_codex_start_does_not_create_empty_placeholder() {
         let Some((pool, schema)) = test_pool().await else {
             return;
         };
@@ -26065,7 +26311,7 @@ inline `@kunk` and after @longbaby
             .await;
             let _ = child.kill().await;
             let _ = child.wait().await;
-            assert!(start_result.is_err());
+            assert!(start_result.is_ok(), "{:?}", start_result.err());
 
             let work_row = sqlx::query(
                 "select status, run_id, completed_at from agent_work_items where id = $1",
@@ -26076,9 +26322,9 @@ inline `@kunk` and after @longbaby
             .map_err(|err| err.to_string())?;
             let run_id: Uuid = work_row
                 .get::<Option<Uuid>, _>("run_id")
-                .ok_or_else(|| "work item should keep failed run id".to_owned())?;
-            assert_eq!(work_row.get::<String, _>("status"), "failed");
-            assert!(work_row.get::<Option<String>, _>("completed_at").is_some());
+                .ok_or_else(|| "work item should keep running run id".to_owned())?;
+            assert_eq!(work_row.get::<String, _>("status"), "running");
+            assert!(work_row.get::<Option<String>, _>("completed_at").is_none());
 
             let run_status: String =
                 sqlx::query_scalar("select status from agent_runs where id = $1")
@@ -26086,7 +26332,7 @@ inline `@kunk` and after @longbaby
                     .fetch_one(&pool)
                     .await
                     .map_err(|err| err.to_string())?;
-            assert_eq!(run_status, "failed");
+            assert_eq!(run_status, "running");
 
             let agent_status: String =
                 sqlx::query_scalar("select status from agents where id = $1")
@@ -26094,24 +26340,22 @@ inline `@kunk` and after @longbaby
                     .fetch_one(&pool)
                     .await
                     .map_err(|err| err.to_string())?;
-            assert_eq!(agent_status, "error");
+            assert_eq!(agent_status, "running");
 
-            let task_activity_count: i64 = sqlx::query_scalar(
+            let empty_message_count: i64 = sqlx::query_scalar(
                 r#"
                 select count(*)
-                from agent_activities
-                where agent_id = $1
-                  and run_id = $2
-                  and kind = 'task'
-                  and title = 'Task run failed'
+                from messages
+                where sender_agent_id = $1
+                  and stream_key = $2
                 "#,
             )
             .bind(agent_id)
-            .bind(run_id)
+            .bind(codex_pending_stream_key(run_id))
             .fetch_one(&pool)
             .await
             .map_err(|err| err.to_string())?;
-            assert_eq!(task_activity_count, 1);
+            assert_eq!(empty_message_count, 0);
             Ok(())
         }
         .await;
