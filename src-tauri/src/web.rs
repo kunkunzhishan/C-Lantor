@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     env,
     net::SocketAddr,
@@ -519,6 +520,7 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
             post(api_agent_workspace_read_file),
         )
         .route("/tool/calendar", get(tool_calendar_preview))
+        .route("/tool/monitoring", get(tool_monitoring_preview))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_web_auth,
@@ -547,6 +549,156 @@ struct CalendarPreviewQuery {
 }
 
 type CalendarPreviewEvent = ToolEvent;
+
+#[derive(Debug, Deserialize)]
+struct MonitoringPreviewQuery {
+    scope: Option<String>,
+    agent: Option<String>,
+    window: Option<String>,
+    bucket: Option<String>,
+    metric: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn tool_monitoring_preview(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<MonitoringPreviewQuery>,
+) -> Response {
+    let scope = query
+        .scope
+        .as_deref()
+        .and_then(normalize_monitoring_scope)
+        .unwrap_or("global");
+    let window = query
+        .window
+        .as_deref()
+        .and_then(normalize_monitoring_window)
+        .unwrap_or("24h");
+    let bucket = query
+        .bucket
+        .as_deref()
+        .and_then(normalize_monitoring_bucket)
+        .unwrap_or("day");
+    let metric = query
+        .metric
+        .as_deref()
+        .and_then(normalize_monitoring_metric)
+        .unwrap_or("total_tokens");
+    let token_metric = if monitoring_metric_is_memory(metric) {
+        "total_tokens"
+    } else {
+        metric
+    };
+    let limit = query.limit.unwrap_or(8).clamp(1, 25);
+    let agent = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut summary = ToolHost::new(&state.pool)
+        .query_monitoring_summary(scope, agent, window, limit)
+        .await
+        .unwrap_or_else(|err| json!({ "error": err, "scope": scope, "window": window }));
+    let handle = if scope == "agent" {
+        agent.map(|value| value.trim().trim_start_matches('@'))
+    } else {
+        None
+    };
+    if scope == "compare" {
+        if let Ok(series) = ToolHost::new(&state.pool)
+            .query_monitoring_agent_time_series(
+                summary.get("since").and_then(Value::as_str),
+                bucket,
+                token_metric,
+            )
+            .await
+        {
+            summary["agent_time_series"] = series;
+        }
+    } else if let Ok(series) = ToolHost::new(&state.pool)
+        .query_monitoring_time_series(
+            summary.get("since").and_then(Value::as_str),
+            handle,
+            bucket,
+            token_metric,
+        )
+        .await
+    {
+        summary["time_series"] = series;
+    }
+    if let Ok(series) = ToolHost::new(&state.pool)
+        .query_monitoring_memory_layer_time_series(
+            summary.get("since").and_then(Value::as_str),
+            handle,
+            bucket,
+        )
+        .await
+    {
+        summary["memory_layer_time_series"] = series;
+    }
+    summary["bucket"] = json!(bucket);
+    summary["metric"] = json!(token_metric);
+    let html = monitoring_preview_html(&summary);
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            ),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+fn normalize_monitoring_scope(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "global" => Some("global"),
+        "agent" => Some("agent"),
+        "compare" => Some("compare"),
+        _ => None,
+    }
+}
+
+fn normalize_monitoring_window(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "24h" => Some("24h"),
+        "7d" => Some("7d"),
+        "30d" => Some("30d"),
+        "all" => Some("all"),
+        _ => None,
+    }
+}
+
+fn normalize_monitoring_bucket(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "day" | "daily" | "days" => Some("day"),
+        "week" | "weekly" | "weeks" => Some("week"),
+        _ => None,
+    }
+}
+
+fn normalize_monitoring_metric(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "total" | "total_tokens" | "tokens" => Some("total_tokens"),
+        "input" | "input_tokens" => Some("input_tokens"),
+        "output" | "output_tokens" => Some("output_tokens"),
+        "cost" | "cost_usd" => Some("cost_usd"),
+        "runs" => Some("runs"),
+        "memory" | "memory_reads" | "memory_accesses" => Some("memory_reads"),
+        "memory_bytes" | "memory_read_bytes" => Some("memory_read_bytes"),
+        _ => None,
+    }
+}
+
+fn monitoring_metric_is_memory(metric: &str) -> bool {
+    matches!(metric, "memory_reads" | "memory_read_bytes")
+}
 
 async fn tool_calendar_preview(
     State(state): State<Arc<WebState>>,
@@ -653,6 +805,751 @@ fn parse_calendar_preview_events(value: &str) -> Vec<CalendarPreviewEvent> {
         })
         .take(24)
         .collect()
+}
+
+fn monitoring_preview_html(summary: &Value) -> String {
+    let scope = summary
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("global");
+    let window = summary
+        .get("window")
+        .and_then(Value::as_str)
+        .unwrap_or("24h");
+    let bucket = summary
+        .get("bucket")
+        .and_then(Value::as_str)
+        .unwrap_or("day");
+    let metric = summary
+        .get("metric")
+        .and_then(Value::as_str)
+        .unwrap_or("total_tokens");
+    let agents = summary
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let selected_agent = summary.get("agent").unwrap_or(&Value::Null);
+    let current_agent = selected_agent
+        .get("handle")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let totals = if scope == "agent" {
+        selected_agent
+    } else {
+        summary.get("global").unwrap_or(&Value::Null)
+    };
+    let series = summary
+        .get("time_series")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let metric_label = monitoring_metric_label(metric);
+    let metric_sum_label = monitoring_metric_sum_label(metric);
+    let metric_total = monitoring_metric_display(totals, metric);
+    let max_metric = series
+        .iter()
+        .map(|point| monitoring_metric_value(point, metric))
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let compare_series = summary
+        .get("agent_time_series")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let compare_model = if scope == "compare" {
+        Some(monitoring_compare_model(compare_series, metric))
+    } else {
+        None
+    };
+    let chart_bars = match compare_model.as_ref() {
+        Some(model) => monitoring_compare_chart_bars(model, metric),
+        None => monitoring_chart_bars(series, metric, max_metric),
+    };
+    let memory_series = summary
+        .get("memory_layer_time_series")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let memory_chart_bars = monitoring_memory_layer_chart_bars(memory_series);
+    let memory_legend = monitoring_memory_layer_legend();
+    let memory_inventory = summary.get("memory_inventory").unwrap_or(&Value::Null);
+    let memory_inventory_chips = monitoring_memory_inventory_chips(memory_inventory);
+    let legend = compare_model
+        .as_ref()
+        .map(monitoring_compare_legend)
+        .unwrap_or_default();
+    let subject = match scope {
+        "agent" => monitoring_agent_label(selected_agent),
+        "compare" => "Agent compare".to_owned(),
+        _ => "All agents".to_owned(),
+    };
+    let window_controls = render_monitoring_dropdown(
+        "Time",
+        monitoring_control_label(window),
+        render_monitoring_links(
+            ["24h", "7d", "30d", "all"].as_slice(),
+            window,
+            |candidate| monitoring_view_url(scope, current_agent, candidate, bucket, metric, 12),
+        ),
+    );
+    let bucket_controls = render_monitoring_dropdown(
+        "Bucket",
+        monitoring_control_label(bucket),
+        render_monitoring_links(["day", "week"].as_slice(), bucket, |candidate| {
+            monitoring_view_url(scope, current_agent, window, candidate, metric, 12)
+        }),
+    );
+    let metric_controls = render_monitoring_dropdown(
+        "Metric",
+        monitoring_control_label(metric),
+        render_monitoring_links(
+            [
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+                "cost_usd",
+                "runs",
+            ]
+            .as_slice(),
+            metric,
+            |candidate| monitoring_view_url(scope, current_agent, window, bucket, candidate, 12),
+        ),
+    );
+    let mut agent_links = vec![format!(
+        r#"<a class="{}" href="{}">All</a>"#,
+        if scope == "global" {
+            "control active"
+        } else {
+            "control"
+        },
+        html_escape(&monitoring_view_url(
+            "global", None, window, bucket, metric, 12
+        ))
+    )];
+    agent_links.push(format!(
+        r#"<a class="{}" href="{}">Compare</a>"#,
+        if scope == "compare" {
+            "control active"
+        } else {
+            "control"
+        },
+        html_escape(&monitoring_view_url(
+            "compare", None, window, bucket, metric, 12
+        ))
+    ));
+    let mut sorted_agents = agents.iter().collect::<Vec<_>>();
+    sorted_agents.sort_by_key(|agent| monitoring_agent_label(agent).to_ascii_lowercase());
+    agent_links.extend(sorted_agents.into_iter().map(|agent| {
+        let handle = value_str(agent, "handle");
+        let label = monitoring_agent_label(agent);
+        let class = if scope == "agent" && current_agent == Some(handle) {
+            "control active"
+        } else {
+            "control"
+        };
+        format!(
+            r#"<a class="{class}" href="{}">{}</a>"#,
+            html_escape(&monitoring_view_url(
+                "agent",
+                Some(handle),
+                window,
+                bucket,
+                metric,
+                12
+            )),
+            html_escape(&label)
+        )
+    }));
+    let agent_controls = render_monitoring_dropdown("Agent", subject.clone(), agent_links.join(""));
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lantor Monitoring</title>
+<style>
+:root {{ color-scheme: light; --ink:#17202a; --muted:#64748b; --line:#d9dee7; --panel:#fff; --bg:#f5f7fb; --accent:#0f766e; --accent-2:#2563eb; --axis:#eef2f7; }}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; min-height:100vh; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:var(--bg); }}
+.shell {{ width:100%; max-width:1120px; margin:0 auto; padding:28px; overflow:hidden; }}
+.toolbar {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:16px; }}
+h1 {{ margin:0; font-size:24px; line-height:1.15; letter-spacing:0; }}
+.muted {{ color:var(--muted); }}
+.chip {{ border:1px solid var(--line); background:var(--panel); border-radius:7px; padding:5px 8px; font-size:12px; color:var(--muted); white-space:nowrap; }}
+.controls {{ display:flex; flex-wrap:nowrap; gap:8px; margin-bottom:12px; align-items:start; overflow:visible; padding-bottom:2px; }}
+.filter {{ position:relative; min-width:0; flex:1 1 0; }}
+.filter summary {{ list-style:none; display:flex; align-items:center; justify-content:space-between; gap:8px; border:1px solid var(--line); background:#fff; border-radius:7px; padding:6px 8px; cursor:pointer; min-width:0; }}
+.filter summary::-webkit-details-marker {{ display:none; }}
+.filter-label {{ color:var(--muted); font-size:12px; line-height:1; white-space:nowrap; }}
+.filter-label::after {{ content:":"; }}
+.filter-value {{ color:#1f2937; font-size:13px; line-height:1; font-weight:680; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }}
+.filter-current {{ display:flex; align-items:center; gap:5px; min-width:0; }}
+.filter-arrow {{ color:#64748b; font-size:12px; line-height:1; transition:transform .12s ease; }}
+.filter[open] .filter-arrow {{ transform:rotate(180deg); }}
+.filter-menu {{ position:absolute; z-index:10; top:calc(100% + 5px); left:0; right:0; display:grid; gap:5px; min-width:170px; max-height:260px; overflow:auto; border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px; box-shadow:0 14px 34px rgba(15,23,42,.14); }}
+.control {{ flex:0 0 auto; border:1px solid var(--line); background:#fff; color:#334155; border-radius:7px; padding:7px 10px; font-size:13px; text-decoration:none; line-height:1; max-width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.filter-menu .control {{ display:block; max-width:none; width:100%; }}
+.control.active {{ border-color:#0f766e; background:#e7f5f1; color:#0f4f49; font-weight:720; }}
+.total {{ display:flex; margin:12px 0 14px; }}
+.sum-chip {{ display:inline-flex; align-items:baseline; gap:10px; border:1px solid #b8d8d2; background:#f2fbf8; border-radius:7px; padding:8px 11px; }}
+.sum-chip span {{ color:#0f4f49; font-size:12px; font-weight:720; text-transform:uppercase; }}
+.sum-chip strong {{ color:#12302e; font-size:18px; line-height:1; font-variant-numeric: tabular-nums; }}
+.chart {{ border:1px solid var(--line); background:#fff; border-radius:8px; padding:16px; min-height:382px; overflow:hidden; }}
+.charts {{ display:grid; grid-template-columns:1fr; gap:14px; }}
+.chart-title {{ display:flex; justify-content:space-between; gap:12px; align-items:baseline; margin-bottom:14px; }}
+.chart-title h2 {{ margin:0; font-size:15px; }}
+.legend {{ display:flex; flex-wrap:wrap; gap:8px 12px; margin:-4px 0 12px; color:#53657d; font-size:12px; }}
+.stat-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:-2px 0 12px; }}
+.stat-chip {{ border:1px solid var(--line); border-radius:7px; padding:6px 8px; color:#334155; font-size:12px; background:#f8fafc; }}
+.stat-chip strong {{ font-variant-numeric:tabular-nums; }}
+.legend-item {{ display:inline-flex; align-items:center; gap:6px; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.legend-swatch {{ width:10px; height:10px; border-radius:2px; flex:0 0 auto; }}
+.plot {{ display:flex; align-items:stretch; gap:14px; min-width:0; height:292px; padding:0 6px 0 10px; border-left:1px solid var(--line); border-bottom:1px solid var(--line); overflow-x:auto; background:linear-gradient(to top, var(--axis) 1px, transparent 1px) 0 26px/100% 56px repeat-y; }}
+.bar-col {{ display:grid; grid-template-rows:254px 38px; justify-items:center; align-items:end; min-width:54px; height:100%; }}
+.bar-track {{ position:relative; display:flex; align-items:flex-end; height:254px; width:100%; justify-content:center; }}
+.bar-value {{ position:absolute; bottom:calc(var(--bar-height) + 6px); color:#334155; font-size:11px; line-height:1; font-variant-numeric: tabular-nums; }}
+.bar {{ width:32px; height:var(--bar-height); min-height:2px; border-radius:5px 5px 0 0; background:linear-gradient(180deg, var(--accent-2), var(--accent)); box-shadow: inset 0 1px 0 rgba(255,255,255,.22); overflow:hidden; }}
+.group-col {{ display:grid; grid-template-rows:254px 38px; justify-items:center; align-items:end; min-width:var(--group-width); height:100%; padding:0 7px; border-right:1px solid rgba(217,222,231,.7); }}
+.group-col:last-child {{ border-right:0; }}
+.group-track {{ display:flex; align-items:flex-end; justify-content:center; gap:4px; height:254px; width:100%; }}
+.mini-bar-wrap {{ position:relative; display:flex; align-items:flex-end; justify-content:center; height:254px; width:25px; }}
+.mini-bar {{ width:15px; height:var(--bar-height); min-height:2px; border-radius:4px 4px 0 0; background:var(--segment-color); }}
+.mini-value {{ position:absolute; left:50%; bottom:calc(var(--bar-height) + 6px); transform:translateX(-50%); color:#334155; font-size:9px; line-height:1; font-variant-numeric: tabular-nums; white-space:nowrap; }}
+.axis-label {{ align-self:start; color:#53657d; font-size:11px; line-height:1.1; white-space:nowrap; padding-top:8px; font-variant-numeric: tabular-nums; }}
+.empty {{ margin:auto; color:var(--muted); }}
+@media (max-width: 760px) {{ .shell {{ padding:16px; }} .toolbar {{ display:block; }} .chip {{ display:inline-block; margin-top:8px; }} .filter {{ flex-basis:0; }} .filter-menu {{ min-width:150px; }} .plot {{ gap:12px; }} .bar-col {{ min-width:50px; }} }}
+</style>
+</head>
+<body>
+<main class="shell">
+  <header class="toolbar"><div><h1>Lantor Monitoring</h1><div class="muted">Token and cost trend by time bucket.</div></div><span class="chip">{} · {} · {} · {}</span></header>
+  <nav class="controls" aria-label="Monitoring filters">
+    {}
+    {}
+    {}
+    {}
+  </nav>
+  <section class="total" aria-label="Selected period total">
+    <div class="sum-chip"><span>{}</span><strong>{}</strong></div>
+  </section>
+  <div class="charts">
+    <section class="chart" aria-label="Token monitoring bar chart"><div class="chart-title"><h2>{} by {}</h2><span class="muted">{}</span></div>{}<div class="plot">{}</div></section>
+    <section class="chart" aria-label="Memory monitoring bar chart"><div class="chart-title"><h2>Memory by {}</h2><span class="muted">reads by layer</span></div>{}{}<div class="plot">{}</div></section>
+  </div>
+</main>
+</body>
+</html>"#,
+        html_escape(&subject),
+        html_escape(scope),
+        html_escape(window),
+        html_escape(bucket),
+        window_controls,
+        bucket_controls,
+        metric_controls,
+        agent_controls,
+        html_escape(metric_sum_label),
+        html_escape(&metric_total),
+        html_escape(metric_label),
+        html_escape(bucket),
+        html_escape(&subject),
+        legend,
+        chart_bars,
+        html_escape(bucket),
+        memory_inventory_chips,
+        memory_legend,
+        memory_chart_bars
+    )
+}
+
+fn monitoring_view_url(
+    scope: &str,
+    agent: Option<&str>,
+    window: &str,
+    bucket: &str,
+    metric: &str,
+    limit: usize,
+) -> String {
+    let mut url = format!(
+        "/tool/monitoring?scope={}&window={}&bucket={}&metric={}&limit={}",
+        percent_encode(scope),
+        percent_encode(window),
+        percent_encode(bucket),
+        percent_encode(metric),
+        limit
+    );
+    if let Some(agent) = agent.filter(|value| !value.trim().is_empty()) {
+        url.push_str("&agent=");
+        url.push_str(&percent_encode(agent));
+    }
+    url
+}
+
+fn render_monitoring_dropdown(label: &str, active_label: String, options: String) -> String {
+    format!(
+        r#"<details class="filter"><summary><span class="filter-current"><span class="filter-label">{}</span><span class="filter-value">{}</span></span><span class="filter-arrow">&#9662;</span></summary><div class="filter-menu">{}</div></details>"#,
+        html_escape(label),
+        html_escape(&active_label),
+        options
+    )
+}
+
+fn render_monitoring_links<F>(values: &[&str], active: &str, url_for: F) -> String
+where
+    F: Fn(&str) -> String,
+{
+    values
+        .iter()
+        .map(|value| {
+            let class = if *value == active {
+                "control active"
+            } else {
+                "control"
+            };
+            format!(
+                r#"<a class="{class}" href="{}">{}</a>"#,
+                html_escape(&url_for(value)),
+                html_escape(&monitoring_control_label(value))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn monitoring_chart_bars(series: &[Value], metric: &str, max_metric: f64) -> String {
+    if series.is_empty() {
+        return r#"<div class="empty">No runs in this selection.</div>"#.to_owned();
+    }
+    series
+        .iter()
+        .map(|point| {
+            let value = monitoring_metric_value(point, metric);
+            let height = ((value / max_metric) * 88.0).round().clamp(1.0, 88.0);
+            format!(
+                r#"<div class="bar-col"><div class="bar-track" style="--bar-height:{}%"><div class="bar-value">{}</div><div class="bar"></div></div><div class="axis-label">{}</div></div>"#,
+                height,
+                html_escape(&monitoring_metric_display(point, metric)),
+                html_escape(&monitoring_bucket_label(value_str(point, "bucket")))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+#[derive(Debug, Clone)]
+struct MonitoringCompareAgent {
+    key: String,
+    label: String,
+    color: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct MonitoringCompareSegment {
+    key: String,
+    value: f64,
+}
+
+#[derive(Debug, Clone)]
+struct MonitoringCompareBucket {
+    bucket: String,
+    segments: Vec<MonitoringCompareSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct MonitoringCompareModel {
+    agents: Vec<MonitoringCompareAgent>,
+    buckets: Vec<MonitoringCompareBucket>,
+    max_value: f64,
+}
+
+fn monitoring_compare_model(series: &[Value], metric: &str) -> MonitoringCompareModel {
+    const COLORS: [&str; 6] = [
+        "#2563eb", "#0f766e", "#dc6b19", "#7c3aed", "#be123c", "#64748b",
+    ];
+
+    let mut agent_totals: HashMap<String, (String, f64)> = HashMap::new();
+    for point in series {
+        let handle = value_str(point, "handle");
+        if handle.is_empty() {
+            continue;
+        }
+        let label = monitoring_agent_label(point);
+        let entry = agent_totals
+            .entry(handle.to_owned())
+            .or_insert((label, 0.0));
+        entry.1 += monitoring_metric_value(point, metric);
+    }
+
+    let mut ranked = agent_totals
+        .into_iter()
+        .collect::<Vec<(String, (String, f64))>>();
+    ranked.sort_by(|left, right| {
+        let left_total = (left.1).1;
+        let right_total = (right.1).1;
+        let left_label = (left.1).0.to_lowercase();
+        let right_label = (right.1).0.to_lowercase();
+        right_total
+            .partial_cmp(&left_total)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left_label.cmp(&right_label))
+    });
+
+    let mut top_keys = ranked
+        .iter()
+        .take(5)
+        .map(|(key, _)| key.to_owned())
+        .collect::<Vec<_>>();
+    top_keys.sort();
+    let top_key_set = top_keys
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut agents = ranked
+        .iter()
+        .filter(|(key, _)| top_key_set.contains(key))
+        .map(|(key, (label, _))| (key.to_owned(), label.to_owned()))
+        .collect::<Vec<_>>();
+    agents.sort_by_key(|(_, label)| label.to_lowercase());
+    let has_others = ranked.iter().any(|(key, _)| !top_key_set.contains(key));
+    let mut legend_agents = agents
+        .iter()
+        .enumerate()
+        .map(|(index, (key, label))| MonitoringCompareAgent {
+            key: key.to_owned(),
+            label: label.to_owned(),
+            color: COLORS[index],
+        })
+        .collect::<Vec<_>>();
+    if has_others {
+        legend_agents.push(MonitoringCompareAgent {
+            key: "__others__".to_owned(),
+            label: "Others".to_owned(),
+            color: COLORS[5],
+        });
+    }
+
+    let color_keys = legend_agents
+        .iter()
+        .map(|agent| agent.key.clone())
+        .collect::<Vec<_>>();
+    let mut bucket_values: BTreeMap<String, HashMap<String, f64>> = BTreeMap::new();
+    for point in series {
+        let bucket = value_str(point, "bucket");
+        let handle = value_str(point, "handle");
+        if bucket.is_empty() || handle.is_empty() {
+            continue;
+        }
+        let key = if top_key_set.contains(handle) {
+            handle
+        } else {
+            "__others__"
+        };
+        *bucket_values
+            .entry(bucket.to_owned())
+            .or_default()
+            .entry(key.to_owned())
+            .or_default() += monitoring_metric_value(point, metric);
+    }
+
+    let buckets = bucket_values
+        .into_iter()
+        .map(|(bucket, values)| {
+            let segments = color_keys
+                .iter()
+                .filter_map(|key| {
+                    let value = values.get(key).copied().unwrap_or_default();
+                    (value > 0.0).then(|| MonitoringCompareSegment {
+                        key: key.to_owned(),
+                        value,
+                    })
+                })
+                .collect::<Vec<_>>();
+            MonitoringCompareBucket { bucket, segments }
+        })
+        .collect::<Vec<_>>();
+    let max_value = buckets
+        .iter()
+        .flat_map(|bucket| bucket.segments.iter().map(|segment| segment.value))
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    MonitoringCompareModel {
+        agents: legend_agents,
+        buckets,
+        max_value,
+    }
+}
+
+fn monitoring_compare_chart_bars(model: &MonitoringCompareModel, metric: &str) -> String {
+    if model.buckets.is_empty() {
+        return r#"<div class="empty">No runs in this selection.</div>"#.to_owned();
+    }
+    let color_by_key = model
+        .agents
+        .iter()
+        .map(|agent| (agent.key.as_str(), agent.color))
+        .collect::<HashMap<_, _>>();
+    model
+        .buckets
+        .iter()
+        .map(|bucket| {
+            let segment_count = bucket.segments.len().max(1);
+            let group_width = (segment_count * 25 + segment_count.saturating_sub(1) * 4 + 14)
+                .max(108);
+            let bars = bucket
+                .segments
+                .iter()
+                .map(|segment| {
+                    let height = ((segment.value / model.max_value) * 82.0)
+                        .round()
+                        .clamp(1.0, 82.0);
+                    format!(
+                        r#"<div class="mini-bar-wrap" style="--bar-height:{}%;--segment-color:{}"><div class="mini-value">{}</div><div class="mini-bar"></div></div>"#,
+                        height,
+                        color_by_key
+                            .get(segment.key.as_str())
+                            .copied()
+                            .unwrap_or("#64748b"),
+                        html_escape(&monitoring_metric_display_value(segment.value, metric))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!(
+                r#"<div class="group-col" style="--group-width:{}px"><div class="group-track">{}</div><div class="axis-label">{}</div></div>"#,
+                group_width,
+                bars,
+                html_escape(&monitoring_bucket_label(&bucket.bucket))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn monitoring_compare_legend(model: &MonitoringCompareModel) -> String {
+    if model.agents.is_empty() {
+        return String::new();
+    }
+    let items = model
+        .agents
+        .iter()
+        .map(|agent| {
+            format!(
+                r#"<span class="legend-item"><span class="legend-swatch" style="background:{}"></span>{}</span>"#,
+                agent.color,
+                html_escape(&agent.label)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<div class="legend">{items}</div>"#)
+}
+
+fn monitoring_memory_layer_chart_bars(series: &[Value]) -> String {
+    if series.is_empty() {
+        return r#"<div class="empty">No memory observations in this selection.</div>"#.to_owned();
+    }
+    const LAYERS: [(&str, &str); 2] = [("realtime", "#2563eb"), ("events", "#0f766e")];
+    let max_value = series
+        .iter()
+        .flat_map(|point| LAYERS.iter().map(|(key, _)| value_i64(point, key) as f64))
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    series
+        .iter()
+        .map(|point| {
+            let segments = LAYERS
+                .iter()
+                .filter_map(|(key, color)| {
+                    let value = value_i64(point, key);
+                    (value > 0).then(|| {
+                        let height = ((value as f64 / max_value) * 82.0).round().clamp(1.0, 82.0);
+                        format!(
+                            r#"<div class="mini-bar-wrap" style="--bar-height:{}%;--segment-color:{}"><div class="mini-value">{}</div><div class="mini-bar"></div></div>"#,
+                            height,
+                            color,
+                            html_escape(&format_compact_i64(value))
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            let segment_count = segments.len().max(1);
+            let group_width =
+                (segment_count * 25 + segment_count.saturating_sub(1) * 4 + 14).max(108);
+            format!(
+                r#"<div class="group-col" style="--group-width:{}px"><div class="group-track">{}</div><div class="axis-label">{}</div></div>"#,
+                group_width,
+                segments.join(""),
+                html_escape(&monitoring_bucket_label(value_str(point, "bucket")))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn monitoring_memory_layer_legend() -> String {
+    let items = [
+        ("Realtime", "#2563eb"),
+        ("Events", "#0f766e"),
+    ]
+    .iter()
+    .map(|(label, color)| {
+        format!(
+            r#"<span class="legend-item"><span class="legend-swatch" style="background:{}"></span>{}</span>"#,
+            color,
+            html_escape(label)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("");
+    format!(r#"<div class="legend">{items}</div>"#)
+}
+
+fn monitoring_memory_inventory_chips(inventory: &Value) -> String {
+    let realtime = value_i64(inventory, "realtime_files");
+    let events = value_i64(inventory, "event_files");
+    format!(
+        r#"<div class="stat-row"><span class="stat-chip">Realtime files <strong>{}</strong></span><span class="stat-chip">Event files <strong>{}</strong></span></div>"#,
+        html_escape(&format_compact_i64(realtime)),
+        html_escape(&format_compact_i64(events))
+    )
+}
+
+fn monitoring_agent_label(agent: &Value) -> String {
+    let display_name = value_str(agent, "display_name")
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(28)
+        .collect::<String>();
+    if !display_name.is_empty() {
+        return display_name;
+    }
+    let handle = value_str(agent, "handle");
+    if handle.is_empty() {
+        "Missing agent".to_owned()
+    } else {
+        handle.to_owned()
+    }
+}
+
+fn monitoring_bucket_label(bucket: &str) -> String {
+    if let Ok(date) = NaiveDate::parse_from_str(bucket, "%Y-%m-%d") {
+        return date.format("%-m/%-d").to_string();
+    }
+    if let Some((_, week)) = bucket.split_once("-W") {
+        if !week.trim().is_empty() {
+            return format!("W{}", week.trim_start_matches('0'));
+        }
+    }
+    bucket.to_owned()
+}
+
+fn monitoring_metric_label(metric: &str) -> &'static str {
+    match metric {
+        "input_tokens" => "Input tokens",
+        "output_tokens" => "Output tokens",
+        "cost_usd" => "Cost",
+        "runs" => "Runs",
+        "memory_reads" => "Memory reads",
+        "memory_read_bytes" => "Memory bytes",
+        _ => "Total tokens",
+    }
+}
+
+fn monitoring_metric_sum_label(metric: &str) -> &'static str {
+    match metric {
+        "input_tokens" => "Input sum",
+        "output_tokens" => "Output sum",
+        "cost_usd" => "Cost sum",
+        "runs" => "Run sum",
+        "memory_reads" => "Memory read sum",
+        "memory_read_bytes" => "Memory byte sum",
+        _ => "Token sum",
+    }
+}
+
+fn monitoring_control_label(value: &str) -> String {
+    match value {
+        "24h" => "24h".to_owned(),
+        "7d" => "7d".to_owned(),
+        "30d" => "30d".to_owned(),
+        "all" => "All".to_owned(),
+        "day" => "Day".to_owned(),
+        "week" => "Week".to_owned(),
+        other => monitoring_metric_label(other).to_owned(),
+    }
+}
+
+fn monitoring_metric_value(value: &Value, metric: &str) -> f64 {
+    if metric == "cost_usd" {
+        value_f64(value, "cost_usd")
+    } else {
+        value_i64(value, metric) as f64
+    }
+}
+
+fn monitoring_metric_display(value: &Value, metric: &str) -> String {
+    if metric == "cost_usd" {
+        format!("${:.4}", value_f64(value, "cost_usd"))
+    } else {
+        format_compact_i64(value_i64(value, metric))
+    }
+}
+
+fn monitoring_metric_display_value(value: f64, metric: &str) -> String {
+    if metric == "cost_usd" {
+        format!("${value:.4}")
+    } else {
+        format_compact_i64(value.round() as i64)
+    }
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn format_compact_i64(value: i64) -> String {
+    let abs = value.abs();
+    if abs >= 1_000_000 {
+        if abs >= 10_000_000 {
+            format!("{}m", value / 1_000_000)
+        } else {
+            format!("{:.1}m", value as f64 / 1_000_000.0)
+        }
+    } else if abs >= 1_000 {
+        if abs >= 10_000 {
+            format!("{}k", value / 1_000)
+        } else {
+            format!("{:.1}k", value as f64 / 1_000.0)
+        }
+    } else {
+        value.to_string()
+    }
+}
+
+fn value_i64<'a>(value: &'a Value, key: &str) -> i64 {
+    value.get(key).and_then(Value::as_i64).unwrap_or_default()
+}
+
+fn value_f64<'a>(value: &'a Value, key: &str) -> f64 {
+    value.get(key).and_then(Value::as_f64).unwrap_or_default()
+}
+
+fn value_str<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
 fn calendar_preview_html(
@@ -2413,6 +3310,64 @@ mod tests {
             "keep-alive"
         );
         assert_eq!(response.headers().get("x-accel-buffering").unwrap(), "no");
+    }
+
+    #[test]
+    fn monitoring_bucket_labels_omit_year_for_chart_axis() {
+        assert_eq!(monitoring_bucket_label("2026-06-03"), "6/3");
+        assert_eq!(monitoring_bucket_label("2026-W09"), "W9");
+    }
+
+    #[test]
+    fn monitoring_agent_label_prefers_display_name() {
+        let agent = json!({
+            "handle": "@agent-id-like",
+            "display_name": "  蕾姆   "
+        });
+        assert_eq!(monitoring_agent_label(&agent), "蕾姆");
+
+        let missing_name = json!({
+            "handle": "@fallback",
+            "display_name": ""
+        });
+        assert_eq!(monitoring_agent_label(&missing_name), "@fallback");
+    }
+
+    #[test]
+    fn monitoring_agent_controls_put_compare_second_then_sort_names() {
+        let html = monitoring_preview_html(&json!({
+            "scope": "compare",
+            "window": "30d",
+            "bucket": "day",
+            "metric": "total_tokens",
+            "global": {
+                "runs": 3,
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                "cost_usd": 0.1
+            },
+            "agents": [
+                { "handle": "@beta", "display_name": "Beta", "runs": 1, "input_tokens": 1, "output_tokens": 1, "total_tokens": 2, "cost_usd": 0.0 },
+                { "handle": "@alpha", "display_name": "Alpha", "runs": 1, "input_tokens": 1, "output_tokens": 1, "total_tokens": 2, "cost_usd": 0.0 }
+            ],
+            "agent_time_series": [
+                { "bucket": "2026-06-03", "handle": "@alpha", "display_name": "Alpha", "runs": 1, "input_tokens": 100, "output_tokens": 0, "total_tokens": 100, "cost_usd": 0.0 },
+                { "bucket": "2026-06-03", "handle": "@beta", "display_name": "Beta", "runs": 1, "input_tokens": 50, "output_tokens": 0, "total_tokens": 50, "cost_usd": 0.0 }
+            ]
+        }));
+        let all = html.find(">All</a>").expect("all control");
+        let compare = html.find(">Compare</a>").expect("compare control");
+        let alpha = html.find(">Alpha</a>").expect("alpha control");
+        let beta = html.find(">Beta</a>").expect("beta control");
+        assert!(all < compare);
+        assert!(compare < alpha);
+        assert!(alpha < beta);
+        assert!(html.contains("Agent compare"));
+        assert!(html.contains("legend-item"));
+        assert!(html.contains(
+            ".controls { display:flex; flex-wrap:nowrap; gap:8px; margin-bottom:12px; align-items:start; overflow:visible;"
+        ));
     }
 }
 

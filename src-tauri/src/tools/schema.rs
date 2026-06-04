@@ -128,3 +128,72 @@ pub(crate) fn calendar_preview_output() -> Value {
         "additionalProperties": false
     })
 }
+
+pub(crate) fn monitoring_summary_input() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "scope": {
+                "type": "string",
+                "enum": ["global", "agent", "compare"],
+                "description": "Summary scope. Defaults to global. Compare returns global totals and is rendered as agent comparison in preview."
+            },
+            "agent": {
+                "type": "string",
+                "description": "Agent handle for agent scope, such as @kunk. Ignored for global scope."
+            },
+            "window": {
+                "type": "string",
+                "enum": ["24h", "7d", "30d", "all"],
+                "description": "Time window for run and activity aggregation. Defaults to 24h."
+            },
+            "bucket": {
+                "type": "string",
+                "enum": ["day", "week"],
+                "description": "Time bucket for preview charts. Defaults to day."
+            },
+            "metric": {
+                "type": "string",
+                "enum": ["total_tokens", "input_tokens", "output_tokens", "cost_usd", "runs"],
+                "description": "Token chart metric rendered by the preview. Memory is rendered in a separate chart."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum agents/events to include in ranked lists. Defaults to 8, max 25."
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+pub(crate) fn monitoring_summary_output() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "scope": { "type": "string" },
+            "window": { "type": "string" },
+            "since": { "type": ["string", "null"] },
+            "global": { "type": "object" },
+            "agents": { "type": "array" },
+            "agent": { "type": ["object", "null"] },
+            "memory_reads": { "type": "object" }
+        },
+        "required": ["scope", "window", "global", "agents", "memory_reads"],
+        "additionalProperties": true
+    })
+}
+
+pub(crate) fn monitoring_preview_output() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "opened": { "type": "boolean" },
+            "target": { "type": "string" },
+            "scope": { "type": "string" },
+            "window": { "type": "string" },
+            "agent": { "type": ["string", "null"] }
+        },
+        "required": ["opened", "target", "scope", "window"],
+        "additionalProperties": false
+    })
+}

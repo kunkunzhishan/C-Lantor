@@ -92,8 +92,6 @@ pub(crate) enum AgentEvent {
         title: Option<String>,
         #[serde(alias = "summary", alias = "content")]
         body: String,
-        #[serde(default)]
-        source_ids: Option<Vec<String>>,
     },
     ChannelCreate {
         name: String,

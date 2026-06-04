@@ -314,8 +314,6 @@ enum CodexActiveTurnScheduleState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CodexActiveTurnReapReason {
     StuckBeforeTurnId,
-    StuckBeforeModelActivity,
-    StuckAfterTurnId,
 }
 
 struct WarmClaudeRuntime {
@@ -1433,6 +1431,24 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )
         "#,
         r#"
+        create table if not exists agent_memory_observations (
+            id blob primary key not null default (randomblob(16)),
+            agent_id blob references agents(id) on delete set null,
+            run_id blob references agent_runs(id) on delete set null,
+            operation text not null default 'read',
+            layer text not null default 'unknown',
+            confidence text not null default 'unknown',
+            tool_type text not null default '',
+            tool_item_id text not null default '',
+            command_preview text not null default '',
+            matched_paths text not null default '[]',
+            output_chars integer not null default 0,
+            output_bytes integer not null default 0,
+            created_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
+            unique(run_id, tool_item_id)
+        )
+        "#,
+        r#"
         create table if not exists agent_work_items (
             id blob primary key not null default (randomblob(16)),
             agent_id blob not null references agents(id) on delete cascade,
@@ -1570,6 +1586,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "create index if not exists artifacts_channel_id_idx on artifacts(channel_id)",
         "create index if not exists reminders_due_idx on reminders(status, due_at)",
         "create index if not exists agent_schedules_due_idx on agent_schedules(status, next_run_at)",
+        "create index if not exists agent_memory_observations_agent_created_idx on agent_memory_observations(agent_id, created_at desc)",
+        "create index if not exists agent_memory_observations_layer_created_idx on agent_memory_observations(layer, created_at desc)",
         "create index if not exists agent_inbox_items_agent_state_idx on agent_inbox_items(agent_id, state, priority desc, created_at)",
         "create unique index if not exists agent_inbox_items_source_unique on agent_inbox_items(agent_id, source_message_id, kind) where source_message_id is not null",
         "create index if not exists ui_events_created_idx on ui_events(created_at)",
@@ -1604,6 +1622,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     migrate_long_tasks_schema(pool).await?;
     call_mode::migrate_call_mode_schema(pool).await?;
+    backfill_agent_memory_observations(pool).await?;
     sqlx::query(
         r#"
         insert into owner_profile (id, display_name, avatar, description)
@@ -1623,6 +1642,207 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
     backfill_agent_run_usage_from_logs(pool).await?;
+
+    Ok(())
+}
+
+async fn backfill_agent_memory_observations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        delete from agent_memory_observations
+        where layer not in ('realtime', 'events', 'root')
+           or matched_paths in ('["memory/"]', '["realtime/"]', '["events/"]')
+           or tool_type = 'system_memory_context'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        insert into agent_memory_observations (
+            agent_id,
+            run_id,
+            operation,
+            layer,
+            confidence,
+            tool_type,
+            tool_item_id,
+            command_preview,
+            matched_paths,
+            output_chars,
+            output_bytes,
+            created_at
+        )
+        select
+            ac.agent_id,
+            ac.run_id,
+            'read',
+            case
+                when ac.metadata like '%memory/events%' or ac.detail like '%memory/events%' or ac.summary like '%memory/events%' then 'events'
+                when ac.metadata like '%memory/realtime%' or ac.detail like '%memory/realtime%' or ac.summary like '%memory/realtime%' then 'realtime'
+            end,
+            case when ac.title = 'Memory read observed' then coalesce(json_extract(ac.metadata, '$.confidence'), 'direct') else 'weak' end,
+            case when ac.kind = 'command' then 'commandExecution' else ac.kind end,
+            case
+                when ac.title = 'Memory read observed' then coalesce(json_extract(ac.metadata, '$.tool_item_id'), 'activity:' || lower(hex(ac.id)))
+                else 'activity:' || lower(hex(ac.id))
+            end,
+            substr(coalesce(json_extract(ac.metadata, '$.command'), json_extract(ac.metadata, '$.command_preview'), ac.detail, ac.summary, ac.title), 1, 240),
+            case
+                when ac.metadata like '%memory/events%' or ac.detail like '%memory/events%' or ac.summary like '%memory/events%' then '["memory/events"]'
+                when ac.metadata like '%memory/realtime%' or ac.detail like '%memory/realtime%' or ac.summary like '%memory/realtime%' then '["memory/realtime"]'
+            end,
+            case
+                when ac.title = 'Memory read observed' then coalesce(cast(json_extract(ac.metadata, '$.output_chars') as integer), 0)
+                else length(coalesce(ac.metadata, '') || coalesce(ac.detail, '') || coalesce(ac.summary, ''))
+            end,
+            case
+                when ac.title = 'Memory read observed' then coalesce(cast(json_extract(ac.metadata, '$.output_bytes') as integer), 0)
+                else length(cast(coalesce(ac.metadata, '') || coalesce(ac.detail, '') || coalesce(ac.summary, '') as blob))
+            end,
+            ac.created_at
+        from agent_activities ac
+        where (
+            ac.title = 'Memory read observed'
+            and (
+                ac.metadata like '%memory/realtime%'
+                or ac.metadata like '%memory/events%'
+                or ac.detail like '%memory/realtime%'
+                or ac.detail like '%memory/events%'
+                or ac.summary like '%memory/realtime%'
+                or ac.summary like '%memory/events%'
+            )
+        )
+        on conflict(run_id, tool_item_id) do nothing
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    backfill_agent_memory_observations_from_run_logs(pool).await?;
+
+    Ok(())
+}
+
+async fn backfill_agent_memory_observations_from_run_logs(
+    pool: &SqlitePool,
+) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        select
+            r.id as run_id,
+            r.agent_id,
+            r.log,
+            r.started_at,
+            a.working_directory
+        from agent_runs r
+        join agents a on a.id = r.agent_id
+        where r.log like '%commandExecution%'
+          and r.log like '%memory%'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let run_id: Uuid = row.get("run_id");
+        let agent_id: Uuid = row.get("agent_id");
+        let log: String = row.get("log");
+        let started_at: String = row.get("started_at");
+        let working_directory: String = row.get("working_directory");
+        let working_directory = working_directory.trim();
+        if working_directory.is_empty() {
+            continue;
+        }
+        let memory_root = PathBuf::from(working_directory).join("memory");
+        for line in log.lines().filter_map(|line| line.strip_prefix("[codex] ")) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if value.get("method").and_then(Value::as_str) != Some("item/completed") {
+                continue;
+            }
+            let Some(item) = value.pointer("/params/item") else {
+                continue;
+            };
+            let Some(detail) = codex_memory_read_observation_detail(item, &memory_root) else {
+                continue;
+            };
+            let parsed_detail: Value = serde_json::from_str(&detail).unwrap_or_else(|_| json!({}));
+            let item_id = parsed_detail
+                .get("tool_item_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if item_id.is_empty() {
+                continue;
+            }
+            let matched_paths = parsed_detail
+                .get("matched_paths")
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let layer = memory_observation_layer(&matched_paths);
+            sqlx::query(
+                r#"
+                insert into agent_memory_observations (
+                    agent_id,
+                    run_id,
+                    operation,
+                    layer,
+                    confidence,
+                    tool_type,
+                    tool_item_id,
+                    command_preview,
+                    matched_paths,
+                    output_chars,
+                    output_bytes,
+                    created_at
+                )
+                values ($1, $2, 'read', $3, $4, 'commandExecution', $5, $6, $7, $8, $9, $10)
+                on conflict(run_id, tool_item_id) do nothing
+                "#,
+            )
+            .bind(agent_id)
+            .bind(run_id)
+            .bind(layer)
+            .bind(
+                parsed_detail
+                    .get("confidence")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            )
+            .bind(item_id)
+            .bind(
+                parsed_detail
+                    .get("command_preview")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+            .bind(json!(matched_paths).to_string())
+            .bind(
+                parsed_detail
+                    .get("output_chars")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            )
+            .bind(
+                parsed_detail
+                    .get("output_bytes")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            )
+            .bind(&started_at)
+            .execute(pool)
+            .await?;
+        }
+    }
 
     Ok(())
 }
@@ -9578,20 +9798,10 @@ async fn handle_agent_event(
             .await?;
             Ok("usage accepted".to_owned())
         }
-        AgentEvent::MemoryRunSummary {
-            title,
-            body,
-            source_ids,
-        } => {
-            let memory_path = md_memory::append_run_summary(
-                pool,
-                agent_id,
-                run_id,
-                title.as_deref(),
-                &body,
-                &source_ids.unwrap_or_default(),
-            )
-            .await?;
+        AgentEvent::MemoryRunSummary { title, body } => {
+            let memory_path =
+                md_memory::append_run_summary(pool, agent_id, run_id, title.as_deref(), &body)
+                    .await?;
             record_agent_activity(
                 pool,
                 Some(agent_id),
@@ -12181,6 +12391,31 @@ fn codex_request_error(value: &Value) -> Option<String> {
     })
 }
 
+#[derive(Debug)]
+enum CodexInboundMessage<'a> {
+    Response { id: i64 },
+    Request { id: Value, method: &'a str },
+    Notification { method: &'a str },
+    Invalid,
+}
+
+fn codex_inbound_message(value: &Value) -> CodexInboundMessage<'_> {
+    let method = value.get("method").and_then(Value::as_str);
+    let id = value.get("id");
+    match (method, id) {
+        (Some(method), Some(id)) => CodexInboundMessage::Request {
+            id: id.clone(),
+            method,
+        },
+        (Some(method), None) => CodexInboundMessage::Notification { method },
+        (None, Some(id)) if value.get("result").is_some() || value.get("error").is_some() => id
+            .as_i64()
+            .map(|id| CodexInboundMessage::Response { id })
+            .unwrap_or(CodexInboundMessage::Invalid),
+        _ => CodexInboundMessage::Invalid,
+    }
+}
+
 async fn respond_codex_dynamic_tool_call(
     runtime: &Arc<WarmCodexRuntime>,
     request_id: Option<Value>,
@@ -12191,6 +12426,25 @@ async fn respond_codex_dynamic_tool_call(
     };
     let mut stdin = runtime.stdin.lock().await;
     codex_write_json(&mut stdin, json!({ "id": request_id, "result": result })).await
+}
+
+async fn respond_codex_method_not_found(
+    runtime: &Arc<WarmCodexRuntime>,
+    request_id: Value,
+    method: &str,
+) -> CommandResult<()> {
+    let mut stdin = runtime.stdin.lock().await;
+    codex_write_json(
+        &mut stdin,
+        json!({
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": format!("Unsupported Codex app-server request method: {method}")
+            }
+        }),
+    )
+    .await
 }
 
 async fn handle_codex_dynamic_tool_call(
@@ -12443,7 +12697,17 @@ fn codex_tool_completion_activity(value: &Value) -> Option<(&'static str, &'stat
 }
 
 fn first_codex_item_output(item: &Value) -> Option<&str> {
-    first_nonempty_item_string(item, &["output", "stdout", "stderr", "result", "error"])
+    first_nonempty_item_string(
+        item,
+        &[
+            "aggregatedOutput",
+            "output",
+            "stdout",
+            "stderr",
+            "result",
+            "error",
+        ],
+    )
 }
 
 fn push_unique_string(values: &mut Vec<String>, value: impl Into<String>) {
@@ -12462,30 +12726,151 @@ fn memory_read_match_from_codex_item(
     }
     let command = item.get("command").and_then(Value::as_str).unwrap_or("");
     let output = first_codex_item_output(item).unwrap_or("");
-    let memory_root = memory_root.to_string_lossy();
+    let memory_root = memory_root.to_string_lossy().replace('\\', "/");
     let mut matched_paths = Vec::new();
     let mut confidence = None;
 
-    for text in [command, output] {
-        if !memory_root.is_empty() && text.contains(memory_root.as_ref()) {
-            push_unique_string(&mut matched_paths, memory_root.to_string());
+    let normalized_command = command.replace('\\', "/");
+    if !memory_read_command_can_access_files(&normalized_command) {
+        return None;
+    }
+    let command_mentions_memory_root =
+        command_mentions_memory_path(&normalized_command, &memory_root);
+    for path in memory_layer_path_matches(&normalized_command, &memory_root, "realtime") {
+        push_unique_string(&mut matched_paths, path);
+        confidence = Some("direct");
+    }
+    for path in memory_layer_path_matches(&normalized_command, &memory_root, "events") {
+        push_unique_string(&mut matched_paths, path);
+        confidence = Some("direct");
+    }
+
+    let normalized_output = output.replace('\\', "/");
+    let output_can_classify = command_mentions_memory_root
+        || contains_path_prefix(&normalized_output, memory_root.trim_end_matches('/'));
+    if output_can_classify {
+        for path in memory_layer_path_matches(&normalized_output, &memory_root, "realtime") {
+            push_unique_string(&mut matched_paths, path);
             confidence = Some("direct");
         }
-        if text.contains("memory/") {
-            push_unique_string(&mut matched_paths, "memory/");
+        for path in memory_layer_path_matches(&normalized_output, &memory_root, "events") {
+            push_unique_string(&mut matched_paths, path);
             confidence = Some("direct");
         }
-        if text.contains("realtime/") {
-            push_unique_string(&mut matched_paths, "realtime/");
-            confidence.get_or_insert("weak");
-        }
-        if text.contains("events/") {
-            push_unique_string(&mut matched_paths, "events/");
-            confidence.get_or_insert("weak");
-        }
+    }
+    if matched_paths.is_empty() && command_mentions_memory_root {
+        push_unique_string(
+            &mut matched_paths,
+            if memory_root.trim().is_empty() {
+                "memory".to_owned()
+            } else {
+                memory_root.trim_end_matches('/').to_owned()
+            },
+        );
+        confidence = Some("direct");
     }
 
     confidence.map(|confidence| (confidence.to_owned(), matched_paths))
+}
+
+fn memory_read_command_can_access_files(command: &str) -> bool {
+    [
+        "cat", "sed", "rg", "grep", "ls", "find", "wc", "tail", "head", "nl",
+    ]
+    .iter()
+    .any(|word| contains_shell_word(command, word))
+}
+
+fn command_mentions_memory_path(command: &str, memory_root: &str) -> bool {
+    contains_path_prefix(command, "$PWD/memory")
+        || contains_path_prefix(command, "${PWD}/memory")
+        || contains_path_prefix(command, "memory/realtime")
+        || contains_path_prefix(command, "memory/events")
+        || (!memory_root.trim().is_empty()
+            && contains_path_prefix(command, memory_root.trim_end_matches('/')))
+}
+
+fn memory_layer_path_matches(text: &str, memory_root: &str, layer: &str) -> Vec<String> {
+    let mut matches = Vec::new();
+    let relative = format!("memory/{layer}");
+    if contains_path_prefix(text, &relative) {
+        matches.push(relative);
+    }
+    let root = memory_root.trim_end_matches('/');
+    if !root.is_empty() {
+        let absolute = format!("{root}/{layer}");
+        if contains_path_prefix(text, &absolute) {
+            matches.push(absolute);
+        }
+    }
+    matches
+}
+
+fn contains_path_prefix(text: &str, path: &str) -> bool {
+    if !text.contains(path) {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let path_bytes = path.as_bytes();
+    let mut start = 0;
+    while let Some(offset) = text[start..].find(path) {
+        let idx = start + offset;
+        let before_ok = idx == 0 || is_path_boundary(bytes[idx - 1]);
+        let after_idx = idx + path_bytes.len();
+        let after_ok = after_idx >= bytes.len() || is_path_boundary(bytes[after_idx]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + path_bytes.len();
+    }
+    false
+}
+
+fn contains_shell_word(text: &str, word: &str) -> bool {
+    if !text.contains(word) {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let word_bytes = word.as_bytes();
+    let mut start = 0;
+    while let Some(offset) = text[start..].find(word) {
+        let idx = start + offset;
+        let before_ok = idx == 0 || !is_shell_word_byte(bytes[idx - 1]);
+        let after_idx = idx + word_bytes.len();
+        let after_ok = after_idx >= bytes.len() || !is_shell_word_byte(bytes[after_idx]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + word_bytes.len();
+    }
+    false
+}
+
+fn is_shell_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn is_path_boundary(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'/' | b'\\'
+            | b' '
+            | b'\t'
+            | b'\n'
+            | b'\r'
+            | b'"'
+            | b'\''
+            | b'`'
+            | b':'
+            | b','
+            | b';'
+            | b'('
+            | b')'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+    )
 }
 
 fn codex_memory_read_observation_detail(item: &Value, memory_root: &Path) -> Option<String> {
@@ -12509,6 +12894,24 @@ fn codex_memory_read_observation_detail(item: &Value, memory_root: &Path) -> Opt
         })
         .to_string(),
     )
+}
+
+fn memory_observation_layer(matched_paths: &[String]) -> &'static str {
+    if matched_paths
+        .iter()
+        .any(|path| path.contains("memory/events") || path.contains("/events"))
+    {
+        "events"
+    } else if matched_paths
+        .iter()
+        .any(|path| path.contains("memory/realtime") || path.contains("/realtime"))
+    {
+        "realtime"
+    } else if !matched_paths.is_empty() {
+        "root"
+    } else {
+        "unknown"
+    }
 }
 
 async fn record_codex_memory_read_observation(
@@ -12539,6 +12942,76 @@ async fn record_codex_memory_read_observation(
     let Some(detail) = codex_memory_read_observation_detail(item, &memory_root) else {
         return Ok(());
     };
+    let parsed_detail: Value = serde_json::from_str(&detail).unwrap_or_else(|_| json!({}));
+    let matched_paths = parsed_detail
+        .get("matched_paths")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let layer = memory_observation_layer(&matched_paths);
+    sqlx::query(
+        r#"
+        insert into agent_memory_observations (
+            agent_id,
+            run_id,
+            operation,
+            layer,
+            confidence,
+            tool_type,
+            tool_item_id,
+            command_preview,
+            matched_paths,
+            output_chars,
+            output_bytes
+        )
+        values ($1, $2, 'read', $3, $4, $5, $6, $7, $8, $9, $10)
+        on conflict(run_id, tool_item_id) do nothing
+        "#,
+    )
+    .bind(agent_id)
+    .bind(run_id)
+    .bind(layer)
+    .bind(
+        parsed_detail
+            .get("confidence")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    )
+    .bind(
+        parsed_detail
+            .get("tool_type")
+            .and_then(Value::as_str)
+            .unwrap_or("commandExecution"),
+    )
+    .bind(item_id)
+    .bind(
+        parsed_detail
+            .get("command_preview")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    )
+    .bind(json!(matched_paths).to_string())
+    .bind(
+        parsed_detail
+            .get("output_chars")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+    )
+    .bind(
+        parsed_detail
+            .get("output_bytes")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+    )
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
     let duplicate: Option<Uuid> = sqlx::query_scalar(
         r#"
         select id
@@ -13505,21 +13978,12 @@ fn codex_active_turn_schedule_state(
 
 fn codex_active_turn_reap_reason(
     turn_id: Option<&str>,
-    first_model_activity_seen: bool,
+    _first_model_activity_seen: bool,
     elapsed_since_start: Duration,
-    idle_elapsed: Duration,
+    _idle_elapsed: Duration,
 ) -> Option<CodexActiveTurnReapReason> {
     if turn_id.is_none() && elapsed_since_start >= CODEX_TURN_START_TIMEOUT {
         return Some(CodexActiveTurnReapReason::StuckBeforeTurnId);
-    }
-    if turn_id.is_some()
-        && !first_model_activity_seen
-        && elapsed_since_start >= CODEX_TURN_START_TIMEOUT
-    {
-        return Some(CodexActiveTurnReapReason::StuckBeforeModelActivity);
-    }
-    if turn_id.is_some() && idle_elapsed >= CODEX_ACTIVE_TURN_IDLE_TIMEOUT {
-        return Some(CodexActiveTurnReapReason::StuckAfterTurnId);
     }
     None
 }
@@ -15020,7 +15484,7 @@ async fn supervisor_start_agent(
     let avatar: Option<String> = row.get("avatar");
     let is_warm_streaming_runtime =
         runtime.eq_ignore_ascii_case("codex") || runtime.eq_ignore_ascii_case("claude");
-    let memory_context = md_memory::runtime_context(pool, agent_id, 16 * 1024)
+    let memory_context_text = md_memory::runtime_context(pool, agent_id, 16 * 1024)
         .await
         .ok()
         .flatten();
@@ -15113,7 +15577,7 @@ async fn supervisor_start_agent(
             service_tier,
             working_directory,
             work_item_prompt,
-            memory_context,
+            memory_context_text,
         )
         .await;
     }
@@ -15128,7 +15592,7 @@ async fn supervisor_start_agent(
             reasoning_effort,
             working_directory,
             work_item_prompt,
-            memory_context,
+            memory_context_text,
         )
         .await;
     }
@@ -15726,83 +16190,90 @@ async fn handle_codex_warm_stdout_line(
         }
     }
 
-    if let Some(response_id) = value.get("id").and_then(Value::as_i64) {
-        let matched = {
-            let mut state = runtime.state.lock().await;
-            let Some(active) = state.active.as_mut() else {
-                return Ok(());
-            };
-            if active.turn_request_id == response_id {
-                if let Some(turn_id) = codex_turn_id_from_value(&value) {
-                    active.turn_id = Some(turn_id);
+    let (method, request_id) = match codex_inbound_message(&value) {
+        CodexInboundMessage::Response { id: response_id } => {
+            let matched = {
+                let mut state = runtime.state.lock().await;
+                let Some(active) = state.active.as_mut() else {
+                    return Ok(());
+                };
+                if active.turn_request_id == response_id {
+                    if let Some(turn_id) = codex_turn_id_from_value(&value) {
+                        active.turn_id = Some(turn_id);
+                        state.last_activity = Instant::now();
+                    }
+                    Some((true, None, false))
+                } else if let Some(steer) = active.steer_requests.remove(&response_id) {
+                    if codex_request_error(&value).is_some() {
+                        active.steer_disabled = true;
+                    }
                     state.last_activity = Instant::now();
-                }
-                Some((true, None, false))
-            } else if let Some(steer) = active.steer_requests.remove(&response_id) {
-                if codex_request_error(&value).is_some() {
-                    active.steer_disabled = true;
-                }
-                state.last_activity = Instant::now();
-                Some((false, Some(steer), false))
-            } else if active.interrupt_request_id == Some(response_id) {
-                active.interrupt_request_id = None;
-                state.last_activity = Instant::now();
-                Some((false, None, true))
-            } else {
-                None
-            }
-        };
-        if let Some((is_turn_start, steer, is_interrupt)) = matched {
-            if is_turn_start {
-                if let Some(error) = codex_request_error(&value) {
-                    finish_warm_codex_active_turn(pool, agent_id, runtime, false, Some(error))
-                        .await?;
-                } else if let Some(run_id) = active_run_id {
-                    record_agent_activity(
-                        pool,
-                        Some(agent_id),
-                        Some(run_id),
-                        "run",
-                        "Request acknowledged",
-                        response_id.to_string(),
-                    )
-                    .await?;
-                }
-                return Ok(());
-            }
-            if is_interrupt {
-                if let Some(error) = codex_request_error(&value) {
-                    finish_warm_codex_active_turn(pool, agent_id, runtime, false, Some(error))
-                        .await?;
-                } else if let Some(run_id) = active_run_id {
-                    record_agent_activity(
-                        pool,
-                        Some(agent_id),
-                        Some(run_id),
-                        "run",
-                        "Stop acknowledged",
-                        response_id.to_string(),
-                    )
-                    .await?;
-                }
-                return Ok(());
-            }
-            if let Some(steer) = steer {
-                if let Some(error) = codex_request_error(&value) {
-                    finish_codex_steer_request(pool, agent_id, steer, false, Some(error)).await?;
+                    Some((false, Some(steer), false))
+                } else if active.interrupt_request_id == Some(response_id) {
+                    active.interrupt_request_id = None;
+                    state.last_activity = Instant::now();
+                    Some((false, None, true))
                 } else {
-                    finish_codex_steer_request(pool, agent_id, steer, true, None).await?;
+                    None
                 }
-                return Ok(());
+            };
+            if let Some((is_turn_start, steer, is_interrupt)) = matched {
+                if is_turn_start {
+                    if let Some(error) = codex_request_error(&value) {
+                        finish_warm_codex_active_turn(pool, agent_id, runtime, false, Some(error))
+                            .await?;
+                    } else if let Some(run_id) = active_run_id {
+                        record_agent_activity(
+                            pool,
+                            Some(agent_id),
+                            Some(run_id),
+                            "run",
+                            "Request acknowledged",
+                            response_id.to_string(),
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
+                if is_interrupt {
+                    if let Some(error) = codex_request_error(&value) {
+                        finish_warm_codex_active_turn(pool, agent_id, runtime, false, Some(error))
+                            .await?;
+                    } else if let Some(run_id) = active_run_id {
+                        record_agent_activity(
+                            pool,
+                            Some(agent_id),
+                            Some(run_id),
+                            "run",
+                            "Stop acknowledged",
+                            response_id.to_string(),
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
+                if let Some(steer) = steer {
+                    if let Some(error) = codex_request_error(&value) {
+                        finish_codex_steer_request(pool, agent_id, steer, false, Some(error))
+                            .await?;
+                    } else {
+                        finish_codex_steer_request(pool, agent_id, steer, true, None).await?;
+                    }
+                    return Ok(());
+                }
             }
+            return Ok(());
         }
-    }
+        CodexInboundMessage::Request { id, method } => (method, Some(id)),
+        CodexInboundMessage::Notification { method } => (method, None),
+        CodexInboundMessage::Invalid => return Ok(()),
+    };
 
-    match value.get("method").and_then(Value::as_str) {
-        Some("item/tool/call") => {
+    match method {
+        "item/tool/call" => {
             handle_codex_dynamic_tool_call(pool, agent_id, runtime, active_run_id, &value).await?;
         }
-        Some("turn/started") => {
+        "turn/started" => {
             if value.pointer("/params/threadId").and_then(Value::as_str)
                 != Some(runtime.thread_id.as_str())
             {
@@ -15816,7 +16287,7 @@ async fn handle_codex_warm_stdout_line(
                 }
             }
         }
-        Some("item/agentMessage/delta") => {
+        "item/agentMessage/delta" => {
             let item_id = value
                 .pointer("/params/itemId")
                 .and_then(Value::as_str)
@@ -15890,7 +16361,7 @@ async fn handle_codex_warm_stdout_line(
                 }
             }
         }
-        Some("item/completed") if codex_item_type(&value) == Some("agentMessage") => {
+        "item/completed" if codex_item_type(&value) == Some("agentMessage") => {
             let Some(item_id) = codex_item_id(&value) else {
                 return Ok(());
             };
@@ -15968,7 +16439,7 @@ async fn handle_codex_warm_stdout_line(
                 }
             }
         }
-        Some("item/completed") => {
+        "item/completed" => {
             let Some(run_id) = active_run_id else {
                 return Ok(());
             };
@@ -15990,7 +16461,7 @@ async fn handle_codex_warm_stdout_line(
                 record_codex_memory_read_observation(pool, agent_id, run_id, item).await?;
             }
         }
-        Some("item/started") => {
+        "item/started" => {
             let Some(run_id) = active_run_id else {
                 return Ok(());
             };
@@ -16009,15 +16480,15 @@ async fn handle_codex_warm_stdout_line(
                 .await?;
             }
         }
-        Some("item/reasoning/textDelta") | Some("item/reasoning/summaryTextDelta") => {}
-        Some("turn/completed") => {
+        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {}
+        "turn/completed" => {
             if value.pointer("/params/threadId").and_then(Value::as_str)
                 == Some(runtime.thread_id.as_str())
             {
                 finish_warm_codex_active_turn(pool, agent_id, runtime, true, None).await?;
             }
         }
-        Some("error") => {
+        "error" => {
             if let Some(detail) = codex_error_notification_detail(&value) {
                 finish_warm_codex_active_turn(pool, agent_id, runtime, false, Some(detail)).await?;
             } else {
@@ -16025,7 +16496,11 @@ async fn handle_codex_warm_stdout_line(
                 state.last_activity = Instant::now();
             }
         }
-        _ => {}
+        _ => {
+            if let Some(request_id) = request_id {
+                respond_codex_method_not_found(runtime, request_id, method).await?;
+            }
+        }
     }
 
     Ok(())
@@ -16169,8 +16644,6 @@ async fn reap_stuck_codex_runtime(
 
     let detail_reason = match reason {
         CodexActiveTurnReapReason::StuckBeforeTurnId => "no turn id",
-        CodexActiveTurnReapReason::StuckBeforeModelActivity => "no model activity after turn start",
-        CodexActiveTurnReapReason::StuckAfterTurnId => "turn id stalled before completion",
     };
     let detail = format!(
         "{detail_reason} after {elapsed_ms} ms; source={source}; process_group={}",
@@ -16492,10 +16965,7 @@ async fn validate_event_ingest_work_item_done(
             )));
         }
     }
-    let summary_path = memory_root
-        .join("events")
-        .join(agent_id.to_string())
-        .join("summary.md");
+    let summary_path = memory_root.join("events").join("summary.md");
     let Ok(summary) = fs::read_to_string(&summary_path) else {
         return Ok(Some(format!(
             "event_ingest did not write event summary: {}",
@@ -17205,16 +17675,16 @@ mod tests {
     use super::{
         activity_status, adopt_streaming_agent_message_key, agent_accepts_new_work,
         append_streaming_agent_message, append_streaming_agent_message_deferred_completion,
-        append_thread_context, append_ui_refresh_metrics_log, build_codex_streaming_prompt,
-        build_steer_followup_prompt, build_streaming_work_item_prompt, build_work_item_prompt,
-        capped_stream_delta, claim_agent_event, claim_next_supervisor_command,
-        classify_agent_output_activity, claude_message_text, claude_result_error,
-        claude_stream_event_activity, claude_streaming_command_text,
-        claude_surface_boundary_marker, claude_system_prompt, claude_text_delta,
-        cleanup_failed_warm_codex_start, cleanup_stale_starting_agent_runs,
+        append_thread_context, append_ui_refresh_metrics_log, backfill_agent_memory_observations,
+        build_codex_streaming_prompt, build_steer_followup_prompt,
+        build_streaming_work_item_prompt, build_work_item_prompt, capped_stream_delta,
+        claim_agent_event, claim_next_supervisor_command, classify_agent_output_activity,
+        claude_message_text, claude_result_error, claude_stream_event_activity,
+        claude_streaming_command_text, claude_surface_boundary_marker, claude_system_prompt,
+        claude_text_delta, cleanup_failed_warm_codex_start, cleanup_stale_starting_agent_runs,
         codex_active_turn_reap_reason, codex_active_turn_schedule_state,
         codex_context_rotate_input_tokens_from_env, codex_error_notification_detail,
-        codex_item_started_activity, codex_memory_read_observation_detail,
+        codex_inbound_message, codex_item_started_activity, codex_memory_read_observation_detail,
         codex_pending_stream_key, codex_turn_id_from_value, compact_chars_middle,
         consume_streaming_agent_control_lines,
         context_tool::{
@@ -17235,29 +17705,30 @@ mod tests {
         load_agent_activities, load_channel_agent_roster, load_channels, load_messages,
         load_reminders, load_runtime_thread_id, load_thread_activities,
         load_unread_inbox_wake_batch, mark_all_owner_inbox_read_in_pool,
-        mark_inbox_items_read_in_pool, maybe_hide_silent_streaming_reply, migrate,
-        normalize_open_link_target, notify_ui_work_item_changed, open_dm_with_agent_in_pool,
-        parse_activity_metadata, parse_tailscale_ipv4_from_text, prepend_inbox_context,
-        process_due_agent_schedules, process_due_reminders, queue_mentions_as_work_items,
-        reassign_agent_work_in_pool, record_agent_activity, record_codex_memory_read_observation,
-        recover_supervisor_commands_at_startup, sanitize_window_state, send_owner_message_in_pool,
-        set_channel_agent_membership_in_pool, should_append_codex_stream_line_to_run_log,
-        should_keep_ui_refresh_metric_line, silent_reply_reason,
-        split_complete_streaming_agent_event_lines, split_streaming_agent_event_lines,
-        split_terminal_streaming_agent_event_lines, streaming_message_body_is_empty,
-        supervisor_start_codex_streaming_agent,
+        mark_inbox_items_read_in_pool, maybe_hide_silent_streaming_reply, memory_observation_layer,
+        migrate, normalize_open_link_target, notify_ui_work_item_changed,
+        open_dm_with_agent_in_pool, parse_activity_metadata, parse_tailscale_ipv4_from_text,
+        prepend_inbox_context, process_due_agent_schedules, process_due_reminders,
+        queue_mentions_as_work_items, reassign_agent_work_in_pool, record_agent_activity,
+        record_codex_memory_read_observation, recover_supervisor_commands_at_startup,
+        sanitize_window_state, send_owner_message_in_pool, set_channel_agent_membership_in_pool,
+        should_append_codex_stream_line_to_run_log, should_keep_ui_refresh_metric_line,
+        silent_reply_reason, split_complete_streaming_agent_event_lines,
+        split_streaming_agent_event_lines, split_terminal_streaming_agent_event_lines,
+        streaming_message_body_is_empty, supervisor_start_codex_streaming_agent,
         tools::ToolHost,
         trim_ui_refresh_metric_lines_to_size, try_claim_unassigned_task, update_channel_in_pool,
         update_owner_profile_in_pool, upsert_agent_thread_subscription, upsert_runtime_thread_id,
         usage::{usage_from_run_log, usage_from_runtime_event},
         validate_event_ingest_work_item_done, wait_for_agent_run, AgentAttachmentFile, AgentEvent,
         AgentInboxItemInput, AgentMessageControlDemuxState, ClaudeActiveTurn, ClaudeSurface,
-        CodexActiveTurn, CodexActiveTurnReapReason, CodexActiveTurnScheduleState, InboxWakeItem,
-        InboxWakeSummary, MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState,
-        WarmCodexRegistry, WarmCodexRuntime, WarmCodexState, WindowMonitorBounds, WindowState,
-        CODEX_ACTIVE_TURN_IDLE_TIMEOUT, CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS,
-        CODEX_TURN_START_TIMEOUT, MEMORY_READ_ACTIVITY_TITLE, STREAMING_MESSAGE_BODY_LIMIT,
-        STREAMING_TRUNCATION_MARKER, UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
+        CodexActiveTurn, CodexActiveTurnReapReason, CodexActiveTurnScheduleState,
+        CodexInboundMessage, InboxWakeItem, InboxWakeSummary, MentionDispatchOrigin,
+        WarmClaudeRuntime, WarmClaudeState, WarmCodexRegistry, WarmCodexRuntime, WarmCodexState,
+        WindowMonitorBounds, WindowState, CODEX_ACTIVE_TURN_IDLE_TIMEOUT,
+        CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS, CODEX_TURN_START_TIMEOUT,
+        MEMORY_READ_ACTIVITY_TITLE, STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER,
+        UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
     };
     use chrono::NaiveDate;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -17273,6 +17744,117 @@ mod tests {
     };
     use tokio::{process::Command, sync::Mutex as AsyncMutex};
     use uuid::Uuid;
+
+    #[test]
+    fn codex_inbound_message_classifies_jsonrpc_envelopes() {
+        match codex_inbound_message(&json!({"id": 5, "result": {"turn": {"id": "turn-1"}}})) {
+            CodexInboundMessage::Response { id } => assert_eq!(id, 5),
+            other => panic!("expected response, got {other:?}"),
+        }
+
+        match codex_inbound_message(
+            &json!({"method": "item/tool/call", "id": 5, "params": {"tool": "call_tool"}}),
+        ) {
+            CodexInboundMessage::Request { id, method } => {
+                assert_eq!(id, json!(5));
+                assert_eq!(method, "item/tool/call");
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+
+        match codex_inbound_message(&json!({"method": "item/started", "params": {}})) {
+            CodexInboundMessage::Notification { method } => assert_eq!(method, "item/started"),
+            other => panic!("expected notification, got {other:?}"),
+        }
+
+        assert!(matches!(
+            codex_inbound_message(&json!({"id": 5, "params": {}})),
+            CodexInboundMessage::Invalid
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_tool_call_request_id_matching_turn_request_is_not_ack() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "codex-tool-demux-agent").await?;
+            let run_id: Uuid = sqlx::query_scalar(
+                "insert into agent_runs (agent_id, command, status) values ($1, 'codex', 'running') returning id",
+            )
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let registry = WarmCodexRegistry::default();
+            let mut child = insert_test_warm_codex_runtime(&registry, agent_id).await?;
+            let runtime = {
+                registry
+                    .runtimes
+                    .lock()
+                    .await
+                    .get(&agent_id)
+                    .cloned()
+                    .ok_or_else(|| "missing test runtime".to_owned())?
+            };
+            {
+                let mut state = runtime.state.lock().await;
+                state.active = Some(CodexActiveTurn {
+                    run_id,
+                    turn_request_id: 5,
+                    turn_id: Some("turn-1".to_owned()),
+                    started_at: Instant::now(),
+                    first_delta_at: None,
+                    first_model_activity_at: None,
+                    work_item_id: None,
+                    channel_id: None,
+                    thread_root_id: None,
+                    stream_keys: HashSet::new(),
+                    completed_agent_message_stream_keys: HashSet::new(),
+                    agent_message_control_demux: HashMap::new(),
+                    output_text: String::new(),
+                    steer_requests: HashMap::new(),
+                    steer_disabled: false,
+                    interrupt_request_id: None,
+                });
+            }
+
+            handle_codex_warm_stdout_line(
+                &pool,
+                agent_id,
+                &runtime,
+                &json!({
+                    "method": "item/tool/call",
+                    "id": 5,
+                    "params": {
+                        "threadId": "test-thread",
+                        "namespace": "lantor",
+                        "tool": "search_tools",
+                        "arguments": {}
+                    }
+                })
+                .to_string(),
+            )
+            .await?;
+
+            let titles: Vec<String> = sqlx::query_scalar(
+                "select title from agent_activities where run_id = $1 order by created_at, id",
+            )
+            .bind(run_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert!(titles.iter().any(|title| title == "Lantor tool completed"));
+            assert!(!titles.iter().any(|title| title == "Request acknowledged"));
+            assert!(runtime.state.lock().await.active.is_some());
+            let _ = child.kill().await;
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        result.unwrap();
+    }
 
     #[test]
     fn ui_refresh_metrics_log_retains_recent_entries_only() {
@@ -17522,9 +18104,12 @@ inline `@kunk` and after @longbaby
         assert!(prompt.contains("Treat messages as conversation"));
         assert!(prompt.contains("Activity events are the short progress notes"));
         assert!(prompt.contains("Lantor md memory has a realtime layer and a durable event layer"));
-        assert!(prompt.contains("memory/realtime/<agent_id>/<number>.md"));
-        assert!(prompt.contains("memory/events/<agent_id>/"));
+        assert!(prompt.contains("memory/realtime/<number>.md"));
+        assert!(prompt.contains("memory/events/"));
         assert!(prompt.contains("memory_run_summary"));
+        assert!(prompt.contains("memory_run_summary` is an agent-emitted event"));
+        assert!(prompt.contains("the agent should emit `memory_run_summary`"));
+        assert!(prompt.contains("call utterance"));
         assert!(!prompt.contains("memory-read"));
         assert!(prompt.contains("injected memory path"));
         assert!(prompt.contains("stable user preferences"));
@@ -18239,15 +18824,12 @@ inline `@kunk` and after @longbaby
                 .await
                 .map_err(|err| err.to_string())?;
 
-            let input_rel = format!("realtime/{agent_id}/000001.md");
+            let input_rel = "realtime/000001.md".to_owned();
             let input_path = workspace.join("memory").join(&input_rel);
             std::fs::create_dir_all(input_path.parent().expect("input parent"))
                 .map_err(|err| err.to_string())?;
             std::fs::write(&input_path, "## realtime item").map_err(|err| err.to_string())?;
-            let summary_path = workspace
-                .join("memory/events")
-                .join(agent_id.to_string())
-                .join("summary.md");
+            let summary_path = workspace.join("memory/events/summary.md");
             std::fs::create_dir_all(summary_path.parent().expect("summary parent"))
                 .map_err(|err| err.to_string())?;
             std::fs::write(
@@ -20155,6 +20737,135 @@ inline `@kunk` and after @longbaby
         );
     }
 
+    #[test]
+    fn codex_memory_read_detector_requires_memory_layer_path() {
+        let memory_root = std::env::temp_dir()
+            .join("lantor-memory-read-detector")
+            .join("memory");
+        assert!(codex_memory_read_observation_detail(
+            &json!({
+                "id": "tool-plain-events",
+                "type": "commandExecution",
+                "command": "rg events src-tauri/src",
+                "output": "events/foo.rs"
+            }),
+            &memory_root,
+        )
+        .is_none());
+        let detail = codex_memory_read_observation_detail(
+            &json!({
+                "id": "tool-memory-root",
+                "type": "commandExecution",
+                "command": format!("ls {}", memory_root.display()),
+                "output": "realtime\nevents"
+            }),
+            &memory_root,
+        )
+        .expect("memory root listing should be observed");
+        let value: Value = serde_json::from_str(&detail).expect("json detail");
+        assert_eq!(
+            memory_observation_layer(
+                &value
+                    .get("matched_paths")
+                    .and_then(Value::as_array)
+                    .expect("matched paths")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ),
+            "root"
+        );
+        assert!(codex_memory_read_observation_detail(
+            &json!({
+                "id": "tool-source-search",
+                "type": "commandExecution",
+                "command": "rg -n \"memory/realtime|memory/events\" src-tauri/src",
+                "output": "src-tauri/src/prompts.rs: memory/events/"
+            }),
+            &memory_root,
+        )
+        .is_none());
+
+        let detail = codex_memory_read_observation_detail(
+            &json!({
+                "id": "tool-absolute-events",
+                "type": "commandExecution",
+                "command": format!("cat {}/events/kunk/summary.md", memory_root.display()),
+                "output": "event memory"
+            }),
+            &memory_root,
+        )
+        .expect("event memory path should be observed");
+        let value: Value = serde_json::from_str(&detail).expect("json detail");
+        let matched_paths = value
+            .get("matched_paths")
+            .and_then(Value::as_array)
+            .expect("matched paths");
+        let absolute_events_path = memory_root
+            .join("events")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(matched_paths
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|path| path == "memory/events" || path == absolute_events_path.as_str()));
+
+        let detail = codex_memory_read_observation_detail(
+            &json!({
+                "id": "tool-variable-base",
+                "type": "commandExecution",
+                "command": format!("base=\"{}\"; grep -R \"^##\" \"$base/realtime\"", memory_root.display()),
+                "aggregatedOutput": format!("{}/realtime/agent/000001.md:## saved context", memory_root.display())
+            }),
+            &memory_root,
+        )
+        .expect("variable memory base should be observed");
+        let value: Value = serde_json::from_str(&detail).expect("json detail");
+        assert_eq!(
+            value.get("confidence").and_then(Value::as_str),
+            Some("direct")
+        );
+        assert_eq!(
+            memory_observation_layer(
+                &value
+                    .get("matched_paths")
+                    .and_then(Value::as_array)
+                    .expect("matched paths")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ),
+            "realtime"
+        );
+
+        let detail = codex_memory_read_observation_detail(
+            &json!({
+                "id": "tool-pwd-memory",
+                "type": "commandExecution",
+                "command": "find \"$PWD/memory\" -maxdepth 3 -type f",
+                "aggregatedOutput": "/work/agent/memory/legacy_sources/MEMORY.md"
+            }),
+            &memory_root,
+        )
+        .expect("root memory listing should be observed");
+        let value: Value = serde_json::from_str(&detail).expect("json detail");
+        assert_eq!(
+            memory_observation_layer(
+                &value
+                    .get("matched_paths")
+                    .and_then(Value::as_array)
+                    .expect("matched paths")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ),
+            "root"
+        );
+    }
+
     #[tokio::test]
     async fn records_codex_memory_read_observation_once_per_tool_item() {
         let Some((pool, schema)) = test_pool().await else {
@@ -20209,7 +20920,140 @@ inline `@kunk` and after @longbaby
                 metadata.get("output_bytes").and_then(Value::as_u64),
                 Some("known memory".len() as u64)
             );
+            let observation = sqlx::query(
+                r#"
+                select layer, output_bytes
+                from agent_memory_observations
+                where run_id = $1 and tool_item_id = 'tool-memory-1'
+                "#,
+            )
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(observation.get::<String, _>("layer"), "realtime");
+            assert_eq!(
+                observation.get::<i64, _>("output_bytes"),
+                "known memory".len() as i64
+            );
             let _ = std_fs::remove_dir_all(workspace);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn monitoring_summary_aggregates_tokens_and_memory_reads() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "monitor-agent").await?;
+            let other_agent_id = insert_test_agent(&pool, "monitor-other").await?;
+            let run_id: Uuid = sqlx::query_scalar(
+                r#"
+                insert into agent_runs (
+                    agent_id, command, status, input_tokens, output_tokens, cost_micros, stopped_at
+                )
+                values ($1, 'codex', 'done', 1000, 250, 12345, '2026-06-03T08:00:00+00:00')
+                returning id
+                "#,
+            )
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            sqlx::query(
+                r#"
+                insert into agent_runs (
+                    agent_id, command, status, input_tokens, output_tokens, cost_micros
+                )
+                values ($1, 'codex', 'running', 400, 50, 1000)
+                "#,
+            )
+            .bind(other_agent_id)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            record_agent_activity(
+                &pool,
+                Some(agent_id),
+                Some(run_id),
+                "tools",
+                MEMORY_READ_ACTIVITY_TITLE,
+                json!({
+                    "operation": "memory_read_observed",
+                    "tool_item_id": "tool-monitor-1",
+                    "command_preview": "cat memory/realtime/monitor-agent/000001.md",
+                    "matched_paths": ["memory/realtime"],
+                    "output_chars": 42,
+                    "output_bytes": 50,
+                    "confidence": "direct"
+                })
+                .to_string(),
+            )
+            .await?;
+            sqlx::query(
+                r#"
+                insert into agent_memory_observations (
+                    agent_id,
+                    run_id,
+                    operation,
+                    layer,
+                    confidence,
+                    tool_type,
+                    tool_item_id,
+                    command_preview,
+                    output_chars,
+                    output_bytes,
+                    created_at
+                )
+                values (
+                    $1,
+                    $2,
+                    'read',
+                    'events',
+                    'direct',
+                    'commandExecution',
+                    'tool-monitor-2',
+                    'cat memory/events/summary.md',
+                    20,
+                    25,
+                    '2026-06-03T08:10:00+00:00'
+                )
+                "#,
+            )
+            .bind(agent_id)
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            backfill_agent_memory_observations(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let summary = ToolHost::new(&pool)
+                .query_monitoring_summary("global", None, "all", 8)
+                .await?;
+            assert_eq!(summary["global"]["runs"], 2);
+            assert_eq!(summary["global"]["input_tokens"], 1400);
+            assert_eq!(summary["global"]["output_tokens"], 300);
+            assert_eq!(summary["memory_reads"]["count"], 2);
+            assert_eq!(summary["memory_reads"]["output_bytes"], 75);
+            assert_eq!(summary["memory_reads"]["layers"]["events"], 1);
+
+            let agent_summary = ToolHost::new(&pool)
+                .query_monitoring_summary("agent", Some("@monitor-agent"), "all", 8)
+                .await?;
+            assert_eq!(agent_summary["agent"]["handle"], "@monitor-agent");
+            assert_eq!(agent_summary["agent"]["input_tokens"], 1000);
+            assert_eq!(agent_summary["memory_reads"]["count"], 2);
+            let memory_series = ToolHost::new(&pool)
+                .query_monitoring_time_series(None, Some("monitor-agent"), "day", "memory_reads")
+                .await?;
+            assert_eq!(memory_series[0]["memory_reads"], 2);
             Ok(())
         }
         .await;
@@ -21334,18 +22178,20 @@ inline `@kunk` and after @longbaby
                 .execute(&pool)
                 .await
                 .map_err(|err| err.to_string())?;
-            let run_id: Uuid = sqlx::query_scalar(
-                r#"
-                insert into agent_runs (agent_id, command, status)
-                values ($1, 'codex app-server', 'running')
-                returning id
-                "#,
+            let channel_id = insert_test_channel(&pool, "memory-run-summary").await?;
+            let (work_item_id, run_id) = insert_running_work_item_with_run(
+                &pool,
+                agent_id,
+                channel_id,
+                "Memory run summary source",
             )
-            .bind(agent_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(|err| err.to_string())?;
-
+            .await?;
+            let source_message_id: Uuid =
+                sqlx::query_scalar("select source_message_id from agent_work_items where id = $1")
+                    .bind(work_item_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
             handle_agent_event(
                 &pool,
                 agent_id,
@@ -21353,19 +22199,15 @@ inline `@kunk` and after @longbaby
                 AgentEvent::MemoryRunSummary {
                     title: Some("Turn note".to_owned()),
                     body: "Decision: keep realtime entries short.".to_owned(),
-                    source_ids: Some(vec!["message:abc123".to_owned()]),
                 },
             )
             .await?;
 
-            let segment = workspace
-                .join("memory/realtime")
-                .join(agent_id.to_string())
-                .join("000001.md");
+            let segment = workspace.join("memory/realtime").join("000001.md");
             let memory = std::fs::read_to_string(segment).map_err(|err| err.to_string())?;
             assert!(memory.contains("Turn note"));
-            assert!(memory.contains("Source:"));
-            assert!(memory.contains("message:abc123"));
+            assert!(memory.contains("Sources:"));
+            assert!(memory.contains(&format!("message:{source_message_id}")));
             assert!(memory.contains("Decision: keep realtime entries short."));
             assert!(!workspace.join("memory/manifest.json").exists());
             Ok(())
@@ -22046,6 +22888,46 @@ inline `@kunk` and after @longbaby
                 .await
                 .map_err(|err| err.to_string())?;
             assert_eq!(remaining, 0);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn internal_wait_status_reply_is_retained_on_complete() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "wait-status-agent").await?;
+            let channel_id = insert_test_channel(&pool, "wait-status-channel").await?;
+            let stream_key = "wait-run:item-1";
+
+            let message_id = append_streaming_agent_message_deferred_completion(
+                &pool,
+                agent_id,
+                channel_id,
+                None,
+                stream_key,
+                "Need wait.",
+            )
+            .await?;
+            finish_streaming_agent_message_deferred_mentions(&pool, stream_key, "complete").await?;
+
+            let remaining: i64 = sqlx::query_scalar("select count(*) from messages where id = $1")
+                .bind(message_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            assert_eq!(remaining, 1);
+            let body: String = sqlx::query_scalar("select body from messages where id = $1")
+                .bind(message_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            assert_eq!(body, "Need wait.");
             Ok(())
         }
         .await;
@@ -28125,7 +29007,7 @@ inline `@kunk` and after @longbaby
     }
 
     #[test]
-    fn codex_active_turn_with_turn_id_reaps_only_after_idle_timeout() {
+    fn codex_active_turn_with_turn_id_is_not_reaped_by_idle_timeout() {
         assert_eq!(
             codex_active_turn_reap_reason(
                 Some("turn-1"),
@@ -28142,7 +29024,7 @@ inline `@kunk` and after @longbaby
                 Duration::from_secs(5),
                 CODEX_ACTIVE_TURN_IDLE_TIMEOUT + Duration::from_secs(1),
             ),
-            Some(CodexActiveTurnReapReason::StuckAfterTurnId)
+            None
         );
         assert_eq!(
             codex_active_turn_reap_reason(
@@ -28160,7 +29042,16 @@ inline `@kunk` and after @longbaby
                 CODEX_TURN_START_TIMEOUT + Duration::from_secs(1),
                 Duration::from_secs(1),
             ),
-            Some(CodexActiveTurnReapReason::StuckBeforeModelActivity)
+            None
+        );
+        assert_eq!(
+            codex_active_turn_reap_reason(
+                Some("turn-1"),
+                false,
+                CODEX_TURN_START_TIMEOUT + Duration::from_secs(1),
+                CODEX_ACTIVE_TURN_IDLE_TIMEOUT + Duration::from_secs(1),
+            ),
+            None
         );
     }
 
