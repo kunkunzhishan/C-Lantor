@@ -3,7 +3,8 @@ use std::{future::Future, pin::Pin};
 use serde_json::{json, Value};
 
 use super::{
-    calendar, schema, tool_browser, ToolHost, ToolResult, CALENDAR_PREVIEW_ID, TOOL_BROWSER_OPEN_ID,
+    calendar, monitoring, schema, tool_browser, ToolHost, ToolResult, CALENDAR_PREVIEW_ID,
+    MONITORING_PREVIEW_ID, MONITORING_SUMMARY_ID, TOOL_BROWSER_OPEN_ID,
 };
 use crate::CommandResult;
 
@@ -72,6 +73,30 @@ pub(crate) fn tool_definitions() -> &'static [CodexToolDefinition] {
             enabled: true,
         },
         CodexToolDefinition {
+            id: MONITORING_PREVIEW_ID,
+            title: "Monitoring Preview",
+            description: "Open an isolated monitoring dashboard for global or per-agent token usage, run counts, cost, and memory read observations.",
+            handler: monitoring_preview_handler,
+            tool_app_entry: Some("/tool/monitoring"),
+            input_schema: schema::monitoring_summary_input,
+            output_schema: schema::monitoring_preview_output,
+            side_effects: &["ui", "network"],
+            display: Some("webview"),
+            enabled: true,
+        },
+        CodexToolDefinition {
+            id: MONITORING_SUMMARY_ID,
+            title: "Monitoring Summary",
+            description: "Return a read-only Lantor monitoring summary for global or per-agent token usage, run counts, cost, and memory read observations.",
+            handler: monitoring_summary_handler,
+            tool_app_entry: None,
+            input_schema: schema::monitoring_summary_input,
+            output_schema: schema::monitoring_summary_output,
+            side_effects: &[],
+            display: None,
+            enabled: true,
+        },
+        CodexToolDefinition {
             id: TOOL_BROWSER_OPEN_ID,
             title: "Open Tool Browser",
             description: "Open an absolute http/https URL in Lantor's embedded Tool Browser panel.",
@@ -111,6 +136,14 @@ fn calendar_preview_handler<'a>(host: &'a ToolHost<'a>, arguments: &'a Value) ->
     Box::pin(calendar::preview(host, arguments))
 }
 
+fn monitoring_summary_handler<'a>(host: &'a ToolHost<'a>, arguments: &'a Value) -> ToolFuture<'a> {
+    Box::pin(monitoring::summary(host, arguments))
+}
+
+fn monitoring_preview_handler<'a>(host: &'a ToolHost<'a>, arguments: &'a Value) -> ToolFuture<'a> {
+    Box::pin(monitoring::preview(host, arguments))
+}
+
 fn tool_browser_open_handler<'a>(host: &'a ToolHost<'a>, arguments: &'a Value) -> ToolFuture<'a> {
     Box::pin(tool_browser::open(host, arguments))
 }
@@ -123,6 +156,13 @@ mod tests {
     fn registry_exposes_codex_tools_and_tool_app_entry() {
         let calendar = find_tool(CALENDAR_PREVIEW_ID).expect("calendar tool");
         assert_eq!(calendar.tool_app_entry, Some("/tool/calendar"));
+
+        let monitoring = find_tool(MONITORING_SUMMARY_ID).expect("monitoring tool");
+        assert_eq!(monitoring.tool_app_entry, None);
+        assert!(monitoring.side_effects.is_empty());
+
+        let monitoring_preview = find_tool(MONITORING_PREVIEW_ID).expect("monitoring preview tool");
+        assert_eq!(monitoring_preview.tool_app_entry, Some("/tool/monitoring"));
 
         let browser = find_tool(TOOL_BROWSER_OPEN_ID).expect("tool browser");
         assert_eq!(browser.tool_app_entry, None);
@@ -137,7 +177,7 @@ mod tests {
             .and_then(Value::as_array)
             .expect("tools");
 
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 4);
         assert!(tools.iter().any(|tool| {
             tool.get("id").and_then(Value::as_str) == Some(CALENDAR_PREVIEW_ID)
                 && tool.get("tool_app_entry").and_then(Value::as_str) == Some("/tool/calendar")

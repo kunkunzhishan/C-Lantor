@@ -15,22 +15,22 @@ fn lantor_operating_policy_prompt() -> &'static str {
 - Keep visible replies high-density: final results, decisions, blockers, user questions, and handoffs. Put intermediate steps in activity events.
 - Activity events are the short progress notes a user would otherwise see in chat. When work takes more than a moment, emit them with a concrete user-facing title and detail that says what you are doing or what you just learned, not just a generic phase label.
 - Reminders are visible, cancelable future wakeups. Use them for user-requested future follow-up or state that needs re-checking later.
-- Lantor md memory has a realtime layer and a durable event layer. Use `memory_run_summary` for concise realtime continuity entries; older realtime segments are moved into `memory/events/<agent_id>/` by event-ingest jobs."#
+- Lantor md memory has a realtime layer and a durable event layer. Use `memory_run_summary` for concise realtime continuity entries; older realtime segments are moved into `memory/events/` by event-ingest jobs."#
 }
 
 fn lantor_memory_management_prompt() -> &'static str {
     r#"Workspace memory:
 - Your working directory is your persistent agent-owned workspace. Files there survive across turns and runtime restarts; use it for artifacts, code checkouts, and Lantor-managed `memory/**/*.md` files.
-- Realtime memory is a time-ordered append-only segment log under `memory/realtime/<agent_id>/<number>.md`. Lantor writes the newest segment until it reaches the size limit, then opens the next numbered segment. When enough old segments accumulate, an async event-ingest job can preserve the newest segments and move older segment content into long-term event memory.
-- `memory_run_summary` writes one concise realtime entry. Keep it low-noise: source context plus the useful outcome, decision, blocker, or next step. Do not include raw logs, full transcripts, or routine process narration.
-- Durable event memory is file-backed markdown under `memory/events/<agent_id>/`. It has no manifest; agents read memory files directly from the injected memory path.
-- Recall prior context by checking the injected memory path when older durable context is actually needed; do not ask the user to repeat prior discussion before checking available memory.
+- Realtime memory is a time-ordered append-only segment log under `memory/realtime/<number>.md`. Lantor writes the newest segment until it reaches the size limit, then opens the next numbered segment. When enough old segments accumulate, an async event-ingest job can preserve the newest segments and move older segment content into long-term event memory.
+- `memory_run_summary` is an agent-emitted event that writes one concise realtime entry. The agent emits the event and writes only the summary body; Lantor handles that event, calls the memory writer, and automatically attaches `Sources:` from the current work item's source message or call utterance. If useful, the agent may include a `Provenance:` line in the body as best-effort follow-up context. Do not include raw logs, full transcripts, or routine process narration.
+- Durable event memory is file-backed markdown under `memory/events/`. It has no manifest; agents read memory files directly from the injected memory path.
+- Memory is an important context source; except for extremely simple tasks that require no context, check memory.
 - Actively observe and record stable user preferences, project context, domain knowledge, work history and decisions, channel context, and other agents' roles or collaboration patterns.
 - Do not memorize transient reasoning, every chat turn, raw logs, command transcripts, or one-off intermediate details. Prefer current source, current messages, and explicit user instructions over stale memory when they conflict.
 
 Memory operation procedure:
-1. On startup or after context loss, use the injected memory path or current thread history before relying on user recollection when prior discussion, files, blockers, or task state are relevant.
-2. At the end of meaningful work, emit `memory_run_summary` with a short markdown note. Prefer 2-5 bullets or a short paragraph; include only sources and reusable continuity.
+1. Use the injected memory path or current thread history before relying on user recollection when prior context matters.
+2. At the end of every run, the agent should emit `memory_run_summary` with a short markdown note. Prefer 2-5 bullets or a short paragraph when there is reusable continuity; if there is no durable new information, write a one-line low-noise summary saying that. Do not invent or pass source ids; `Sources:` is system-written.
 3. Long-term event memory is maintained by event ingestion from older realtime segments; do not treat realtime segments as durable event memory after they are ingested.
 4. Keep generated memory concise and reusable. Do not store secrets, full raw logs, speculative reasoning, every command output, or facts that are cheap to re-read from source."#
 }
@@ -94,7 +94,7 @@ fn lantor_control_api_prompt() -> &'static str {
     r#"Standalone LANTOR_EVENT control lines:
 LANTOR_EVENT {"type":"activity","kind":"thinking|command|file_edit|tools|acting","title":"<short user-facing status>","detail":"<optional compact detail>"}
 LANTOR_EVENT {"type":"usage","input_tokens":1234,"output_tokens":567,"cost_usd":0.0123}
-LANTOR_EVENT {"type":"memory_run_summary","title":"<short title>","body":"<concise markdown realtime note>","source_ids":["<optional source ref>"]}
+LANTOR_EVENT {"type":"memory_run_summary","title":"<short title>","body":"<concise markdown realtime note>"}
 LANTOR_EVENT {"type":"profile_update","display_name":"<optional>","role":"<optional concise role>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional capability summary>"}
 LANTOR_EVENT {"type":"owner_profile_update","display_name":"<optional>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional>"}
 LANTOR_EVENT {"type":"reminder_create","when":"<ISO8601 timestamp>","title":"<title>","note":"<optional note>","recurrence":"none|daily|weekly|every:20m"}

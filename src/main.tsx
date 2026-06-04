@@ -42,6 +42,7 @@ import {
   type ChatTextSize,
 } from "./chatTextSize";
 import { isProgressOnlyMessage } from "./message-grouping";
+import { mergeMessages, mergeMessageVersion, sortedMessages } from "./messageMerge";
 import { agentMentionBinding, serializeAgentDisplayMentions, type AgentMentionBinding } from "./mentions";
 import { isToolBrowserToggleEvent, TOOL_BROWSER_TOGGLE_EVENT } from "./toolBrowserEvents";
 import { compareThreadsByLatestActivity, threadLatestActivityAt } from "./threadActivity";
@@ -995,17 +996,6 @@ function App() {
     setRuntimeChecks(Object.fromEntries(entries));
   }
 
-  function sortedMessages(messages: Message[]) {
-    return [...messages].sort((left, right) => timestampMs(left.created_at) - timestampMs(right.created_at));
-  }
-
-  function mergeMessages(existing: Message[], incoming: Message[]) {
-    if (incoming.length === 0) return existing;
-    const byId = new Map(existing.map((message) => [message.id, message] as const));
-    for (const message of incoming) byId.set(message.id, message);
-    return sortedMessages(Array.from(byId.values()));
-  }
-
   function normalizeBootstrap(next: Bootstrap): Bootstrap {
     return {
       ...next,
@@ -1469,11 +1459,20 @@ function App() {
             : [...agents, event.agent];
           agentsChanged = true;
         } else if (event.type === "message_upsert") {
-          messageDeltaBufferRef.current.delete(event.message.id);
           const existingIndex = messages.findIndex((item) => item.id === event.message.id);
-          messages = existingIndex >= 0
-            ? messages.map((item) => item.id === event.message.id ? event.message : item)
-            : [...messages, event.message];
+          if (existingIndex >= 0) {
+            let acceptedIncoming = false;
+            messages = messages.map((item) => {
+              if (item.id !== event.message.id) return item;
+              const merged = mergeMessageVersion(item, event.message);
+              acceptedIncoming = merged === event.message;
+              return merged;
+            });
+            if (acceptedIncoming) messageDeltaBufferRef.current.delete(event.message.id);
+          } else {
+            messageDeltaBufferRef.current.delete(event.message.id);
+            messages = [...messages, event.message];
+          }
           messagesChanged = true;
         } else if (event.type === "message_delete") {
           messageDeltaBufferRef.current.delete(event.message_id);

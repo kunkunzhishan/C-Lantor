@@ -4,6 +4,7 @@ pub(crate) mod schema;
 
 mod calendar;
 mod host;
+mod monitoring;
 mod tool_browser;
 
 use serde_json::Value;
@@ -17,6 +18,8 @@ pub(crate) use result::{ToolDisplay, ToolResult};
 
 pub(crate) const TOOL_BROWSER_OPEN_ID: &str = "tool_browser.open";
 pub(crate) const CALENDAR_PREVIEW_ID: &str = "calendar.preview";
+pub(crate) const MONITORING_SUMMARY_ID: &str = "monitoring.summary";
+pub(crate) const MONITORING_PREVIEW_ID: &str = "monitoring.preview";
 
 pub(crate) async fn execute(
     pool: &SqlitePool,

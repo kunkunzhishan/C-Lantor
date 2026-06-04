@@ -29,6 +29,8 @@ const CALL_WORK_SPOKEN_REQUEST_PAYLOAD_BUDGET: usize = 16 * 1024;
 const CALL_COORDINATOR_COMMAND_ENV: &str = "LANTOR_CALL_COORDINATOR_COMMAND";
 const CALL_COORDINATOR_MODEL_ENV: &str = "LANTOR_CALL_COORDINATOR_MODEL";
 const CALL_COORDINATOR_REASONING_EFFORT_ENV: &str = "LANTOR_CALL_COORDINATOR_REASONING_EFFORT";
+const DEFAULT_CALL_COORDINATOR_MODEL: &str = "gpt-5.5";
+const DEFAULT_CALL_COORDINATOR_REASONING_EFFORT: &str = "low";
 const CALL_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(60);
 const CALL_DISPATCH_QUEUE_LEASE_SECONDS: i64 = 120;
 const CALL_COORDINATOR_TRANSCRIPT_CONTEXT_LIMIT: usize = 12;
@@ -36,8 +38,6 @@ const CALL_COORDINATOR_MESSAGE_CONTEXT_LIMIT: usize = 16;
 const CALL_BOOTSTRAP_SESSION_LIMIT: i64 = 20;
 const CALL_BOOTSTRAP_UTTERANCE_LIMIT: i64 = 160;
 const CALL_BOOTSTRAP_DISPATCH_LIMIT: i64 = 160;
-const CALL_COORDINATOR_APP_SERVER_COMMAND: &str = "codex app-server --listen stdio://";
-
 #[derive(Clone, Copy)]
 enum CallVoiceLanguage {
     ZhCn,
@@ -2778,7 +2778,7 @@ fn call_coordinator_model_value() -> String {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "gpt-5.4-mini".to_owned())
+        .unwrap_or_else(|| DEFAULT_CALL_COORDINATOR_MODEL.to_owned())
 }
 
 fn call_coordinator_reasoning_effort() -> String {
@@ -2786,7 +2786,7 @@ fn call_coordinator_reasoning_effort() -> String {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "low".to_owned())
+        .unwrap_or_else(|| DEFAULT_CALL_COORDINATOR_REASONING_EFFORT.to_owned())
 }
 
 fn call_coordinator_cwd() -> String {
@@ -2843,10 +2843,19 @@ async fn run_call_coordinator_app_server(
 }
 
 async fn spawn_call_coordinator_app_server() -> CommandResult<CallCoordinatorAppServer> {
-    let mut command = Command::new("/bin/zsh");
-    command.arg("-lc").arg(format!(
-        "exec {CALL_COORDINATOR_APP_SERVER_COMMAND} -c 'notify=[]'"
-    ));
+    let model_reasoning_effort = serde_json::to_string(&call_coordinator_reasoning_effort())
+        .map_err(to_string)
+        .map(|value| format!("model_reasoning_effort={value}"))?;
+    let mut command = Command::new("codex");
+    command.args([
+        "app-server",
+        "--listen",
+        "stdio://",
+        "-c",
+        "notify=[]",
+        "-c",
+        &model_reasoning_effort,
+    ]);
     #[cfg(unix)]
     command.process_group(0);
     command
@@ -4088,6 +4097,28 @@ mod tests {
             Some(value) => env::set_var(CALL_COORDINATOR_COMMAND_ENV, value),
             None => env::remove_var(CALL_COORDINATOR_COMMAND_ENV),
         }
+        match previous_model {
+            Some(value) => env::set_var(CALL_COORDINATOR_MODEL_ENV, value),
+            None => env::remove_var(CALL_COORDINATOR_MODEL_ENV),
+        }
+        match previous_reasoning {
+            Some(value) => env::set_var(CALL_COORDINATOR_REASONING_EFFORT_ENV, value),
+            None => env::remove_var(CALL_COORDINATOR_REASONING_EFFORT_ENV),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_call_coordinator_runtime_uses_stronger_low_reasoning_model() {
+        let _guard = VOICE_ENV_LOCK.lock().await;
+        let previous_model = env::var(CALL_COORDINATOR_MODEL_ENV).ok();
+        let previous_reasoning = env::var(CALL_COORDINATOR_REASONING_EFFORT_ENV).ok();
+
+        env::remove_var(CALL_COORDINATOR_MODEL_ENV);
+        env::remove_var(CALL_COORDINATOR_REASONING_EFFORT_ENV);
+
+        assert_eq!(call_coordinator_model_value(), "gpt-5.5");
+        assert_eq!(call_coordinator_reasoning_effort(), "low");
+
         match previous_model {
             Some(value) => env::set_var(CALL_COORDINATOR_MODEL_ENV, value),
             None => env::remove_var(CALL_COORDINATOR_MODEL_ENV),
