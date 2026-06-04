@@ -7,7 +7,7 @@ pub(super) fn operating_policy_prompt() -> &'static str {
 - Keep visible replies high-density: final results, decisions, blockers, user questions, and handoffs. Put intermediate steps in activity events.
 - Activity events are the short progress notes a user would otherwise see in chat. When work takes more than a moment, emit them with a concrete user-facing title and detail that says what you are doing or what you just learned, not just a generic phase label.
 - Reminders are visible, cancelable future wakeups. Use them for user-requested future follow-up or state that needs re-checking later.
-- Lantor md memory has a realtime layer and a durable event layer. Use `memory_run_summary` for concise realtime continuity entries; older realtime segments are moved into `memory/events/` by event-ingest jobs."#
+- Use Lantor md memory for concise durable continuity; follow the Workspace memory rules for reading and writing memory."#
 }
 
 pub(super) fn turn_startup_sequence_prompt() -> &'static str {

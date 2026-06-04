@@ -18103,13 +18103,15 @@ inline `@kunk` and after @longbaby
         assert!(prompt.contains("channel and thread are delivered as message envelope fields"));
         assert!(prompt.contains("Treat messages as conversation"));
         assert!(prompt.contains("Activity events are the short progress notes"));
-        assert!(prompt.contains("Lantor md memory has a realtime layer and a durable event layer"));
+        assert!(prompt.contains("follow the Workspace memory rules"));
         assert!(prompt.contains("memory/realtime/<number>.md"));
         assert!(prompt.contains("memory/events/"));
         assert!(prompt.contains("memory_run_summary"));
         assert!(prompt.contains("memory_run_summary` is an agent-emitted event"));
         assert!(prompt.contains("the agent should emit `memory_run_summary`"));
         assert!(prompt.contains("call utterance"));
+        assert!(prompt.contains("Provenance:"));
+        assert!(prompt.contains("When you encounter a problem"));
         assert!(!prompt.contains("memory-read"));
         assert!(prompt.contains("injected memory path"));
         assert!(prompt.contains("stable user preferences"));
