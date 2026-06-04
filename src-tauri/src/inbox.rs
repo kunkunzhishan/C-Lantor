@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::publish_guard::inbox_payload_with_base_thread_version;
 use crate::{
-    compact_chars_middle, short_id, CommandResult, DISPATCH_MESSAGE_BODY_LIMIT,
+    compact_chars_middle, prompts, short_id, CommandResult, DISPATCH_MESSAGE_BODY_LIMIT,
     INBOX_WAKE_BATCH_LIMIT, INBOX_WAKE_OTHER_SUMMARY_LIMIT,
 };
 
@@ -569,7 +569,7 @@ pub(crate) fn inbox_wake_context(
         },
         "The message headers below include target, source message id, created time, sender type/name, and preview. Handle directly from them when enough detail is present.".to_owned(),
         "Warm-runtime guard: the inbox item and its thread are authoritative over older context from other channels or tasks.".to_owned(),
-        "For thread follow-ups or contextual references like continue/this fix/that change/above/same issue/继续/这样修/上面/这个, use history-read on the default reply target before answering unless the needed same-thread context is already present.".to_owned(),
+        prompts::inbox::thread_followup_context_rule().to_owned(),
         "Use \"$LANTOR_CONTEXT_TOOL\" --agent-context-tool inbox-read --inbox-id <id> only if the preview/header is insufficient and you need a full source message or metadata.".to_owned(),
         "Use \"$LANTOR_CONTEXT_TOOL\" --agent-context-tool inbox-list --state active --limit 20 only if you need to inspect or choose among other active inbox items.".to_owned(),
         "Current work-item inbox item(s) are archived automatically when this work item finishes; use inbox-archive only for unrelated or extra active items you intentionally clear.".to_owned(),
