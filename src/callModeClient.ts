@@ -5,6 +5,8 @@ type StartCallSessionInput = {
   channelId?: string | null;
   threadRootId?: string | null;
   title?: string | null;
+  mode?: "call" | "wake_word";
+  wakeWords?: string;
 };
 
 type StopCallSessionInput = {
@@ -64,6 +66,8 @@ export async function startCallSession(input: StartCallSessionInput): Promise<Ca
     channelId: input.channelId ?? null,
     threadRootId: input.threadRootId ?? null,
     title: cleanOptionalString(input.title) ?? null,
+    mode: input.mode ?? "call",
+    wakeWords: cleanOptionalString(input.wakeWords) ?? null,
   });
 }
 

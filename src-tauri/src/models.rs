@@ -350,6 +350,8 @@ pub(crate) struct CallSession {
     pub(crate) id: Uuid,
     pub(crate) channel_id: Option<Uuid>,
     pub(crate) thread_root_id: Option<Uuid>,
+    pub(crate) mode: String,
+    pub(crate) wake_words: String,
     pub(crate) status: String,
     pub(crate) title: Option<String>,
     pub(crate) started_at: DateTime<Utc>,

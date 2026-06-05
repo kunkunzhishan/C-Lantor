@@ -261,6 +261,8 @@ export type CallSession = {
   id: string;
   channel_id: string | null;
   thread_root_id: string | null;
+  mode?: "call" | "wake_word" | string;
+  wake_words?: string;
   status: "active" | "ended" | "error" | string;
   title: string | null;
   started_at: string;

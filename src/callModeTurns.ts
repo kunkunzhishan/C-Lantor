@@ -105,18 +105,25 @@ export function buildCallTurns(
 }
 
 function isVisibleCallUtterance(utterance: CallUtterance) {
-  if (!utterance.transcript && isNoSpeechTranscriptionDiagnostic(utterance.transcription_error)) {
+  if (isRoutineIgnoredDiagnostic(utterance.transcription_error)) {
     return false;
   }
   if (utterance.status !== "ignored") return true;
-  return Boolean(utterance.transcription_error && (utterance.audio_duration_ms ?? 0) > 5_000);
+  return Boolean(
+    utterance.transcription_error
+      && (utterance.audio_duration_ms ?? 0) > 5_000
+      && !isRoutineIgnoredDiagnostic(utterance.transcription_error),
+  );
 }
 
-function isNoSpeechTranscriptionDiagnostic(value: string | null | undefined) {
+function isRoutineIgnoredDiagnostic(value: string | null | undefined) {
   const lower = (value ?? "").toLowerCase();
   return lower.includes("no speech")
     || lower.includes("speech was not detected")
-    || lower.includes("emptytranscript");
+    || lower.includes("emptytranscript")
+    || lower.includes("wake word required")
+    || lower.includes("waiting for the wake word")
+    || lower.includes("等待唤醒词");
 }
 
 function groupBy<T>(items: T[], keyForItem: (item: T) => string) {

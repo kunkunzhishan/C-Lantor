@@ -119,6 +119,32 @@ describe("buildCallTurns", () => {
     expect(turns).toEqual([]);
   });
 
+  it("hides wake-word-required ignored turns from the call thread", () => {
+    const utterance = {
+      ...makeUtterance(),
+      transcript: "他妈，他这个到底怎么回事？这个代码怎么气呀？",
+      transcription_error: "wake word required: 小帅,小美,Lantor",
+      status: "ignored",
+      audio_duration_ms: 14_000,
+    };
+    const dispatch = makeDispatch({
+      ack_text: "等待唤醒词。",
+      status: "ignored",
+      outcome: "ignored",
+      error: "wake word required: 小帅,小美,Lantor",
+    });
+
+    const turns = buildCallTurns(
+      makeSession(),
+      [utterance],
+      [dispatch],
+      [],
+      [],
+    );
+
+    expect(turns).toEqual([]);
+  });
+
   it("keeps all visible Voice turns and worker result bodies", () => {
     const utterances = Array.from({ length: 13 }, (_, index) => ({
       ...makeUtterance(),

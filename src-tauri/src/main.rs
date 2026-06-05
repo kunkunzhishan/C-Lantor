@@ -60,7 +60,7 @@ use agent_event::{AgentAttachmentFile, AgentEvent};
 use attachments::{write_attachment_file, ATTACHMENT_SIZE_LIMIT};
 use call_mode::{
     call_dispatch_cancel_work_in_pool, call_dispatch_resolve_confirmation_in_pool,
-    call_session_start_in_pool, call_session_stop_in_pool,
+    call_session_start_with_options_in_pool, call_session_stop_in_pool,
     call_session_submit_text_utterance_in_pool, call_session_submit_utterance_in_pool,
     load_call_dispatches, load_call_sessions, load_call_utterances, CallUtteranceSubmitRequest,
 };
@@ -2048,8 +2048,18 @@ async fn call_session_start(
     channel_id: Option<Uuid>,
     thread_root_id: Option<Uuid>,
     title: Option<String>,
+    mode: Option<String>,
+    wake_words: Option<String>,
 ) -> CommandResult<CallSession> {
-    call_session_start_in_pool(&state.pool, channel_id, thread_root_id, title).await
+    call_session_start_with_options_in_pool(
+        &state.pool,
+        channel_id,
+        thread_root_id,
+        title,
+        mode,
+        wake_words,
+    )
+    .await
 }
 
 #[tauri::command]

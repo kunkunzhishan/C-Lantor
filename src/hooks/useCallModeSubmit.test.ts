@@ -203,6 +203,8 @@ describe("useCallModeSubmit", () => {
       channelId: null,
       threadRootId: null,
       title: "Voice Console",
+      mode: "call",
+      wakeWords: undefined,
     });
     expect(hook.current.session).toBe(workspaceSession);
     expect(hook.current.isLive).toBe(true);

@@ -374,6 +374,35 @@ describe("Call Console controls", () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = originalActEnvironment;
   });
 
+  it("keeps voice configuration behind the Settings control", async () => {
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole {...baseCallConsoleProps()} />);
+    });
+
+    const renderedVoice = JSON.stringify(renderer.toJSON());
+    expect(renderedVoice).not.toContain("Assistant");
+    expect(renderedVoice).not.toContain("No live work");
+    expect(renderedVoice).not.toContain("Voice threads tracked");
+    expect(renderedVoice).not.toContain("Call voice settings");
+    expect(renderer.root.findByProps({ className: "call-header-actions" }).findAllByType("button")).toHaveLength(3);
+    expect(renderer.root.findAllByProps({ "aria-label": "Voice settings" })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call voice provider" })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call wake words" })).toHaveLength(0);
+
+    await act(async () => {
+      findButtonByLabel(renderer, "Voice settings").props.onClick();
+    });
+
+    expect(renderer.root.findAllByProps({ "aria-label": "Voice settings panel" })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call voice provider" })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call wake words" })).toHaveLength(1);
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
   it("blocks end-call and mute actions while recorder final audio is flushing", async () => {
     const stop = vi.fn(async () => activeSession);
     const flushAndStop = vi.fn(async () => undefined);
@@ -926,6 +955,62 @@ describe("Call Console controls", () => {
     });
   });
 
+  it("does not mark an async coordinator ACK as already spoken while submit is still pending", async () => {
+    const pendingResult = sequencedSubmitResult(1, "收到，已进入调度队列。");
+    pendingResult.dispatch.intent = "coordinator_pending";
+    pendingResult.dispatch.status = "dispatching";
+    pendingResult.dispatch.outcome = "dispatching";
+    pendingResult.utterance.status = "dispatching";
+    const finalResult = sequencedSubmitResult(1, "听到了，我在。");
+    finalResult.dispatch.id = "dispatch-final-ack-1";
+    finalResult.dispatch.intent = "ack_only";
+    finalResult.dispatch.status = "acknowledged";
+    finalResult.dispatch.outcome = "acknowledged";
+    finalResult.dispatch.status_text = "Heard and acknowledged.";
+    const props = baseCallConsoleProps();
+
+    mockCallModeState({ isSubmitting: true, submitResults: [] });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch]}
+        callUtterances={[pendingResult.utterance]}
+      />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+
+    await act(async () => {
+      renderer.update(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch, finalResult.dispatch]}
+        callUtterances={[pendingResult.utterance]}
+      />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+
+    mockCallModeState({ isSubmitting: false, submitResults: [finalResult], lastResult: finalResult });
+    await act(async () => {
+      renderer.update(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch, finalResult.dispatch]}
+        callUtterances={[{ ...pendingResult.utterance, status: "acknowledged" }]}
+      />);
+    });
+
+    expect(speechSpeak).toHaveBeenCalledTimes(1);
+    expect(speechSpeak.mock.calls[0][0]).toMatchObject({
+      text: "听到了，我在。",
+      lang: "zh-CN",
+    });
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
   it("speaks newly inserted call ACK dispatches from backend refresh", async () => {
     const historicalAck = sequencedSubmitResult(1, "Historical acknowledgement.");
     const freshUtterance: CallUtterance = {
@@ -974,6 +1059,57 @@ describe("Call Console controls", () => {
     expect(speechSpeak).toHaveBeenCalledTimes(1);
     expect(speechSpeak.mock.calls[0][0]).toMatchObject({
       text: "可以，我直接念给你。",
+      lang: "zh-CN",
+    });
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("speaks the final coordinator ACK when it replaces a pending dispatch for the same utterance", async () => {
+    const pendingResult = sequencedSubmitResult(1, "收到，已进入调度队列。");
+    pendingResult.dispatch.intent = "coordinator_pending";
+    pendingResult.dispatch.status = "queued";
+    pendingResult.dispatch.outcome = "queued";
+    pendingResult.utterance.status = "queued";
+    const finalAck: CallDispatch = {
+      ...pendingResult.dispatch,
+      id: "dispatch-final-ack-1",
+      intent: "ack_only",
+      ack_status: "heard",
+      ack_text: "听到了，我在。",
+      status: "acknowledged",
+      outcome: "acknowledged",
+      status_text: "Heard and acknowledged.",
+      created_at: "2026-05-24T00:00:03.000Z",
+      updated_at: "2026-05-24T00:00:03.000Z",
+    };
+    const props = baseCallConsoleProps();
+
+    mockCallModeState({ submitResults: [pendingResult] });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch]}
+        callUtterances={[pendingResult.utterance]}
+      />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+
+    await act(async () => {
+      renderer.update(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch, finalAck]}
+        callUtterances={[{ ...pendingResult.utterance, status: "acknowledged" }]}
+      />);
+    });
+
+    expect(speechSpeak).toHaveBeenCalledTimes(1);
+    expect(speechSpeak.mock.calls[0][0]).toMatchObject({
+      text: "听到了，我在。",
       lang: "zh-CN",
     });
 
@@ -1111,7 +1247,7 @@ describe("Call Console controls", () => {
     });
   });
 
-  it("surfaces the voice-first policy while assistant speech is playing", async () => {
+  it("keeps assistant speech state out of the compact Voice controls", async () => {
     mockCallModeState({ submitResults: [submitResult] });
 
     let renderer!: ReactTestRenderer;
@@ -1121,7 +1257,8 @@ describe("Call Console controls", () => {
 
     expect(speechSpeak).toHaveBeenCalledTimes(1);
     const tree = JSON.stringify(renderer.toJSON());
-    expect(tree).toContain("Yielding to voice");
+    expect(tree).not.toContain("Yielding to voice");
+    expect(tree).not.toContain("Assistant");
 
     await act(async () => {
       renderer.unmount();
@@ -1160,6 +1297,43 @@ describe("Call Console controls", () => {
 
     expect(speechCancel).not.toHaveBeenCalled();
     expect(speechSpeak).not.toHaveBeenCalled();
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("keeps wake-word-required ignored turns silent", async () => {
+    const props = baseCallConsoleProps();
+    const ignoredWakeRequired: CallUtteranceSubmitResult = {
+      ...submitResult,
+      utterance: {
+        ...submitResult.utterance,
+        id: "utterance-wake-required",
+        transcript: "他妈，他这个到底怎么回事？这个代码怎么气呀？",
+        transcription_error: "wake word required: 小帅,小美,Lantor",
+        status: "ignored",
+      },
+      dispatch: {
+        ...submitResult.dispatch,
+        id: "dispatch-wake-required",
+        utterance_id: "utterance-wake-required",
+        ack_text: "等待唤醒词。",
+        status: "ignored",
+        outcome: "ignored",
+        error: "wake word required: 小帅,小美,Lantor",
+      },
+      ack_text: "等待唤醒词。",
+    };
+
+    let renderer!: ReactTestRenderer;
+    mockCallModeState({ lastResult: ignoredWakeRequired });
+    await act(async () => {
+      renderer = create(<CallConsole {...props} />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("等待唤醒词。");
 
     await act(async () => {
       renderer.unmount();

@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::call_mode::{
     call_dispatch_cancel_work_in_pool, call_dispatch_resolve_confirmation_in_pool,
-    call_session_start_in_pool, call_session_stop_in_pool,
+    call_session_start_with_options_in_pool, call_session_stop_in_pool,
     call_session_submit_text_utterance_in_pool, call_session_submit_utterance_in_pool,
     CallUtteranceSubmitRequest,
 };
@@ -328,6 +328,10 @@ struct CallSessionStartRequest {
     thread_root_id: Option<Uuid>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    wake_words: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2615,11 +2619,13 @@ async fn api_call_session_start(
     State(state): State<Arc<WebState>>,
     Json(request): Json<CallSessionStartRequest>,
 ) -> Result<impl IntoResponse, Response> {
-    call_session_start_in_pool(
+    call_session_start_with_options_in_pool(
         &state.pool,
         request.channel_id,
         request.thread_root_id,
         request.title,
+        request.mode,
+        request.wake_words,
     )
     .await
     .map(Json)

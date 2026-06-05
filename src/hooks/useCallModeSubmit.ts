@@ -15,6 +15,8 @@ type UseCallModeSubmitOptions = {
   title?: string;
   surfaceSession?: CallSession | null;
   language?: string;
+  mode?: "call" | "wake_word";
+  wakeWords?: string;
 };
 
 type SubmitRecordedUtteranceInput = {
@@ -62,6 +64,8 @@ export function useCallModeSubmit({
   title,
   surfaceSession = null,
   language = "zh-CN",
+  mode = "call",
+  wakeWords,
 }: UseCallModeSubmitOptions) {
   const [session, setSession] = useState<CallSession | null>(surfaceSession);
   const [lastResult, setLastResult] = useState<CallUtteranceSubmitResult | null>(null);
@@ -100,6 +104,8 @@ export function useCallModeSubmit({
         channelId,
         threadRootId,
         title,
+        mode,
+        wakeWords,
       });
       setSession(next);
       setLastResult(null);
@@ -111,7 +117,7 @@ export function useCallModeSubmit({
     } finally {
       setIsStarting(false);
     }
-  }, [channelId, session, threadRootId, title]);
+  }, [channelId, mode, session, threadRootId, title, wakeWords]);
 
   const stop = useCallback(async () => {
     const current = session;
