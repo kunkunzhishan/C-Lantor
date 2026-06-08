@@ -185,6 +185,7 @@ function baseCallConsoleProps(): React.ComponentProps<typeof CallConsole> {
     },
     activeCallThreadId: null,
     setActiveCallThreadId: vi.fn(),
+    loadOlderCallHistory: vi.fn(async () => 0),
     onOpenWorkItem: vi.fn(),
     openMobileSidebar: vi.fn(),
     messages: [],
@@ -372,6 +373,94 @@ describe("Call Console controls", () => {
       });
     }
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = originalActEnvironment;
+  });
+
+  it("keeps voice configuration behind the Settings control", async () => {
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole {...baseCallConsoleProps()} />);
+    });
+
+    const renderedVoice = JSON.stringify(renderer.toJSON());
+    expect(renderedVoice).not.toContain("Assistant");
+    expect(renderedVoice).not.toContain("No live work");
+    expect(renderedVoice).not.toContain("Voice threads tracked");
+    expect(renderedVoice).not.toContain("Call voice settings");
+    expect(renderer.root.findByProps({ className: "call-header-actions" }).findAllByType("button")).toHaveLength(3);
+    expect(renderer.root.findAllByProps({ "aria-label": "Voice settings" })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call voice provider" })).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call wake words" })).toHaveLength(0);
+
+    await act(async () => {
+      findButtonByLabel(renderer, "Voice settings").props.onClick();
+    });
+
+    expect(renderer.root.findAllByProps({ "aria-label": "Voice settings panel" })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call voice provider" })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ "aria-label": "Call wake words" })).toHaveLength(1);
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("defaults new Voice sessions to Wake Word mode", async () => {
+    mockCallModeState({ isLive: false, session: null });
+
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole {...baseCallConsoleProps()} />);
+    });
+
+    expect(useCallModeSubmitMock).toHaveBeenCalledWith(expect.objectContaining({
+      mode: "wake_word",
+      wakeWords: "兰托, 蓝托, Lantor",
+    }));
+    expect(() => findButtonByLabel(renderer, "Start Wake Word Mode")).not.toThrow();
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("uses the live backend session mode for Voice labels while a call is active", async () => {
+    Object.defineProperty(globalThis.window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: vi.fn((key: string) => key === "lantor.voiceConsoleSettings"
+          ? JSON.stringify({ mode: "wake_word", wakeWords: "小美" })
+          : null),
+        setItem: vi.fn(),
+      },
+    });
+    mockCallModeState({
+      session: {
+        ...activeSession,
+        mode: "call",
+        wake_words: "兰托,蓝托,Lantor",
+      },
+    });
+
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole {...baseCallConsoleProps()} />);
+    });
+
+    expect(() => findButtonByLabel(renderer, "End Call Mode")).not.toThrow();
+    expect(() => findButtonByLabel(renderer, "End Wake Word Mode")).toThrow();
+
+    await act(async () => {
+      findButtonByLabel(renderer, "Voice settings").props.onClick();
+    });
+
+    const modeGroup = renderer.root.findByProps({ "aria-label": "Call console mode" });
+    const [callButton, wakeWordButton] = modeGroup.findAllByType("button");
+    expect(callButton.props["aria-pressed"]).toBe(true);
+    expect(wakeWordButton.props["aria-pressed"]).toBe(false);
+
+    await act(async () => {
+      renderer.unmount();
+    });
   });
 
   it("blocks end-call and mute actions while recorder final audio is flushing", async () => {
@@ -857,6 +946,95 @@ describe("Call Console controls", () => {
     });
   });
 
+  it("only barge-interrupts wake-word mode speech after a wake-only acknowledgement", async () => {
+    vi.useFakeTimers();
+    window.setTimeout = globalThis.setTimeout;
+    window.clearTimeout = globalThis.clearTimeout;
+    Object.defineProperty(globalThis.window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: vi.fn((key: string) => key === "lantor.voiceConsoleSettings"
+          ? JSON.stringify({ mode: "wake_word", wakeWords: "小美" })
+          : null),
+        setItem: vi.fn(),
+      },
+    });
+    const firstResult = sequencedSubmitResult(1, "First answer.");
+    const secondResult = sequencedSubmitResult(2, "Second answer.");
+    const wakeAckBase = sequencedSubmitResult(3, "我在，您说。");
+    const wakeAckResult: CallUtteranceSubmitResult = {
+      ...wakeAckBase,
+      session: {
+        ...activeSession,
+        mode: "wake_word",
+        wake_words: "小美",
+      },
+      utterance: {
+        ...wakeAckBase.utterance,
+        transcript: "小美小美",
+        status: "acknowledged",
+      },
+      dispatch: {
+        ...wakeAckBase.dispatch,
+        intent: "ack_only",
+        status: "acknowledged",
+        work_item_id: null,
+      },
+      work_item_id: null,
+    };
+    const props = baseCallConsoleProps();
+    const wakeWordSession: CallSession = {
+      ...activeSession,
+      mode: "wake_word",
+      wake_words: "小美",
+    };
+
+    let renderer!: ReactTestRenderer;
+    mockCallModeState({ session: wakeWordSession, submitResults: [firstResult, secondResult] });
+    await act(async () => {
+      renderer = create(<CallConsole {...props} />);
+    });
+    expect(speechSpeak).toHaveBeenCalledTimes(1);
+    expect(speechSpeak.mock.calls[0][0]).toMatchObject({ text: "First answer." });
+
+    mockRecorderState({ isVoiceActive: true });
+    await act(async () => {
+      renderer.update(<CallConsole {...props} />);
+    });
+    expect(speechCancel).toHaveBeenCalledTimes(1);
+    expect(speechSpeak).toHaveBeenCalledTimes(1);
+
+    mockCallModeState({ session: wakeWordSession, submitResults: [firstResult, secondResult, wakeAckResult] });
+    await act(async () => {
+      renderer.update(<CallConsole {...props} />);
+    });
+    expect(speechSpeak).toHaveBeenCalledTimes(2);
+    expect(speechSpeak.mock.calls[1][0]).toMatchObject({ text: "我在，您说。" });
+    expect(speechCancel).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      speechSpeak.mock.calls[1][0].onend();
+      vi.advanceTimersByTime(1000);
+    });
+    expect(speechSpeak).toHaveBeenCalledTimes(3);
+    expect(speechSpeak.mock.calls[2][0]).toMatchObject({ text: "Second answer." });
+
+    await act(async () => {
+      speechSpeak.mock.calls[2][0].onend();
+      vi.advanceTimersByTime(1000);
+    });
+    expect(speechSpeak).toHaveBeenCalledTimes(3);
+    expect(speechSpeak.mock.calls.map((call) => call[0].text)).toEqual([
+      "First answer.",
+      "我在，您说。",
+      "Second answer.",
+    ]);
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
   it("seeds ordered ACK speech from resumed call state", async () => {
     const historicalFirst = sequencedSubmitResult(1, "Historical first acknowledgement.");
     const historicalSecond = sequencedSubmitResult(2, "Historical second acknowledgement.");
@@ -926,6 +1104,62 @@ describe("Call Console controls", () => {
     });
   });
 
+  it("does not mark an async coordinator ACK as already spoken while submit is still pending", async () => {
+    const pendingResult = sequencedSubmitResult(1, "收到，已进入调度队列。");
+    pendingResult.dispatch.intent = "coordinator_pending";
+    pendingResult.dispatch.status = "dispatching";
+    pendingResult.dispatch.outcome = "dispatching";
+    pendingResult.utterance.status = "dispatching";
+    const finalResult = sequencedSubmitResult(1, "听到了，我在。");
+    finalResult.dispatch.id = "dispatch-final-ack-1";
+    finalResult.dispatch.intent = "ack_only";
+    finalResult.dispatch.status = "acknowledged";
+    finalResult.dispatch.outcome = "acknowledged";
+    finalResult.dispatch.status_text = "Heard and acknowledged.";
+    const props = baseCallConsoleProps();
+
+    mockCallModeState({ isSubmitting: true, submitResults: [] });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch]}
+        callUtterances={[pendingResult.utterance]}
+      />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+
+    await act(async () => {
+      renderer.update(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch, finalResult.dispatch]}
+        callUtterances={[pendingResult.utterance]}
+      />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+
+    mockCallModeState({ isSubmitting: false, submitResults: [finalResult], lastResult: finalResult });
+    await act(async () => {
+      renderer.update(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch, finalResult.dispatch]}
+        callUtterances={[{ ...pendingResult.utterance, status: "acknowledged" }]}
+      />);
+    });
+
+    expect(speechSpeak).toHaveBeenCalledTimes(1);
+    expect(speechSpeak.mock.calls[0][0]).toMatchObject({
+      text: "听到了，我在。",
+      lang: "zh-CN",
+    });
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
   it("speaks newly inserted call ACK dispatches from backend refresh", async () => {
     const historicalAck = sequencedSubmitResult(1, "Historical acknowledgement.");
     const freshUtterance: CallUtterance = {
@@ -982,7 +1216,58 @@ describe("Call Console controls", () => {
     });
   });
 
-  it("keeps queued and superseded call dispatch receipts out of assistant speech", async () => {
+  it("speaks the final coordinator ACK when it replaces a pending dispatch for the same utterance", async () => {
+    const pendingResult = sequencedSubmitResult(1, "收到，已进入调度队列。");
+    pendingResult.dispatch.intent = "coordinator_pending";
+    pendingResult.dispatch.status = "queued";
+    pendingResult.dispatch.outcome = "queued";
+    pendingResult.utterance.status = "queued";
+    const finalAck: CallDispatch = {
+      ...pendingResult.dispatch,
+      id: "dispatch-final-ack-1",
+      intent: "ack_only",
+      ack_status: "heard",
+      ack_text: "听到了，我在。",
+      status: "acknowledged",
+      outcome: "acknowledged",
+      status_text: "Heard and acknowledged.",
+      created_at: "2026-05-24T00:00:03.000Z",
+      updated_at: "2026-05-24T00:00:03.000Z",
+    };
+    const props = baseCallConsoleProps();
+
+    mockCallModeState({ submitResults: [pendingResult] });
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch]}
+        callUtterances={[pendingResult.utterance]}
+      />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+
+    await act(async () => {
+      renderer.update(<CallConsole
+        {...props}
+        callDispatches={[pendingResult.dispatch, finalAck]}
+        callUtterances={[{ ...pendingResult.utterance, status: "acknowledged" }]}
+      />);
+    });
+
+    expect(speechSpeak).toHaveBeenCalledTimes(1);
+    expect(speechSpeak.mock.calls[0][0]).toMatchObject({
+      text: "听到了，我在。",
+      lang: "zh-CN",
+    });
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("keeps incomplete queued and superseded call dispatch receipts out of assistant speech", async () => {
     const baseAck = sequencedSubmitResult(1, "I will ask kunk to check it.");
     const supersededAck: CallDispatch = {
       ...baseAck.dispatch,
@@ -1016,6 +1301,43 @@ describe("Call Console controls", () => {
     });
 
     expect(speechSpeak).not.toHaveBeenCalled();
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("speaks queued agent work handoffs once a work item is linked", async () => {
+    const baseAck = sequencedSubmitResult(1, "我让坤坤看一下。");
+    const queuedWorkAck: CallDispatch = {
+      ...baseAck.dispatch,
+      id: "dispatch-queued-work-ack",
+      intent: "agent_work",
+      status: "queued",
+      ack_status: "understood",
+      ack_text: "我让坤坤看一下。",
+      outcome: "work_queued",
+      work_item_id: "work-queued-1",
+      created_at: "2026-05-24T00:00:06.000Z",
+      updated_at: "2026-05-24T00:00:06.000Z",
+    };
+    const props = baseCallConsoleProps();
+
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole {...props} />);
+    });
+
+    await act(async () => {
+      renderer.update(<CallConsole
+        {...props}
+        callDispatches={[queuedWorkAck]}
+        callUtterances={[baseAck.utterance]}
+      />);
+    });
+
+    expect(speechSpeak).toHaveBeenCalledTimes(1);
+    expect(speechSpeak.mock.calls[0][0]).toMatchObject({ text: "我让坤坤看一下。" });
 
     await act(async () => {
       renderer.unmount();
@@ -1111,7 +1433,7 @@ describe("Call Console controls", () => {
     });
   });
 
-  it("surfaces the voice-first policy while assistant speech is playing", async () => {
+  it("keeps assistant speech state out of the compact Voice controls", async () => {
     mockCallModeState({ submitResults: [submitResult] });
 
     let renderer!: ReactTestRenderer;
@@ -1121,7 +1443,8 @@ describe("Call Console controls", () => {
 
     expect(speechSpeak).toHaveBeenCalledTimes(1);
     const tree = JSON.stringify(renderer.toJSON());
-    expect(tree).toContain("Yielding to voice");
+    expect(tree).not.toContain("Yielding to voice");
+    expect(tree).not.toContain("Assistant");
 
     await act(async () => {
       renderer.unmount();
@@ -1160,6 +1483,43 @@ describe("Call Console controls", () => {
 
     expect(speechCancel).not.toHaveBeenCalled();
     expect(speechSpeak).not.toHaveBeenCalled();
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("keeps wake-word-required ignored turns silent", async () => {
+    const props = baseCallConsoleProps();
+    const ignoredWakeRequired: CallUtteranceSubmitResult = {
+      ...submitResult,
+      utterance: {
+        ...submitResult.utterance,
+        id: "utterance-wake-required",
+        transcript: "他妈，他这个到底怎么回事？这个代码怎么气呀？",
+        transcription_error: "wake word required: 小帅,小美,Lantor",
+        status: "ignored",
+      },
+      dispatch: {
+        ...submitResult.dispatch,
+        id: "dispatch-wake-required",
+        utterance_id: "utterance-wake-required",
+        ack_text: "等待唤醒词。",
+        status: "ignored",
+        outcome: "ignored",
+        error: "wake word required: 小帅,小美,Lantor",
+      },
+      ack_text: "等待唤醒词。",
+    };
+
+    let renderer!: ReactTestRenderer;
+    mockCallModeState({ lastResult: ignoredWakeRequired });
+    await act(async () => {
+      renderer = create(<CallConsole {...props} />);
+    });
+
+    expect(speechSpeak).not.toHaveBeenCalled();
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("等待唤醒词。");
 
     await act(async () => {
       renderer.unmount();
@@ -1293,6 +1653,49 @@ describe("Call Console controls", () => {
     const tree = JSON.stringify(renderer.toJSON());
     expect(tree).toContain("old call request should remain visible");
     expect(tree).toContain("Old request acknowledged.");
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("shows fixed-channel Voice Console sessions in the call surface", async () => {
+    const fixedChannelSession: CallSession = {
+      ...activeSession,
+      id: "fixed-channel-call-session",
+      channel_id: "voice-console-channel",
+      title: "Voice Console",
+    };
+    const utterance: CallUtterance = {
+      ...submitResult.utterance,
+      id: "fixed-channel-utterance",
+      session_id: fixedChannelSession.id,
+      transcript: "fixed channel voice request",
+      source_message_id: "fixed-channel-message",
+    };
+    const dispatch: CallDispatch = {
+      ...submitResult.dispatch,
+      id: "fixed-channel-dispatch",
+      session_id: fixedChannelSession.id,
+      utterance_id: utterance.id,
+      utterance_sequence: utterance.sequence,
+      ack_text: "Fixed channel request acknowledged.",
+    };
+
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole
+        {...baseCallConsoleProps()}
+        activeCallThreadId={utterance.id}
+        callSessions={[fixedChannelSession]}
+        callUtterances={[utterance]}
+        callDispatches={[dispatch]}
+      />);
+    });
+
+    const tree = JSON.stringify(renderer.toJSON());
+    expect(tree).toContain("fixed channel voice request");
+    expect(tree).toContain("Fixed channel request acknowledged.");
 
     await act(async () => {
       renderer.unmount();
@@ -1797,7 +2200,9 @@ describe("Call Console controls", () => {
     Object.defineProperty(globalThis.window, "localStorage", {
       configurable: true,
       value: {
-        getItem: vi.fn(() => JSON.stringify({ provider: "edge", voice: "zh-CN-XiaoxiaoNeural", rate: 1 })),
+        getItem: vi.fn(() => JSON.stringify({
+          tts: { provider: "edge", voice: "zh-CN-XiaoxiaoNeural", rate: 1 },
+        })),
         setItem: vi.fn(),
       },
     });

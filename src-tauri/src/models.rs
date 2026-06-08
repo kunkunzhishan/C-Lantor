@@ -350,6 +350,8 @@ pub(crate) struct CallSession {
     pub(crate) id: Uuid,
     pub(crate) channel_id: Option<Uuid>,
     pub(crate) thread_root_id: Option<Uuid>,
+    pub(crate) mode: String,
+    pub(crate) wake_words: String,
     pub(crate) status: String,
     pub(crate) title: Option<String>,
     pub(crate) started_at: DateTime<Utc>,
@@ -362,6 +364,7 @@ pub(crate) struct CallUtterance {
     pub(crate) id: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) thread_root_utterance_id: Option<Uuid>,
+    pub(crate) source_message_id: Option<Uuid>,
     pub(crate) sequence: i64,
     pub(crate) transcript: String,
     pub(crate) language: String,
@@ -408,6 +411,12 @@ pub(crate) struct CallUtteranceSubmitResult {
     pub(crate) ack_text: String,
     pub(crate) work_item_id: Option<Uuid>,
     pub(crate) long_task_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct CallHistoryPage {
+    pub(crate) utterances: Vec<CallUtterance>,
+    pub(crate) dispatches: Vec<CallDispatch>,
 }
 
 #[derive(Debug, Serialize)]

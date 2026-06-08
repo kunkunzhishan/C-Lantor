@@ -152,6 +152,22 @@ describe("callModeStatusText", () => {
     expect(callModeStatusText(null, null)).toBe("Ready for utterance submit");
   });
 
+  it("does not surface wake-word-required ignored ACKs as status text", () => {
+    const session = makeSession();
+    const utterance = makeUtterance({
+      status: "ignored",
+      transcription_error: "wake word required: 小帅,小美,Lantor",
+    });
+    const result = makeSubmitResult(session, utterance, makeDispatch(utterance, {
+      ack_text: "等待唤醒词。",
+      status: "ignored",
+      outcome: "ignored",
+      error: "wake word required: 小帅,小美,Lantor",
+    }));
+
+    expect(callModeStatusText(null, result)).toBe("Ready for utterance submit");
+  });
+
   it("uses ended-call status text when there is no current ACK", () => {
     const session = makeSession({
       status: "ended",
@@ -385,6 +401,27 @@ describe("buildCallTimelineRows", () => {
     }));
 
     expect(buildCallTimelineRows(session, utterances, dispatches, [])).toEqual([]);
+  });
+
+  it("hides wake-word-required ignored turns from the visible timeline", () => {
+    const session = makeSession();
+    const utterance = makeUtterance({
+      id: "utterance-wake-required",
+      sequence: 1,
+      transcript: "他妈，他这个到底怎么回事？这个代码怎么气呀？",
+      transcription_error: "wake word required: 小帅,小美,Lantor",
+      status: "ignored",
+    });
+    const dispatch = makeDispatch(utterance, {
+      intent: "ack_only",
+      ack_status: "heard",
+      ack_text: "等待唤醒词。",
+      status: "ignored",
+      outcome: "ignored",
+      error: "wake word required: 小帅,小美,Lantor",
+    });
+
+    expect(buildCallTimelineRows(session, [utterance], [dispatch], [])).toEqual([]);
   });
 
   it("hides failed no-speech diagnostics from the visible timeline", () => {

@@ -111,13 +111,23 @@ type SubmitProbeOptions = {
   channelId?: string | null;
   surfaceSession?: CallSession | null;
   title?: string;
+  mode?: "call" | "wake_word";
+  wakeWords?: string;
 };
 
-function ConfigurableSubmitProbe({ channelId = "channel-1", surfaceSession = activeSession, title }: SubmitProbeOptions) {
+function ConfigurableSubmitProbe({
+  channelId = "channel-1",
+  surfaceSession = activeSession,
+  title,
+  mode,
+  wakeWords,
+}: SubmitProbeOptions) {
   latestHook = useCallModeSubmit({
     channelId,
     surfaceSession,
     title,
+    mode,
+    wakeWords,
   });
   return null;
 }
@@ -203,9 +213,29 @@ describe("useCallModeSubmit", () => {
       channelId: null,
       threadRootId: null,
       title: "Voice Console",
+      mode: "call",
+      wakeWords: undefined,
     });
     expect(hook.current.session).toBe(workspaceSession);
     expect(hook.current.isLive).toBe(true);
+  });
+
+  it("does not reuse an active call session when the selected Voice mode changed", async () => {
+    const hook = await mountSubmitHook({
+      surfaceSession: {
+        ...activeSession,
+        mode: "call",
+      },
+      mode: "wake_word",
+      wakeWords: "小美",
+    });
+
+    await act(async () => {
+      await hook.current.start();
+    });
+
+    expect(startCallSessionMock).not.toHaveBeenCalled();
+    expect(hook.current.error).toContain("does not match the selected mode");
   });
 
   it("routes call work cancellation through the active call session", async () => {

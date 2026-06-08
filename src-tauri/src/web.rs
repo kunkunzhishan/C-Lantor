@@ -35,9 +35,9 @@ use uuid::Uuid;
 
 use crate::call_mode::{
     call_dispatch_cancel_work_in_pool, call_dispatch_resolve_confirmation_in_pool,
-    call_session_start_in_pool, call_session_stop_in_pool,
+    call_session_start_with_options_in_pool, call_session_stop_in_pool,
     call_session_submit_text_utterance_in_pool, call_session_submit_utterance_in_pool,
-    CallUtteranceSubmitRequest,
+    fetch_call_history_page, CallUtteranceSubmitRequest,
 };
 use crate::launch_agent;
 use crate::long_task::{
@@ -328,12 +328,24 @@ struct CallSessionStartRequest {
     thread_root_id: Option<Uuid>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    wake_words: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CallSessionIdRequest {
     session_id: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchCallHistoryRequest {
+    before: DateTime<Utc>,
+    #[serde(default)]
+    limit: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +440,7 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
         .route("/api/health", get(api_health))
         .route("/api/bootstrap", get(api_bootstrap))
         .route("/api/fetch_messages", post(api_fetch_messages))
+        .route("/api/fetch_call_history", post(api_fetch_call_history))
         .route("/api/check_runtime", post(api_check_runtime))
         .route(
             "/api/record_ui_refresh_metric",
@@ -2558,6 +2571,16 @@ async fn api_fetch_messages(
         .map_err(api_error)
 }
 
+async fn api_fetch_call_history(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<FetchCallHistoryRequest>,
+) -> Result<impl IntoResponse, Response> {
+    fetch_call_history_page(&state.pool, request.before, request.limit)
+        .await
+        .map(Json)
+        .map_err(api_error)
+}
+
 async fn api_check_runtime(
     Json(request): Json<RuntimeCheckRequest>,
 ) -> Result<impl IntoResponse, Response> {
@@ -2615,11 +2638,13 @@ async fn api_call_session_start(
     State(state): State<Arc<WebState>>,
     Json(request): Json<CallSessionStartRequest>,
 ) -> Result<impl IntoResponse, Response> {
-    call_session_start_in_pool(
+    call_session_start_with_options_in_pool(
         &state.pool,
         request.channel_id,
         request.thread_root_id,
         request.title,
+        request.mode,
+        request.wake_words,
     )
     .await
     .map(Json)

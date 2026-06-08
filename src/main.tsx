@@ -56,6 +56,7 @@ import {
   Artifact,
   Bootstrap,
   CallDispatch,
+  CallHistoryPage,
   CallSession,
   CallUtterance,
   ChannelMember,
@@ -220,6 +221,7 @@ const BACKEND_DISCONNECTED_REFRESH_MS = 5_000;
 const REFRESH_METRICS_SUMMARY_MS = 30_000;
 const SAVED_MESSAGES_READ_DISMISS_ID = "saved-messages";
 const CHANNEL_MESSAGE_PAGE_SIZE = 120;
+const CALL_HISTORY_PAGE_SIZE = 160;
 const THREAD_MESSAGE_PAGE_SIZE = 240;
 function safeDecodeLocalSegment(value: string) {
   try {
@@ -730,6 +732,8 @@ function App() {
   const [data, setData] = useState<Bootstrap | null>(null);
   const messageLoadKeysRef = useRef<Set<string>>(new Set());
   const messageLoadInFlightRef = useRef<Set<string>>(new Set());
+  const callHistoryLoadKeysRef = useRef<Set<string>>(new Set());
+  const callHistoryLoadInFlightRef = useRef<Set<string>>(new Set());
   const [activeChannelId, setActiveChannelId] = useState<string>("");
   const [activeMainView, setActiveMainView] = useState<MainView>("channels");
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -1220,6 +1224,48 @@ function App() {
       console.error("Failed to dynamically fetch messages", err);
     } finally {
       messageLoadInFlightRef.current.delete(key);
+    }
+  }
+
+  function mergeCallUtterances(current: CallUtterance[], incoming: CallUtterance[]) {
+    if (incoming.length === 0) return current;
+    const byId = new Map(current.map((item) => [item.id, item]));
+    for (const item of incoming) byId.set(item.id, item);
+    return Array.from(byId.values())
+      .sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime());
+  }
+
+  function mergeCallDispatches(current: CallDispatch[], incoming: CallDispatch[]) {
+    if (incoming.length === 0) return current;
+    const byId = new Map(current.map((item) => [item.id, item]));
+    for (const item of incoming) byId.set(item.id, item);
+    return Array.from(byId.values())
+      .sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime());
+  }
+
+  async function fetchCallHistoryOnce(key: string, before: string) {
+    if (callHistoryLoadKeysRef.current.has(key) || callHistoryLoadInFlightRef.current.has(key)) return 0;
+    callHistoryLoadInFlightRef.current.add(key);
+    try {
+      const page = await apiInvoke<CallHistoryPage>("fetch_call_history", {
+        before,
+        limit: CALL_HISTORY_PAGE_SIZE,
+      });
+      callHistoryLoadKeysRef.current.add(key);
+      if (page.utterances.length === 0 && page.dispatches.length === 0) return 0;
+      setData((current) => current
+        ? {
+            ...current,
+            call_utterances: mergeCallUtterances(current.call_utterances ?? [], page.utterances),
+            call_dispatches: mergeCallDispatches(current.call_dispatches ?? [], page.dispatches),
+          }
+        : current);
+      return page.utterances.length;
+    } catch (err) {
+      console.error("Failed to dynamically fetch call history", err);
+      return 0;
+    } finally {
+      callHistoryLoadInFlightRef.current.delete(key);
     }
   }
 
@@ -2425,6 +2471,13 @@ function App() {
       limit: CHANNEL_MESSAGE_PAGE_SIZE,
       rootOnly: true,
     });
+  }
+
+  function loadOlderCallHistory() {
+    const callUtterances = data?.call_utterances ?? [];
+    if (callUtterances.length === 0) return Promise.resolve(0);
+    const oldestUtterance = callUtterances[0];
+    return fetchCallHistoryOnce(`voice:before:${oldestUtterance.created_at}`, oldestUtterance.created_at);
   }
 
   const activeRoot = activeThreadId ? rootMessages.find((m) => m.id === activeThreadId) ?? null : null;
@@ -4629,6 +4682,7 @@ function App() {
           ownerProfile={data.owner_profile}
           activeCallThreadId={activeVoiceThreadId}
           setActiveCallThreadId={setActiveVoiceThreadId}
+          loadOlderCallHistory={loadOlderCallHistory}
           openMobileSidebar={openMobileSidebarFromContent}
           onOpenWorkItem={openWorkItem}
         />

@@ -1,9 +1,11 @@
 use std::{collections::HashSet, env, process::Stdio, sync::OnceLock, time::Duration};
 
+use chrono::{DateTime, Utc};
+use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
@@ -19,10 +21,14 @@ use crate::{
         notify_ui_call_dispatch_upsert, notify_ui_call_session_upsert,
         notify_ui_call_utterance_upsert, notify_ui_message_upsert,
     },
-    models::{CallDispatch, CallSession, CallUtterance, CallUtteranceSubmitResult, Message},
+    models::{
+        CallDispatch, CallHistoryPage, CallSession, CallUtterance, CallUtteranceSubmitResult,
+        Message,
+    },
     prompts::call::{
         call_worker_brief_header, call_worker_brief_intro, CALL_COORDINATOR_SYSTEM_PROMPT,
     },
+    publish_guard::bump_thread_version,
     text::compact_chars_middle,
     to_string, voice, AgentWorkDispatchInput, AgentWorkDispatchProvenance, CommandResult,
 };
@@ -35,12 +41,19 @@ const CALL_COORDINATOR_REASONING_EFFORT_ENV: &str = "LANTOR_CALL_COORDINATOR_REA
 const DEFAULT_CALL_COORDINATOR_MODEL: &str = "gpt-5.5";
 const DEFAULT_CALL_COORDINATOR_REASONING_EFFORT: &str = "low";
 const CALL_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(60);
+const CALL_COORDINATOR_RUNTIME_KEY: &str = "codex_call_coordinator";
 const CALL_DISPATCH_QUEUE_LEASE_SECONDS: i64 = 120;
 const CALL_COORDINATOR_TRANSCRIPT_CONTEXT_LIMIT: usize = 12;
 const CALL_COORDINATOR_MESSAGE_CONTEXT_LIMIT: usize = 16;
+const CALL_SESSION_MODE_CALL: &str = "call";
+const CALL_SESSION_MODE_WAKE_WORD: &str = "wake_word";
+const DEFAULT_CALL_WAKE_WORDS: &[&str] = &["兰托", "蓝托", "lantor"];
+const CALL_SYSTEM_CHANNEL_NAME: &str = "voice-console";
 const CALL_BOOTSTRAP_SESSION_LIMIT: i64 = 20;
-const CALL_BOOTSTRAP_UTTERANCE_LIMIT: i64 = 160;
+const CALL_BOOTSTRAP_UTTERANCE_LIMIT: i64 = 600;
 const CALL_BOOTSTRAP_DISPATCH_LIMIT: i64 = 160;
+const DEFAULT_FETCH_CALL_HISTORY_LIMIT: i64 = 160;
+const MAX_FETCH_CALL_HISTORY_LIMIT: i64 = 300;
 #[derive(Clone, Copy)]
 enum CallVoiceLanguage {
     ZhCn,
@@ -89,6 +102,20 @@ impl CallVoiceLanguage {
         match self {
             Self::ZhCn => "我听到了。",
             Self::EnUs => "I heard you.",
+        }
+    }
+
+    fn wake_word_only(self) -> &'static str {
+        match self {
+            Self::ZhCn => "我在，您说。",
+            Self::EnUs => "I'm here. Please continue.",
+        }
+    }
+
+    fn wake_word_required(self) -> &'static str {
+        match self {
+            Self::ZhCn => "等待唤醒词。",
+            Self::EnUs => "Waiting for the wake word.",
         }
     }
 
@@ -160,6 +187,8 @@ pub(crate) async fn migrate_call_mode_schema(pool: &SqlitePool) -> Result<(), sq
             id blob primary key not null default (randomblob(16)),
             channel_id blob references channels(id) on delete set null,
             thread_root_id blob references messages(id) on delete set null,
+            mode text not null default 'call',
+            wake_words text not null default '',
             status text not null default 'active',
             title text,
             started_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
@@ -168,10 +197,20 @@ pub(crate) async fn migrate_call_mode_schema(pool: &SqlitePool) -> Result<(), sq
         )
         "#,
         r#"
+        create table if not exists provider_runtime_sessions (
+            runtime text primary key not null,
+            provider_thread_id text not null,
+            status text not null default 'idle',
+            created_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
+            updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now'))
+        )
+        "#,
+        r#"
         create table if not exists call_utterances (
             id blob primary key not null default (randomblob(16)),
             session_id blob not null references call_sessions(id) on delete cascade,
             thread_root_utterance_id blob references call_utterances(id) on delete set null,
+            source_message_id blob references messages(id) on delete set null,
             sequence integer not null,
             transcript text not null default '',
             language text not null default '',
@@ -212,6 +251,24 @@ pub(crate) async fn migrate_call_mode_schema(pool: &SqlitePool) -> Result<(), sq
         }
     }
 
+    let rows = sqlx::query("pragma table_info(call_sessions)")
+        .fetch_all(pool)
+        .await?;
+    let session_columns = rows
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<HashSet<_>>();
+    if !session_columns.contains("mode") {
+        sqlx::query("alter table call_sessions add column mode text not null default 'call'")
+            .execute(pool)
+            .await?;
+    }
+    if !session_columns.contains("wake_words") {
+        sqlx::query("alter table call_sessions add column wake_words text not null default ''")
+            .execute(pool)
+            .await?;
+    }
+
     let rows = sqlx::query("pragma table_info(call_utterances)")
         .fetch_all(pool)
         .await?;
@@ -222,6 +279,13 @@ pub(crate) async fn migrate_call_mode_schema(pool: &SqlitePool) -> Result<(), sq
     if !utterance_columns.contains("thread_root_utterance_id") {
         sqlx::query(
             "alter table call_utterances add column thread_root_utterance_id blob references call_utterances(id) on delete set null",
+        )
+        .execute(pool)
+        .await?;
+    }
+    if !utterance_columns.contains("source_message_id") {
+        sqlx::query(
+            "alter table call_utterances add column source_message_id blob references messages(id) on delete set null",
         )
         .execute(pool)
         .await?;
@@ -387,7 +451,7 @@ fn final_answer_text_from_run_log(log: &str) -> Option<String> {
 pub(crate) async fn load_call_sessions(pool: &SqlitePool) -> CommandResult<Vec<CallSession>> {
     let rows = sqlx::query(
         r#"
-        select id, channel_id, thread_root_id, status, title, started_at, ended_at, updated_at
+        select id, channel_id, thread_root_id, mode, wake_words, status, title, started_at, ended_at, updated_at
         from call_sessions
         order by case when status = 'active' then 0 else 1 end, updated_at desc, started_at desc
         limit $1
@@ -405,7 +469,7 @@ pub(crate) async fn load_call_utterances(pool: &SqlitePool) -> CommandResult<Vec
     let rows = sqlx::query(
         r#"
         select
-            id, session_id, thread_root_utterance_id, sequence, transcript, language, transcription_provider,
+            id, session_id, thread_root_utterance_id, source_message_id, sequence, transcript, language, transcription_provider,
             transcription_error, audio_mime_type, audio_original_name,
             audio_duration_ms, status, created_at, updated_at
         from (
@@ -451,26 +515,119 @@ pub(crate) async fn load_call_dispatches(pool: &SqlitePool) -> CommandResult<Vec
     Ok(rows.into_iter().map(call_dispatch_from_row).collect())
 }
 
+fn normalized_fetch_call_history_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(DEFAULT_FETCH_CALL_HISTORY_LIMIT)
+        .clamp(1, MAX_FETCH_CALL_HISTORY_LIMIT)
+}
+
+pub(crate) async fn fetch_call_history_page(
+    pool: &SqlitePool,
+    before: DateTime<Utc>,
+    limit: Option<i64>,
+) -> CommandResult<CallHistoryPage> {
+    let limit = normalized_fetch_call_history_limit(limit);
+    let rows = sqlx::query(
+        r#"
+        select
+            id, session_id, thread_root_utterance_id, source_message_id, sequence, transcript, language, transcription_provider,
+            transcription_error, audio_mime_type, audio_original_name,
+            audio_duration_ms, status, created_at, updated_at
+        from (
+            select *
+            from call_utterances
+            where julianday(created_at) < julianday($1)
+            order by created_at desc, sequence desc
+            limit $2
+        ) recent
+        order by created_at asc, sequence asc
+        "#,
+    )
+    .bind(before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(to_string)?;
+
+    let utterances: Vec<CallUtterance> = rows.into_iter().map(call_utterance_from_row).collect();
+    if utterances.is_empty() {
+        return Ok(CallHistoryPage {
+            utterances,
+            dispatches: Vec::new(),
+        });
+    }
+
+    let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"
+        select
+            d.id, d.session_id, d.utterance_id, u.sequence as utterance_sequence,
+            d.intent, d.ack_status,
+            d.ack_text, d.speech_topic, d.confidence, d.target_agent_id, d.work_item_id,
+            d.compensated_work_item_id, d.long_task_id, d.status, d.error, d.created_at, d.updated_at
+        from call_dispatches d
+        join call_utterances u on u.id = d.utterance_id
+        where d.utterance_id in (
+        "#,
+    );
+    let mut separated = builder.separated(", ");
+    for utterance in &utterances {
+        separated.push_bind(utterance.id);
+    }
+    separated.push_unseparated(
+        r#")
+        order by d.created_at asc, d.id asc
+        "#,
+    );
+
+    let dispatch_rows = builder.build().fetch_all(pool).await.map_err(to_string)?;
+
+    Ok(CallHistoryPage {
+        utterances,
+        dispatches: dispatch_rows
+            .into_iter()
+            .map(call_dispatch_from_row)
+            .collect(),
+    })
+}
+
+#[cfg(test)]
 pub(crate) async fn call_session_start_in_pool(
     pool: &SqlitePool,
     channel_id: Option<Uuid>,
     thread_root_id: Option<Uuid>,
     title: Option<String>,
 ) -> CommandResult<CallSession> {
-    validate_call_surface(pool, channel_id, thread_root_id).await?;
+    call_session_start_with_options_in_pool(pool, channel_id, thread_root_id, title, None, None)
+        .await
+}
+
+pub(crate) async fn call_session_start_with_options_in_pool(
+    pool: &SqlitePool,
+    channel_id: Option<Uuid>,
+    thread_root_id: Option<Uuid>,
+    title: Option<String>,
+    mode: Option<String>,
+    wake_words: Option<String>,
+) -> CommandResult<CallSession> {
+    let channel_id = resolve_call_session_channel(pool, channel_id, thread_root_id).await?;
+    validate_call_surface(pool, Some(channel_id), thread_root_id).await?;
     let title = title
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+    let mode = normalize_call_session_mode(mode.as_deref());
+    let wake_words = normalize_call_wake_words(wake_words.as_deref());
     let session_id: Uuid = sqlx::query_scalar(
         r#"
-        insert into call_sessions (channel_id, thread_root_id, title)
-        values ($1, $2, $3)
+        insert into call_sessions (channel_id, thread_root_id, title, mode, wake_words)
+        values ($1, $2, $3, $4, $5)
         returning id
         "#,
     )
     .bind(channel_id)
     .bind(thread_root_id)
     .bind(title)
+    .bind(mode)
+    .bind(wake_words)
     .fetch_one(pool)
     .await
     .map_err(to_string)?;
@@ -521,6 +678,7 @@ pub(crate) async fn call_dispatch_cancel_work_in_pool(
         "application/x-lantor-call-control",
     )
     .await?;
+    let utterance = ensure_call_utterance_owner_message(pool, &utterance).await?;
     notify_ui_call_utterance_upsert(pool, &utterance, "call_utterance_acknowledged").await?;
     let dispatch = cancel_call_work_for_utterance(
         pool,
@@ -599,7 +757,11 @@ async fn submit_text_call_utterance_in_pool(
         audio_mime_type,
     )
     .await?;
+    let utterance = ensure_call_utterance_owner_message(pool, &utterance).await?;
     notify_ui_call_utterance_upsert(pool, &utterance, "call_utterance_acknowledged").await?;
+    if let Some(result) = apply_call_wake_word_gate(pool, &session, &utterance).await? {
+        return Ok(result);
+    }
     let queued_dispatch = queue_transcribed_call_utterance(pool, &session, &utterance).await?;
     let processed_dispatch =
         process_call_dispatch_queue(pool, session.id, Some(utterance.id)).await?;
@@ -678,6 +840,9 @@ pub(crate) async fn call_session_submit_utterance_in_pool(
                     update_utterance_status(pool, utterance.id, "ignored", &dispatch.error).await?;
                 notify_ui_call_utterance_upsert(pool, &utterance, "call_utterance_ignored").await?;
                 return call_submit_result(pool, session.id, utterance, dispatch).await;
+            }
+            if let Some(result) = apply_call_wake_word_gate(pool, &session, &utterance).await? {
+                return Ok(result);
             }
             let queued_dispatch =
                 queue_transcribed_call_utterance(pool, &session, &utterance).await?;
@@ -763,6 +928,7 @@ async fn call_submit_result(
     dispatch: CallDispatch,
 ) -> CommandResult<CallUtteranceSubmitResult> {
     let session = load_call_session(pool, session_id).await?;
+    let utterance = load_call_utterance(pool, utterance.id).await?;
     Ok(CallUtteranceSubmitResult {
         session,
         utterance,
@@ -771,6 +937,329 @@ async fn call_submit_result(
         work_item_id: dispatch.work_item_id,
         long_task_id: dispatch.long_task_id,
     })
+}
+
+fn normalize_call_session_mode(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some(CALL_SESSION_MODE_WAKE_WORD) => CALL_SESSION_MODE_WAKE_WORD,
+        _ => CALL_SESSION_MODE_CALL,
+    }
+}
+
+fn call_wake_words(raw: &str) -> Vec<String> {
+    let parsed = raw
+        .split([',', '\n', '，', '、'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        DEFAULT_CALL_WAKE_WORDS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect()
+    } else {
+        parsed
+    }
+}
+
+fn normalize_call_wake_words(value: Option<&str>) -> String {
+    call_wake_words(value.unwrap_or_default()).join(",")
+}
+
+fn trim_call_wake_separators(value: &str) -> &str {
+    value.trim_start_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '.' | ':' | ';' | '，' | '。' | '、' | '：' | '；' | '！' | '!'
+            )
+    })
+}
+
+fn normalize_call_wake_match_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn call_wake_filler_char(ch: char) -> bool {
+    matches!(ch, '啊' | '呀' | '呢' | '呐' | '吧' | '哈' | '哦' | '喂')
+}
+
+fn trim_call_wake_remainder(value: &str) -> &str {
+    let mut rest = trim_call_wake_separators(value);
+    loop {
+        let Some(ch) = rest.chars().next() else {
+            return rest;
+        };
+        if !call_wake_filler_char(ch) {
+            return rest;
+        }
+        rest = trim_call_wake_separators(&rest[ch.len_utf8()..]);
+    }
+}
+
+fn call_wake_word_end_at(transcript: &str, start_byte: usize, wake_word: &str) -> Option<usize> {
+    let mut transcript_chars = transcript[start_byte..].char_indices();
+    let mut end_byte = None;
+    for word_ch in wake_word.chars() {
+        loop {
+            let (offset, transcript_ch) = transcript_chars.next()?;
+            let absolute_byte = start_byte + offset;
+            if transcript_ch.is_whitespace() {
+                continue;
+            }
+            if transcript_ch == word_ch {
+                end_byte = Some(absolute_byte + transcript_ch.len_utf8());
+                break;
+            }
+            return None;
+        }
+    }
+    end_byte
+}
+
+fn call_wake_phonetic_tokens(value: &str) -> Vec<String> {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .filter_map(|ch| {
+            ch.to_pinyin()
+                .map(|pinyin| pinyin.plain().to_owned())
+                .or_else(|| {
+                    ch.is_ascii_alphanumeric()
+                        .then(|| ch.to_ascii_lowercase().to_string())
+                })
+        })
+        .collect()
+}
+
+fn call_wake_phonetic_candidate_end_at(
+    transcript: &str,
+    start_byte: usize,
+    wake_tokens: &[String],
+) -> Option<usize> {
+    let mut matched = 0usize;
+    for (offset, transcript_ch) in transcript[start_byte..].char_indices() {
+        if transcript_ch.is_whitespace() {
+            continue;
+        }
+        let Some(token) = transcript_ch
+            .to_pinyin()
+            .map(|pinyin| pinyin.plain().to_owned())
+            .or_else(|| {
+                transcript_ch
+                    .is_ascii_alphanumeric()
+                    .then(|| transcript_ch.to_ascii_lowercase().to_string())
+            })
+        else {
+            return None;
+        };
+        if token != wake_tokens[matched] {
+            return None;
+        }
+        matched += 1;
+        let end_byte = start_byte + offset + transcript_ch.len_utf8();
+        if matched == wake_tokens.len() {
+            return Some(end_byte);
+        }
+    }
+    None
+}
+
+fn call_wake_word_is_phonetic_match_candidate(word: &str, tokens: &[String]) -> bool {
+    let char_count = word.chars().filter(|ch| !ch.is_whitespace()).count();
+    (2..=4).contains(&char_count) && tokens.len() == char_count
+}
+
+fn call_wake_phonetic_search_prefix_limit(transcript: &str) -> usize {
+    let mut seen = 0usize;
+    for (byte, ch) in transcript.char_indices() {
+        if ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '.' | ':' | ';' | '，' | '。' | '、' | '：' | '；' | '！' | '!' | '?' | '？'
+            )
+        {
+            continue;
+        }
+        if seen >= 4 {
+            return byte;
+        }
+        seen += 1;
+    }
+    transcript.len()
+}
+
+fn find_call_wake_word(transcript: &str, wake_words: &str) -> Option<(usize, usize)> {
+    let lower = transcript.to_lowercase();
+    let words = call_wake_words(wake_words)
+        .into_iter()
+        .map(|word| normalize_call_wake_match_text(&word))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let mut best: Option<(usize, usize)> = None;
+    for (start_byte, ch) in lower.char_indices() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        for word in &words {
+            let Some(end_byte) = call_wake_word_end_at(&lower, start_byte, word) else {
+                continue;
+            };
+            let candidate = (start_byte, end_byte);
+            if best.is_none_or(|current| {
+                candidate.0 < current.0 || (candidate.0 == current.0 && candidate.1 > current.1)
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    let phonetic_search_end = call_wake_phonetic_search_prefix_limit(&lower);
+    for (start_byte, ch) in lower.char_indices() {
+        if start_byte > phonetic_search_end {
+            break;
+        }
+        if ch.is_whitespace() {
+            continue;
+        }
+        for word in &words {
+            let wake_tokens = call_wake_phonetic_tokens(word);
+            if !call_wake_word_is_phonetic_match_candidate(word, &wake_tokens) {
+                continue;
+            }
+            let Some(end_byte) =
+                call_wake_phonetic_candidate_end_at(&lower, start_byte, &wake_tokens)
+            else {
+                continue;
+            };
+            let candidate = (start_byte, end_byte);
+            if best.is_none_or(|current| {
+                candidate.0 < current.0 || (candidate.0 == current.0 && candidate.1 > current.1)
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn strip_call_wake_word(transcript: &str, wake_words: &str) -> Option<String> {
+    let transcript = transcript.trim();
+    let (_, mut remaining_start) = find_call_wake_word(transcript, wake_words)?;
+    loop {
+        let rest = trim_call_wake_remainder(&transcript[remaining_start..]);
+        let skipped = transcript.len().saturating_sub(rest.len());
+        if let Some((start, end)) = find_call_wake_word(rest, wake_words) {
+            if start == 0 {
+                remaining_start = skipped + end;
+                continue;
+            }
+        }
+        return Some(rest.to_owned());
+    }
+}
+
+async fn call_session_has_recent_wake_only_ack(
+    pool: &SqlitePool,
+    session: &CallSession,
+    utterance: &CallUtterance,
+) -> CommandResult<bool> {
+    let prior_transcript: Option<String> = sqlx::query_scalar(
+        r#"
+        select transcript
+        from call_utterances
+        where session_id = $1
+          and sequence < $2
+          and status = 'acknowledged'
+          and updated_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-45 seconds')
+        order by sequence desc
+        limit 1
+        "#,
+    )
+    .bind(session.id)
+    .bind(utterance.sequence)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    Ok(prior_transcript
+        .and_then(|transcript| strip_call_wake_word(&transcript, &session.wake_words))
+        .is_some_and(|stripped| stripped.trim().is_empty()))
+}
+
+async fn apply_call_wake_word_gate(
+    pool: &SqlitePool,
+    session: &CallSession,
+    utterance: &CallUtterance,
+) -> CommandResult<Option<CallUtteranceSubmitResult>> {
+    if session.mode != CALL_SESSION_MODE_WAKE_WORD {
+        return Ok(None);
+    }
+    let voice_language = CallVoiceLanguage::from_hint(Some(&utterance.language));
+    let Some(stripped_transcript) =
+        strip_call_wake_word(&utterance.transcript, &session.wake_words)
+    else {
+        if call_session_has_recent_wake_only_ack(pool, session, utterance).await? {
+            return Ok(None);
+        }
+        let error = format!("wake word required: {}", session.wake_words);
+        let utterance = update_utterance_status(pool, utterance.id, "ignored", &error).await?;
+        notify_ui_call_utterance_upsert(pool, &utterance, "call_utterance_ignored").await?;
+        let dispatch = create_spoken_ack_dispatch(
+            pool,
+            session,
+            utterance.id,
+            NewDispatch {
+                intent: "ack_only",
+                ack_status: "heard",
+                ack_text: voice_language.wake_word_required(),
+                speech_topic: "",
+                confidence: "high",
+                target_agent_id: None,
+                work_item_id: None,
+                long_task_id: None,
+                status: "ignored",
+                error: &error,
+            },
+            "call_dispatch_ignored",
+        )
+        .await?;
+        return call_submit_result(pool, session.id, utterance, dispatch)
+            .await
+            .map(Some);
+    };
+    if stripped_transcript.trim().is_empty() {
+        let utterance = update_utterance_status(pool, utterance.id, "acknowledged", "").await?;
+        notify_ui_call_utterance_upsert(pool, &utterance, "call_utterance_acknowledged").await?;
+        let dispatch = create_spoken_ack_dispatch(
+            pool,
+            session,
+            utterance.id,
+            NewDispatch {
+                intent: "ack_only",
+                ack_status: "heard",
+                ack_text: voice_language.wake_word_only(),
+                speech_topic: "",
+                confidence: "high",
+                target_agent_id: None,
+                work_item_id: None,
+                long_task_id: None,
+                status: "acknowledged",
+                error: "",
+            },
+            "call_dispatch_acknowledged",
+        )
+        .await?;
+        return call_submit_result(pool, session.id, utterance, dispatch)
+            .await
+            .map(Some);
+    }
+    let utterance = update_utterance_transcript(pool, utterance.id, &stripped_transcript).await?;
+    notify_ui_call_utterance_upsert(pool, &utterance, "call_utterance_transcribed").await?;
+    Ok(None)
 }
 
 async fn validate_call_surface(
@@ -807,10 +1296,106 @@ async fn validate_call_surface(
     Ok(())
 }
 
+async fn resolve_call_session_channel(
+    pool: &SqlitePool,
+    channel_id: Option<Uuid>,
+    thread_root_id: Option<Uuid>,
+) -> CommandResult<Uuid> {
+    if let Some(channel_id) = channel_id {
+        return Ok(channel_id);
+    }
+    if let Some(thread_root_id) = thread_root_id {
+        let channel_id: Option<Uuid> =
+            sqlx::query_scalar("select channel_id from messages where id = $1")
+                .bind(thread_root_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(to_string)?;
+        if let Some(channel_id) = channel_id {
+            return Ok(channel_id);
+        }
+    }
+    ensure_call_system_channel(pool).await
+}
+
+async fn ensure_call_system_channel(pool: &SqlitePool) -> CommandResult<Uuid> {
+    let existing_channel_id: Option<Uuid> =
+        sqlx::query_scalar("select id from channels where name = $1")
+            .bind(CALL_SYSTEM_CHANNEL_NAME)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?;
+    if let Some(channel_id) = existing_channel_id {
+        sqlx::query("update channels set kind = 'voice' where id = $1 and kind <> 'voice'")
+            .bind(channel_id)
+            .execute(pool)
+            .await
+            .map_err(to_string)?;
+        return Ok(channel_id);
+    }
+    let channel_id: Uuid = sqlx::query_scalar(
+        r#"
+        insert into channels (name, kind)
+        values ($1, 'voice')
+        returning id
+        "#,
+    )
+    .bind(CALL_SYSTEM_CHANNEL_NAME)
+    .fetch_one(pool)
+    .await
+    .map_err(to_string)?;
+    Ok(channel_id)
+}
+
+async fn ensure_existing_call_session_channel(
+    pool: &SqlitePool,
+    session_id: Uuid,
+) -> CommandResult<Option<CallSession>> {
+    let row = sqlx::query(
+        r#"
+        select id, channel_id, thread_root_id, mode, wake_words, status, title, started_at, ended_at, updated_at
+        from call_sessions
+        where id = $1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let session = call_session_from_row(row);
+    if session.channel_id.is_some() {
+        return Ok(Some(session));
+    }
+
+    let channel_id = resolve_call_session_channel(pool, None, session.thread_root_id).await?;
+    validate_call_surface(pool, Some(channel_id), session.thread_root_id).await?;
+    sqlx::query(
+        r#"
+        update call_sessions
+        set channel_id = $2,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+        where id = $1
+          and channel_id is null
+        "#,
+    )
+    .bind(session_id)
+    .bind(channel_id)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+
+    let session = load_call_session(pool, session_id).await?;
+    notify_ui_call_session_upsert(pool, &session, "call_session_channel_bound").await?;
+    Ok(Some(session))
+}
+
 async fn load_call_session(pool: &SqlitePool, session_id: Uuid) -> CommandResult<CallSession> {
     let row = sqlx::query(
         r#"
-        select id, channel_id, thread_root_id, status, title, started_at, ended_at, updated_at
+        select id, channel_id, thread_root_id, mode, wake_words, status, title, started_at, ended_at, updated_at
         from call_sessions
         where id = $1
         "#,
@@ -830,13 +1415,14 @@ async fn create_transcribing_utterance(
     duration_ms: Option<u32>,
     language: Option<&str>,
 ) -> CommandResult<(CallSession, CallUtterance)> {
+    ensure_existing_call_session_channel(pool, session_id).await?;
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(to_string)?;
     let session_row = sqlx::query(
         r#"
-        select id, channel_id, thread_root_id, status, title, started_at, ended_at, updated_at
+        select id, channel_id, thread_root_id, mode, wake_words, status, title, started_at, ended_at, updated_at
         from call_sessions
         where id = $1
         "#,
@@ -902,13 +1488,14 @@ async fn create_call_control_utterance(
     transcription_provider: &str,
     audio_mime_type: &str,
 ) -> CommandResult<(CallSession, CallUtterance)> {
+    ensure_existing_call_session_channel(pool, session_id).await?;
     let mut tx = pool
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(to_string)?;
     let session_row = sqlx::query(
         r#"
-        select id, channel_id, thread_root_id, status, title, started_at, ended_at, updated_at
+        select id, channel_id, thread_root_id, mode, wake_words, status, title, started_at, ended_at, updated_at
         from call_sessions
         where id = $1
         "#,
@@ -981,7 +1568,7 @@ async fn load_call_utterance(
     let row = sqlx::query(
         r#"
         select
-            id, session_id, thread_root_utterance_id, sequence, transcript, language, transcription_provider,
+            id, session_id, thread_root_utterance_id, source_message_id, sequence, transcript, language, transcription_provider,
             transcription_error, audio_mime_type, audio_original_name,
             audio_duration_ms, status, created_at, updated_at
         from call_utterances
@@ -1018,7 +1605,8 @@ async fn update_utterance_transcribed(
     .execute(pool)
     .await
     .map_err(to_string)?;
-    load_call_utterance(pool, utterance_id).await
+    let utterance = load_call_utterance(pool, utterance_id).await?;
+    ensure_call_utterance_owner_message(pool, &utterance).await
 }
 
 async fn update_utterance_status(
@@ -1063,7 +1651,8 @@ async fn update_utterance_transcript(
     .execute(pool)
     .await
     .map_err(to_string)?;
-    load_call_utterance(pool, utterance_id).await
+    let utterance = load_call_utterance(pool, utterance_id).await?;
+    ensure_call_utterance_owner_message(pool, &utterance).await
 }
 
 async fn queue_transcribed_call_utterance(
@@ -1738,6 +2327,7 @@ async fn enqueue_and_link_call_dispatch_work(
     let transcript = request_transcript.trim();
     let work_title = call_work_title(transcript);
     let work_context = call_work_context(&session, &utterance, &dispatch, &target, transcript);
+    let thread_root_id = utterance.source_message_id.or(session.thread_root_id);
     #[cfg(test)]
     let work = if transcript.contains(TEST_ASYNC_ENQUEUE_FAILURE_MARKER) {
         Err("test async enqueue failure after ack".to_owned())
@@ -1747,7 +2337,8 @@ async fn enqueue_and_link_call_dispatch_work(
             AgentWorkDispatchInput {
                 agent_id: target.agent_id,
                 channel_id: session.channel_id,
-                thread_root_id: session.thread_root_id,
+                thread_root_id,
+                source_message_id: utterance.source_message_id,
                 task_id: None,
                 title: &work_title,
                 context: &work_context,
@@ -1767,7 +2358,8 @@ async fn enqueue_and_link_call_dispatch_work(
         AgentWorkDispatchInput {
             agent_id: target.agent_id,
             channel_id: session.channel_id,
-            thread_root_id: session.thread_root_id,
+            thread_root_id,
+            source_message_id: utterance.source_message_id,
             task_id: None,
             title: &work_title,
             context: &work_context,
@@ -2298,7 +2890,9 @@ async fn call_coordinator_system_agent_decision(
             }
         }
         None => {
-            match run_call_coordinator_app_server(&request_json, CALL_COORDINATOR_TIMEOUT).await {
+            match run_call_coordinator_app_server(pool, &request_json, CALL_COORDINATOR_TIMEOUT)
+                .await
+            {
                 Ok(stdout) => stdout,
                 Err(err) => return Err(format!("Call Mode coordinator app-server failed: {err}")),
             }
@@ -2332,7 +2926,12 @@ async fn load_call_coordinator_agents(
     pool: &SqlitePool,
     channel_id: Option<Uuid>,
 ) -> CommandResult<Vec<CallCoordinatorAgentContext>> {
-    let rows = if let Some(channel_id) = channel_id {
+    let use_channel_members = if let Some(channel_id) = channel_id {
+        !is_call_system_channel(pool, channel_id).await?
+    } else {
+        false
+    };
+    let rows = if let (Some(channel_id), true) = (channel_id, use_channel_members) {
         sqlx::query(
             r#"
         select a.id, a.handle, coalesce(a.display_name, '') as display_name, a.status
@@ -2374,6 +2973,15 @@ async fn load_call_coordinator_agents(
             status: row.get("status"),
         })
         .collect())
+}
+
+async fn is_call_system_channel(pool: &SqlitePool, channel_id: Uuid) -> CommandResult<bool> {
+    let name: Option<String> = sqlx::query_scalar("select name from channels where id = $1")
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(to_string)?;
+    Ok(name.as_deref() == Some(CALL_SYSTEM_CHANNEL_NAME))
 }
 
 async fn load_call_coordinator_active_work_context(
@@ -2804,6 +3412,7 @@ fn call_coordinator_app_server_slot() -> &'static AsyncMutex<Option<CallCoordina
 }
 
 async fn run_call_coordinator_app_server(
+    pool: &SqlitePool,
     input: &[u8],
     timeout_duration: Duration,
 ) -> CommandResult<String> {
@@ -2814,7 +3423,7 @@ async fn run_call_coordinator_app_server(
     for _ in 0..2 {
         if runtime.is_none() {
             *runtime = Some(
-                timeout(timeout_duration, spawn_call_coordinator_app_server())
+                timeout(timeout_duration, spawn_call_coordinator_app_server(pool))
                     .await
                     .map_err(|_| "coordinator app-server timed out during startup".to_owned())??,
             );
@@ -2843,7 +3452,9 @@ async fn run_call_coordinator_app_server(
     Err(last_error.unwrap_or_else(|| "coordinator app-server failed".to_owned()))
 }
 
-async fn spawn_call_coordinator_app_server() -> CommandResult<CallCoordinatorAppServer> {
+async fn spawn_call_coordinator_app_server(
+    pool: &SqlitePool,
+) -> CommandResult<CallCoordinatorAppServer> {
     let model_reasoning_effort = serde_json::to_string(&call_coordinator_reasoning_effort())
         .map_err(to_string)
         .map(|value| format!("model_reasoning_effort={value}"))?;
@@ -2910,7 +3521,7 @@ async fn spawn_call_coordinator_app_server() -> CommandResult<CallCoordinatorApp
 
     let mut next_request_id = initialize_id + 1;
     let thread_id =
-        start_call_coordinator_thread(&mut stdin, &mut stdout, &mut next_request_id).await?;
+        open_call_coordinator_thread(pool, &mut stdin, &mut stdout, &mut next_request_id).await?;
 
     Ok(CallCoordinatorAppServer {
         child,
@@ -2919,6 +3530,45 @@ async fn spawn_call_coordinator_app_server() -> CommandResult<CallCoordinatorApp
         thread_id,
         next_request_id,
     })
+}
+
+async fn load_call_coordinator_thread_id(pool: &SqlitePool) -> CommandResult<Option<String>> {
+    let thread_id: Option<String> = sqlx::query_scalar(
+        r#"
+        select provider_thread_id
+        from provider_runtime_sessions
+        where runtime = $1
+        "#,
+    )
+    .bind(CALL_COORDINATOR_RUNTIME_KEY)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    Ok(thread_id.filter(|thread_id| !thread_id.trim().is_empty()))
+}
+
+async fn upsert_call_coordinator_thread_id(
+    pool: &SqlitePool,
+    provider_thread_id: &str,
+    status: &str,
+) -> CommandResult<()> {
+    sqlx::query(
+        r#"
+        insert into provider_runtime_sessions (runtime, provider_thread_id, status)
+        values ($1, $2, $3)
+        on conflict (runtime) do update set
+            provider_thread_id = excluded.provider_thread_id,
+            status = excluded.status,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+        "#,
+    )
+    .bind(CALL_COORDINATOR_RUNTIME_KEY)
+    .bind(provider_thread_id)
+    .bind(status)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+    Ok(())
 }
 
 async fn stop_call_coordinator_app_server(
@@ -3075,6 +3725,66 @@ async fn start_call_coordinator_thread(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "coordinator app-server thread/start missing thread id".to_owned())
+}
+
+async fn resume_call_coordinator_thread(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    next_request_id: &mut i64,
+    thread_id: &str,
+) -> CommandResult<String> {
+    let request_id = *next_request_id;
+    *next_request_id += 1;
+    let mut params = json!({
+        "threadId": thread_id,
+        "model": call_coordinator_model_value(),
+        "cwd": call_coordinator_cwd(),
+        "approvalPolicy": "never",
+        "sandbox": "danger-full-access",
+        "developerInstructions": CALL_COORDINATOR_SYSTEM_PROMPT,
+        "persistExtendedHistory": true
+    });
+    apply_call_coordinator_runtime_options(&mut params, &call_coordinator_reasoning_effort());
+    write_call_coordinator_json(
+        stdin,
+        json!({
+            "method": "thread/resume",
+            "id": request_id,
+            "params": params
+        }),
+    )
+    .await?;
+    let value = read_call_coordinator_response(stdout, request_id).await?;
+    if let Some(error) = call_coordinator_request_error(&value) {
+        return Err(format!(
+            "coordinator app-server thread/resume failed: {error}"
+        ));
+    }
+    value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "coordinator app-server thread/resume missing thread id".to_owned())
+}
+
+async fn open_call_coordinator_thread(
+    pool: &SqlitePool,
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    next_request_id: &mut i64,
+) -> CommandResult<String> {
+    if let Some(thread_id) = load_call_coordinator_thread_id(pool).await? {
+        if let Ok(resumed_thread_id) =
+            resume_call_coordinator_thread(stdin, stdout, next_request_id, &thread_id).await
+        {
+            upsert_call_coordinator_thread_id(pool, &resumed_thread_id, "idle").await?;
+            return Ok(resumed_thread_id);
+        }
+    }
+
+    let thread_id = start_call_coordinator_thread(stdin, stdout, next_request_id).await?;
+    upsert_call_coordinator_thread_id(pool, &thread_id, "idle").await?;
+    Ok(thread_id)
 }
 
 fn call_coordinator_event_matches_thread(value: &Value, thread_id: &str) -> bool {
@@ -3289,9 +3999,65 @@ fn cancelable_work_handle_list(works: &[CallCancelableWork]) -> String {
     }
 }
 
+async fn ensure_call_utterance_owner_message(
+    pool: &SqlitePool,
+    utterance: &CallUtterance,
+) -> CommandResult<CallUtterance> {
+    if utterance.source_message_id.is_some() || utterance.transcript.trim().is_empty() {
+        return Ok(utterance.clone());
+    }
+    let session = load_call_session(pool, utterance.session_id).await?;
+    let Some(channel_id) = session.channel_id else {
+        return Ok(utterance.clone());
+    };
+    let thread_root_id = if let Some(thread_root_utterance_id) = utterance.thread_root_utterance_id
+    {
+        sqlx::query_scalar("select source_message_id from call_utterances where id = $1")
+            .bind(thread_root_utterance_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?
+            .flatten()
+    } else {
+        session.thread_root_id
+    };
+    let message_id: Uuid = sqlx::query_scalar(
+        r#"
+        insert into messages (channel_id, thread_root_id, sender_name, sender_role, body, is_task)
+        values ($1, $2, $3, 'owner', $4, false)
+        returning id
+        "#,
+    )
+    .bind(channel_id)
+    .bind(thread_root_id)
+    .bind("You")
+    .bind(utterance.transcript.trim())
+    .fetch_one(pool)
+    .await
+    .map_err(to_string)?;
+    sqlx::query(
+        r#"
+        update call_utterances
+        set source_message_id = $2,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+        where id = $1
+        "#,
+    )
+    .bind(utterance.id)
+    .bind(message_id)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+    bump_call_message_thread_version(pool, channel_id, thread_root_id).await?;
+    let message = load_call_coordinator_message(pool, message_id).await?;
+    notify_ui_message_upsert(pool, &message, "call_utterance_message").await?;
+    load_call_utterance(pool, utterance.id).await
+}
+
 async fn insert_call_coordinator_message(
     pool: &SqlitePool,
     session: &CallSession,
+    utterance_id: Uuid,
     body: &str,
 ) -> CommandResult<()> {
     let Some(channel_id) = session.channel_id else {
@@ -3302,6 +4068,15 @@ async fn insert_call_coordinator_message(
         return Ok(());
     }
 
+    let thread_root_id =
+        sqlx::query_scalar("select source_message_id from call_utterances where id = $1")
+            .bind(utterance_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?
+            .flatten()
+            .or(session.thread_root_id);
+
     let message_id: Uuid = sqlx::query_scalar(
         r#"
         insert into messages (channel_id, thread_root_id, sender_name, sender_role, body, is_task)
@@ -3310,15 +4085,28 @@ async fn insert_call_coordinator_message(
         "#,
     )
     .bind(channel_id)
-    .bind(session.thread_root_id)
+    .bind(thread_root_id)
     .bind(body)
     .fetch_one(pool)
     .await
     .map_err(to_string)?;
 
+    bump_call_message_thread_version(pool, channel_id, thread_root_id).await?;
     let message = load_call_coordinator_message(pool, message_id).await?;
     notify_ui_message_upsert(pool, &message, "call_coordinator_reply").await?;
     Ok(())
+}
+
+async fn bump_call_message_thread_version(
+    pool: &SqlitePool,
+    channel_id: Uuid,
+    thread_root_id: Option<Uuid>,
+) -> CommandResult<()> {
+    match bump_thread_version(pool, channel_id, thread_root_id).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.contains("no such table: thread_versions") => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 async fn load_call_coordinator_message(
@@ -3683,7 +4471,8 @@ async fn create_spoken_ack_dispatch(
     let dispatch = create_dispatch(pool, session.id, utterance_id, dispatch).await?;
     notify_ui_call_dispatch_upsert(pool, &dispatch, reason).await?;
     if dispatch.status != "ignored" {
-        insert_call_coordinator_message(pool, session, dispatch.ack_text.trim()).await?;
+        insert_call_coordinator_message(pool, session, utterance_id, dispatch.ack_text.trim())
+            .await?;
     }
     Ok(dispatch)
 }
@@ -3922,6 +4711,8 @@ fn call_session_from_row(row: sqlx::sqlite::SqliteRow) -> CallSession {
         id: row.get("id"),
         channel_id: row.get("channel_id"),
         thread_root_id: row.get("thread_root_id"),
+        mode: row.get("mode"),
+        wake_words: row.get("wake_words"),
         status: row.get("status"),
         title: row.get("title"),
         started_at: row.get("started_at"),
@@ -3935,6 +4726,7 @@ fn call_utterance_from_row(row: sqlx::sqlite::SqliteRow) -> CallUtterance {
         id: row.get("id"),
         session_id: row.get("session_id"),
         thread_root_utterance_id: row.get("thread_root_utterance_id"),
+        source_message_id: row.get("source_message_id"),
         sequence: row.get("sequence"),
         transcript: row.get("transcript"),
         language: row.get("language"),
@@ -4128,6 +4920,46 @@ mod tests {
             Some(value) => env::set_var(CALL_COORDINATOR_REASONING_EFFORT_ENV, value),
             None => env::remove_var(CALL_COORDINATOR_REASONING_EFFORT_ENV),
         }
+    }
+
+    #[tokio::test]
+    async fn call_coordinator_thread_id_persists_without_agent_row() {
+        let pool = test_pool().await;
+
+        assert_eq!(load_call_coordinator_thread_id(&pool).await.unwrap(), None);
+
+        upsert_call_coordinator_thread_id(&pool, "thread-a", "idle")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_call_coordinator_thread_id(&pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("thread-a")
+        );
+
+        let agent_count: i64 = sqlx::query_scalar("select count(*) from agents")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(agent_count, 0);
+
+        upsert_call_coordinator_thread_id(&pool, "thread-b", "idle")
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("select count(*) from provider_runtime_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(
+            load_call_coordinator_thread_id(&pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("thread-b")
+        );
     }
 
     async fn test_pool() -> SqlitePool {
@@ -4572,6 +5404,291 @@ else:
                 .unwrap();
         assert_eq!(utterance_count, 0);
         assert_eq!(dispatch_count, 0);
+    }
+
+    #[tokio::test]
+    async fn wake_word_mode_ignores_transcripts_without_wake_word() {
+        with_deterministic_transcription_provider(|| async {
+            let pool = test_pool().await;
+            let session = call_session_start_with_options_in_pool(
+                &pool,
+                None,
+                None,
+                Some("Wake console".to_owned()),
+                Some("wake_word".to_owned()),
+                Some("兰托,Lantor".to_owned()),
+            )
+            .await
+            .unwrap();
+
+            let result = call_session_submit_utterance_in_pool(
+                &pool,
+                CallUtteranceSubmitRequest {
+                    session_id: session.id,
+                    bytes: b"LANTOR_TRANSCRIPT:@Ada do this".to_vec(),
+                    mime_type: "audio/webm".to_owned(),
+                    original_name: Some("no-wake.webm".to_owned()),
+                    duration_ms: Some(1600),
+                    language: Some("en".to_owned()),
+                    final_fragment_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.session.mode, "wake_word");
+            assert_eq!(result.utterance.status, "ignored");
+            assert_eq!(result.dispatch.status, "ignored");
+            assert_eq!(result.dispatch.intent, "ack_only");
+            assert_eq!(result.work_item_id, None);
+            let coordinator_reply_count: i64 = sqlx::query_scalar(
+                "select count(*) from messages where sender_name = 'System Agent'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(coordinator_reply_count, 0);
+        })
+        .await;
+    }
+
+    #[test]
+    fn wake_word_matching_uses_first_wake_word_and_normalizes_spacing() {
+        assert_eq!(
+            strip_call_wake_word("小 帅 帮我找 kunk", "小帅,小美,Lantor").as_deref(),
+            Some("帮我找 kunk")
+        );
+        assert_eq!(
+            strip_call_wake_word("你好小帅帮我找 kunk", "小帅,小美,Lantor").as_deref(),
+            Some("帮我找 kunk")
+        );
+        assert_eq!(
+            strip_call_wake_word("小帅小帅", "小帅,小美,Lantor").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            strip_call_wake_word("小帅啊", "小帅,小美,Lantor").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn wake_word_matching_accepts_configured_short_homophones() {
+        assert_eq!(
+            strip_call_wake_word("小妹小妹", "小美").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            strip_call_wake_word("小妹帮我找 kunk", "小美").as_deref(),
+            Some("帮我找 kunk")
+        );
+        assert_eq!(
+            strip_call_wake_word("你好小妹帮我找 kunk", "小美").as_deref(),
+            Some("帮我找 kunk")
+        );
+        assert_eq!(
+            strip_call_wake_word("阿墙帮我整理", "阿强").as_deref(),
+            Some("帮我整理")
+        );
+    }
+
+    #[test]
+    fn wake_word_phonetic_matching_stays_near_transcript_start() {
+        assert_eq!(strip_call_wake_word("这句话后面才提到小妹", "小美"), None);
+        assert_eq!(strip_call_wake_word("小明帮我找 kunk", "小美"), None);
+    }
+
+    #[tokio::test]
+    async fn wake_word_mode_strips_wake_word_before_dispatch() {
+        let coordinator_command = r#"python3 -c 'import json,sys
+p=json.load(sys.stdin)
+t=p.get("current_utterance",{}).get("transcript","")
+if t=="@Ada do this":
+    print(json.dumps({"tool":"dispatch_agent_work","target_agent_handle":"Ada","confidence":"high","say":"Assigned stripped request."}))
+else:
+    print(json.dumps({"tool":"ask_user","say":"unexpected transcript: "+t,"confidence":"low","error":t}))
+'"#;
+        with_command_call_coordinator(coordinator_command, || async {
+            let pool = test_pool().await;
+            let agent_id: Uuid = sqlx::query_scalar(
+                "insert into agents (handle, display_name, status, runtime) values ('Ada', 'Ada', 'idle', 'codex') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let channel_id: Uuid = sqlx::query_scalar(
+                "insert into channels (name, kind) values ('wake-word-call', 'channel') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("insert into channel_members (channel_id, agent_id) values ($1, $2)")
+                .bind(channel_id)
+                .bind(agent_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let session = call_session_start_with_options_in_pool(
+                &pool,
+                Some(channel_id),
+                None,
+                Some("Wake console".to_owned()),
+                Some("wake_word".to_owned()),
+                Some("兰托,Lantor".to_owned()),
+            )
+            .await
+            .unwrap();
+
+            let result = call_session_submit_utterance_in_pool(
+                &pool,
+                CallUtteranceSubmitRequest {
+                    session_id: session.id,
+                    bytes: "LANTOR_TRANSCRIPT:兰托 @Ada do this".as_bytes().to_vec(),
+                    mime_type: "audio/webm".to_owned(),
+                    original_name: Some("wake.webm".to_owned()),
+                    duration_ms: Some(1600),
+                    language: Some("zh-CN".to_owned()),
+                    final_fragment_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.utterance.transcript, "@Ada do this");
+            assert_eq!(result.dispatch.intent, "agent_work");
+            assert_eq!(result.dispatch.target_agent_id, Some(agent_id));
+            assert_eq!(result.dispatch.work_item_id, None);
+            let linked_dispatch = wait_for_dispatch_work_link(&pool, result.dispatch.id).await;
+            assert!(linked_dispatch.work_item_id.is_some());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wake_word_mode_treats_repeated_wake_word_as_wake_only() {
+        with_deterministic_transcription_provider(|| async {
+            let pool = test_pool().await;
+            let session = call_session_start_with_options_in_pool(
+                &pool,
+                None,
+                None,
+                Some("Wake console".to_owned()),
+                Some("wake_word".to_owned()),
+                Some("小帅,小美,Lantor".to_owned()),
+            )
+            .await
+            .unwrap();
+
+            let result = call_session_submit_utterance_in_pool(
+                &pool,
+                CallUtteranceSubmitRequest {
+                    session_id: session.id,
+                    bytes: "LANTOR_TRANSCRIPT:小帅小帅".as_bytes().to_vec(),
+                    mime_type: "audio/webm".to_owned(),
+                    original_name: Some("wake-repeat.webm".to_owned()),
+                    duration_ms: Some(1600),
+                    language: Some("zh-CN".to_owned()),
+                    final_fragment_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.utterance.status, "acknowledged");
+            assert_eq!(result.dispatch.intent, "ack_only");
+            assert_eq!(result.dispatch.ack_text, "我在，您说。");
+            let queued_dispatch_count: i64 = sqlx::query_scalar(
+                "select count(*) from call_dispatches where session_id = $1 and intent = 'coordinator_pending'",
+            )
+            .bind(session.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(queued_dispatch_count, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wake_word_mode_allows_one_followup_after_wake_only_ack() {
+        let coordinator_command = r#"python3 -c 'import json,sys
+p=json.load(sys.stdin)
+t=p.get("current_utterance",{}).get("transcript","")
+if t=="@Ada do this":
+    print(json.dumps({"tool":"dispatch_agent_work","target_agent_handle":"Ada","confidence":"high","say":"Assigned follow-up."}))
+else:
+    print(json.dumps({"tool":"ask_user","say":"unexpected transcript: "+t,"confidence":"low","error":t}))
+'"#;
+        with_command_call_coordinator(coordinator_command, || async {
+            let pool = test_pool().await;
+            let agent_id: Uuid = sqlx::query_scalar(
+                "insert into agents (handle, display_name, status, runtime) values ('Ada', 'Ada', 'idle', 'codex') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let channel_id: Uuid = sqlx::query_scalar(
+                "insert into channels (name, kind) values ('wake-followup-call', 'channel') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("insert into channel_members (channel_id, agent_id) values ($1, $2)")
+                .bind(channel_id)
+                .bind(agent_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let session = call_session_start_with_options_in_pool(
+                &pool,
+                Some(channel_id),
+                None,
+                Some("Wake console".to_owned()),
+                Some("wake_word".to_owned()),
+                Some("小美".to_owned()),
+            )
+            .await
+            .unwrap();
+
+            let wake = call_session_submit_utterance_in_pool(
+                &pool,
+                CallUtteranceSubmitRequest {
+                    session_id: session.id,
+                    bytes: "LANTOR_TRANSCRIPT:小美小美".as_bytes().to_vec(),
+                    mime_type: "audio/webm".to_owned(),
+                    original_name: Some("wake-only.webm".to_owned()),
+                    duration_ms: Some(1600),
+                    language: Some("zh-CN".to_owned()),
+                    final_fragment_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(wake.dispatch.ack_text, "我在，您说。");
+
+            let followup = call_session_submit_utterance_in_pool(
+                &pool,
+                CallUtteranceSubmitRequest {
+                    session_id: session.id,
+                    bytes: "LANTOR_TRANSCRIPT:@Ada do this".as_bytes().to_vec(),
+                    mime_type: "audio/webm".to_owned(),
+                    original_name: Some("followup.webm".to_owned()),
+                    duration_ms: Some(1800),
+                    language: Some("zh-CN".to_owned()),
+                    final_fragment_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(followup.utterance.transcript, "@Ada do this");
+            assert_eq!(followup.dispatch.intent, "agent_work");
+            assert_eq!(followup.dispatch.target_agent_id, Some(agent_id));
+            assert_eq!(followup.dispatch.work_item_id, None);
+            let linked_dispatch = wait_for_dispatch_work_link(&pool, followup.dispatch.id).await;
+            assert!(linked_dispatch.work_item_id.is_some());
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -5392,7 +6509,7 @@ else:
     }
 
     #[tokio::test]
-    async fn workspace_call_coordinator_sees_global_agents_without_channel() {
+    async fn workspace_call_coordinator_sees_workspace_agents_from_system_call_channel() {
         let coordinator_command = r#"python3 -c 'import json,sys
 p=json.load(sys.stdin)
 handles=[a.get("handle") for a in p.get("available_agents",[])]
@@ -5428,10 +6545,149 @@ else:
             .await
             .unwrap();
 
-            assert_eq!(result.session.channel_id, None);
+            assert!(result.session.channel_id.is_some());
             assert_eq!(result.dispatch.intent, "agent_work");
             assert_eq!(result.dispatch.target_agent_id, Some(ada_id));
             assert_eq!(result.dispatch.ack_text, "Assigning Ada from Voice.");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn global_call_dispatch_uses_system_channel_message_thread() {
+        let coordinator_command = r#"python3 -c 'import json,sys
+p=json.load(sys.stdin)
+print(json.dumps({"tool":"dispatch_agent_work","target_agent_handle":"Ada","say":"Assigning Ada from Voice.","confidence":"high","request_transcript":p.get("current_utterance",{}).get("transcript","voice request")}))
+'"#;
+        with_command_call_coordinator(coordinator_command, || async {
+            let pool = test_pool().await;
+            let _ada_id: Uuid = sqlx::query_scalar(
+                "insert into agents (handle, status, runtime) values ('Ada', 'idle', 'codex') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let session = call_session_start_in_pool(
+                &pool,
+                None,
+                None,
+                Some("workspace voice".to_owned()),
+            )
+            .await
+            .unwrap();
+            let channel_name: String = sqlx::query_scalar("select name from channels where id = $1")
+                .bind(session.channel_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(channel_name, CALL_SYSTEM_CHANNEL_NAME);
+
+            let result = call_session_submit_text_utterance_in_pool(
+                &pool,
+                session.id,
+                "global voice request".to_owned(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let source_message_id = result
+                .utterance
+                .source_message_id
+                .expect("call utterance should be backed by an owner message");
+            let message_row = sqlx::query(
+                "select channel_id, thread_root_id, sender_role, body from messages where id = $1",
+            )
+            .bind(source_message_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(message_row.get::<Uuid, _>("channel_id"), session.channel_id.unwrap());
+            assert_eq!(message_row.get::<Option<Uuid>, _>("thread_root_id"), None);
+            assert_eq!(message_row.get::<String, _>("sender_role"), "owner");
+            assert_eq!(message_row.get::<String, _>("body"), "global voice request");
+
+            let work_row = sqlx::query(
+                "select channel_id, thread_root_id, source_message_id from agent_work_items where call_utterance_id = $1",
+            )
+            .bind(result.utterance.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(work_row.get::<Option<Uuid>, _>("channel_id"), session.channel_id);
+            assert_eq!(
+                work_row.get::<Option<Uuid>, _>("thread_root_id"),
+                Some(source_message_id)
+            );
+            assert_eq!(
+                work_row.get::<Option<Uuid>, _>("source_message_id"),
+                Some(source_message_id)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_global_call_session_binds_system_channel_on_submit() {
+        let coordinator_command = r#"python3 -c 'import json,sys
+p=json.load(sys.stdin)
+print(json.dumps({"tool":"dispatch_agent_work","target_agent_handle":"Ada","say":"Assigning Ada from legacy Voice.","confidence":"high","request_transcript":p.get("current_utterance",{}).get("transcript","voice request")}))
+'"#;
+        with_command_call_coordinator(coordinator_command, || async {
+            let pool = test_pool().await;
+            let _ada_id: Uuid = sqlx::query_scalar(
+                "insert into agents (handle, status, runtime) values ('Ada', 'idle', 'codex') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let session_id: Uuid = sqlx::query_scalar(
+                "insert into call_sessions (title, status) values ('legacy voice', 'active') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            let result = call_session_submit_text_utterance_in_pool(
+                &pool,
+                session_id,
+                "legacy voice request".to_owned(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let channel_id = result
+                .session
+                .channel_id
+                .expect("legacy session should be bound to the system channel");
+            let channel_name: String = sqlx::query_scalar("select name from channels where id = $1")
+                .bind(channel_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(channel_name, CALL_SYSTEM_CHANNEL_NAME);
+            let source_message_id = result
+                .utterance
+                .source_message_id
+                .expect("legacy utterance should get an owner message");
+            let work_row = sqlx::query(
+                "select channel_id, thread_root_id, source_message_id from agent_work_items where call_utterance_id = $1",
+            )
+            .bind(result.utterance.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(work_row.get::<Option<Uuid>, _>("channel_id"), Some(channel_id));
+            assert_eq!(
+                work_row.get::<Option<Uuid>, _>("thread_root_id"),
+                Some(source_message_id)
+            );
+            assert_eq!(
+                work_row.get::<Option<Uuid>, _>("source_message_id"),
+                Some(source_message_id)
+            );
         })
         .await;
     }
@@ -6530,14 +7786,30 @@ else:
         let utterances = load_call_utterances(&pool).await.unwrap();
         let dispatches = load_call_dispatches(&pool).await.unwrap();
 
-        assert_eq!(utterances.len(), CALL_BOOTSTRAP_UTTERANCE_LIMIT as usize);
-        assert_eq!(utterances.first().unwrap().sequence, 246);
+        assert_eq!(utterances.len(), 405);
+        assert_eq!(utterances.first().unwrap().sequence, 1);
         assert_eq!(utterances.last().unwrap().sequence, 405);
-        assert_eq!(utterances.first().unwrap().transcript, "utterance 246");
+        assert_eq!(utterances.first().unwrap().transcript, "utterance 1");
         assert_eq!(utterances.last().unwrap().transcript, "utterance 405");
 
         assert_eq!(dispatches.len(), CALL_BOOTSTRAP_DISPATCH_LIMIT as usize);
         assert_eq!(dispatches.first().unwrap().ack_text, "ack 246");
         assert_eq!(dispatches.last().unwrap().ack_text, "ack 405");
+
+        let page = fetch_call_history_page(
+            &pool,
+            DateTime::parse_from_rfc3339("2026-01-01T00:04:06.000+00:00")
+                .unwrap()
+                .with_timezone(&Utc),
+            Some(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.utterances.len(), 5);
+        assert_eq!(page.utterances.first().unwrap().sequence, 241);
+        assert_eq!(page.utterances.last().unwrap().sequence, 245);
+        assert_eq!(page.dispatches.len(), 5);
+        assert_eq!(page.dispatches.first().unwrap().ack_text, "ack 241");
+        assert_eq!(page.dispatches.last().unwrap().ack_text, "ack 245");
     }
 }

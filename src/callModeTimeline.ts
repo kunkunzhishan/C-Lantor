@@ -103,7 +103,14 @@ export function callModeStatusText(
   session: CallSession | null = null,
 ) {
   if (error) return error;
-  if (lastResult?.ack_text) return lastResult.ack_text;
+  if (
+    lastResult?.ack_text
+    && lastResult.utterance.status !== "ignored"
+    && lastResult.dispatch.status !== "ignored"
+    && !isRoutineIgnoredDiagnosticText(lastResult.utterance.transcription_error || lastResult.dispatch.error || lastResult.ack_text)
+  ) {
+    return lastResult.ack_text;
+  }
   if (session?.status && session.status !== "active") {
     if (session.status === "ended") return "Call ended. Utterance input is disabled.";
     if (session.status === "error") return "Call unavailable. Utterance input is disabled.";
@@ -161,19 +168,23 @@ function isUnresolvedOrInFlightCallTimelineRow(row: CallTimelineRow) {
 }
 
 function isIgnoredCallTimelineDiagnostic(row: CallTimelineRow) {
-  if (!row.utterance.transcript && isNoSpeechTranscriptionDiagnostic(row.utterance.transcription_error || row.dispatch?.error)) {
+  if (isRoutineIgnoredDiagnosticText(row.utterance.transcription_error || row.dispatch?.error)) {
     return true;
   }
   return row.utterance.status === "ignored"
     && row.dispatch?.status === "ignored"
-    && row.dispatch?.outcome === "ignored";
+    && row.dispatch?.outcome === "ignored"
+    && isRoutineIgnoredDiagnosticText(row.utterance.transcription_error || row.dispatch?.error || row.dispatch?.ack_text);
 }
 
-function isNoSpeechTranscriptionDiagnostic(value: string | null | undefined) {
+function isRoutineIgnoredDiagnosticText(value: string | null | undefined) {
   const lower = (value ?? "").toLowerCase();
   return lower.includes("no speech")
     || lower.includes("speech was not detected")
-    || lower.includes("emptytranscript");
+    || lower.includes("emptytranscript")
+    || lower.includes("wake word required")
+    || lower.includes("waiting for the wake word")
+    || lower.includes("等待唤醒词");
 }
 
 function isImportantCallTimelineRow(row: CallTimelineRow) {

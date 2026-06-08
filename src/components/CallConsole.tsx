@@ -1,5 +1,4 @@
 import {
-  Activity,
   ArrowLeft,
   BriefcaseBusiness,
   CheckCircle2,
@@ -13,8 +12,8 @@ import {
   PhoneOff,
   RotateCcw,
   Send,
+  Settings,
   Sparkles,
-  Volume2,
   X,
 } from "lucide-react";
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -22,7 +21,6 @@ import {
   CALL_TTS_VOICES,
   CALL_TTS_DEFAULT_GAP_MS,
   CALL_VOICE_LANGUAGES,
-  DEFAULT_CALL_TTS_SETTINGS,
   normalizeCallTtsSettings,
   synthesizeCallTtsAudio,
   voicesForCallTtsProvider,
@@ -37,6 +35,14 @@ import { useCallModeRecorder } from "../hooks/useCallModeRecorder";
 import { useCallModeSubmit } from "../hooks/useCallModeSubmit";
 import type { Agent, AgentWorkItem, CallDispatch, CallSession, CallUtterance, CallUtteranceSubmitResult, Message, OwnerProfile } from "../types";
 import { formatDateDivider, formatTime, isSameCalendarDay, ownerAsAvatarAgent } from "../ui-utils";
+import {
+  loadVoiceConsoleSettings,
+  normalizeVoiceConsoleSettings,
+  normalizeVoiceWakeSettings,
+  saveVoiceConsoleSettings,
+  type VoiceConsoleMode,
+  type VoiceWakeSettings,
+} from "../voiceConsoleSettings";
 import { AgentAvatar } from "./AgentAvatar";
 import { MessageMarkdown } from "./MessageMarkdown";
 
@@ -50,13 +56,14 @@ type CallConsoleProps = {
   ownerProfile: OwnerProfile;
   activeCallThreadId: string | null;
   setActiveCallThreadId: (threadId: string | null) => void;
+  loadOlderCallHistory: () => Promise<number>;
   openMobileSidebar: () => void;
   onOpenWorkItem: (item: AgentWorkItem) => void;
 };
 
 const CALL_SPEECH_CHUNK_CHARS = 160;
 
-type CallSpeechPolicy = "queue" | "barge-in";
+type CallSpeechPolicy = "queue" | "barge-in" | "barge-in-resume";
 
 type QueuedCallSpeech = {
   id: number;
@@ -90,27 +97,10 @@ type CallWorkerReply = {
   workItem: AgentWorkItem;
 };
 
-const CALL_TTS_SETTINGS_STORAGE_KEY = "lantor.callTts";
 const SILENT_CALL_DISPATCH_STATUSES = new Set(["queued", "dispatching", "superseded", "ignored", "failed", "compensated"]);
 
-function loadCallTtsSettings(): CallTtsSettings {
-  if (typeof window === "undefined" || !("localStorage" in window)) return DEFAULT_CALL_TTS_SETTINGS;
-  try {
-    const raw = window.localStorage.getItem(CALL_TTS_SETTINGS_STORAGE_KEY);
-    if (!raw) return DEFAULT_CALL_TTS_SETTINGS;
-    return normalizeCallTtsSettings(JSON.parse(raw) as Partial<CallTtsSettings>);
-  } catch {
-    return DEFAULT_CALL_TTS_SETTINGS;
-  }
-}
-
-function saveCallTtsSettings(settings: CallTtsSettings) {
-  if (typeof window === "undefined" || !("localStorage" in window)) return;
-  try {
-    window.localStorage.setItem(CALL_TTS_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    // Settings persistence should never affect live call playback.
-  }
+function callConsoleModeLabel(mode: string | null | undefined) {
+  return mode === "wake_word" ? "Wake Word" : "Call";
 }
 
 function cancelBrowserCallSpeech() {
@@ -217,7 +207,12 @@ function callSpeechChunks(text: string) {
 
 function isNoSpeechTranscriptionText(value: string | null | undefined) {
   const lower = (value ?? "").toLowerCase();
-  return lower.includes("no speech") || lower.includes("speech was not detected") || lower.includes("emptytranscript");
+  return lower.includes("no speech")
+    || lower.includes("speech was not detected")
+    || lower.includes("emptytranscript")
+    || lower.includes("wake word required")
+    || lower.includes("waiting for the wake word")
+    || lower.includes("等待唤醒词");
 }
 
 function isIgnoredNoSpeechTurn(turn: CallTurn) {
@@ -240,6 +235,15 @@ function callAckSpeechText(result: CallUtteranceSubmitResult) {
   return normalizeCallSpeechText(ackText);
 }
 
+function isWakeOnlyAckResult(result: CallUtteranceSubmitResult) {
+  return result.session.mode === "wake_word"
+    && result.utterance.status === "acknowledged"
+    && result.dispatch.intent === "ack_only"
+    && result.dispatch.status === "acknowledged"
+    && result.work_item_id === null
+    && normalizeCallSpeechText(result.dispatch.ack_text).length > 0;
+}
+
 function callDispatchSpeechText(dispatch: CallDispatch) {
   if (SILENT_CALL_DISPATCH_STATUSES.has(dispatch.status) && !isSpeakableQueuedCallDispatch(dispatch)) return null;
   if (dispatch.intent === "coordinator_pending") return null;
@@ -253,8 +257,17 @@ function callDispatchSpeechText(dispatch: CallDispatch) {
 
 function isSpeakableQueuedCallDispatch(dispatch: CallDispatch) {
   return dispatch.status === "queued"
-    && dispatch.intent === "cancel_work"
-    && dispatch.outcome === "work_cancel_requested";
+    && (
+      (
+        dispatch.intent === "agent_work"
+        && dispatch.outcome === "work_queued"
+        && Boolean(dispatch.work_item_id)
+      )
+      || (
+        dispatch.intent === "cancel_work"
+        && dispatch.outcome === "work_cancel_requested"
+      )
+    );
 }
 
 function isRoutineTranscriptionDiagnostic(value: string | null | undefined) {
@@ -268,6 +281,9 @@ function isRoutineTranscriptionDiagnostic(value: string | null | undefined) {
     || lower.includes("transcription failed")
     || lower.includes("voice transcription")
     || lower.includes("speech recognition")
+    || lower.includes("wake word required")
+    || lower.includes("waiting for the wake word")
+    || lower.includes("等待唤醒词")
     || lower.includes("转写失败")
     || lower.includes("语音识别");
 }
@@ -357,6 +373,10 @@ function compareCallSessionsByStart(left: CallSession, right: CallSession) {
   const startedDelta = new Date(left.started_at).getTime() - new Date(right.started_at).getTime();
   if (startedDelta !== 0) return startedDelta;
   return left.id.localeCompare(right.id);
+}
+
+function isVoiceConsoleSession(session: CallSession) {
+  return session.thread_root_id === null && (session.channel_id === null || session.title === "Voice Console");
 }
 
 const callSystemAvatarAgent: Agent = {
@@ -489,24 +509,33 @@ export function CallConsole({
   ownerProfile,
   activeCallThreadId,
   setActiveCallThreadId,
+  loadOlderCallHistory,
   openMobileSidebar,
   onOpenWorkItem,
 }: CallConsoleProps) {
   const [callDurationNow, setCallDurationNow] = useState(() => Date.now());
   const [isCallAssistantSpeaking, setIsCallAssistantSpeaking] = useState(false);
-  const [callSpeechQueueDepth, setCallSpeechQueueDepth] = useState(0);
   const [callConfirmationCorrectionDraft, setCallConfirmationCorrectionDraft] = useState("");
   const [callTypedUtteranceDraft, setCallTypedUtteranceDraft] = useState("");
   const [callThreadReplyDraft, setCallThreadReplyDraft] = useState("");
   const [isSubmittingTypedCallUtterance, setIsSubmittingTypedCallUtterance] = useState(false);
   const [isSubmittingCallThreadReply, setIsSubmittingCallThreadReply] = useState(false);
-  const [callTtsSettings, setCallTtsSettingsState] = useState<CallTtsSettings>(loadCallTtsSettings);
+  const [voiceConsoleSettings, setVoiceConsoleSettingsState] = useState(loadVoiceConsoleSettings);
+  const callTtsSettings = voiceConsoleSettings.tts;
+  const callWakeSettings = useMemo<VoiceWakeSettings>(() => ({
+    mode: voiceConsoleSettings.mode,
+    wakeWords: voiceConsoleSettings.wakeWords,
+  }), [voiceConsoleSettings.mode, voiceConsoleSettings.wakeWords]);
+  const [showCallSettings, setShowCallSettings] = useState(false);
   const [callTtsStatus, setCallTtsStatus] = useState("");
   const [finalCallSpeechDrainSessionId, setFinalCallSpeechDrainSessionId] = useState<string | null>(null);
   const finalCallSpeechDrainSessionIdRef = useRef<string | null>(null);
+  const callMessageListRef = useRef<HTMLDivElement | null>(null);
+  const olderCallHistoryLoadInFlightRef = useRef(false);
+  const allOlderCallHistoryLoadedRef = useRef(false);
   const surfaceCallSessions = useMemo(() => {
     return callSessions
-      .filter((session) => session.channel_id === null && session.thread_root_id === null)
+      .filter(isVoiceConsoleSession)
       .sort(compareCallSessionsByStart);
   }, [callSessions]);
   const surfaceCallSession = useMemo(() => {
@@ -521,9 +550,16 @@ export function CallConsole({
     title: "Voice Console",
     surfaceSession: surfaceCallSession,
     language: callTtsSettings.language,
+    mode: callWakeSettings.mode,
+    wakeWords: callWakeSettings.wakeWords,
   });
+  const visibleCallSession = callMode.session ?? surfaceCallSession;
+  const effectiveCallConsoleMode = visibleCallSession?.status === "active"
+    ? (visibleCallSession.mode === "wake_word" ? "wake_word" : "call")
+    : callWakeSettings.mode;
+  const isCallWakeWordMode = effectiveCallConsoleMode === "wake_word";
   const callRecorder = useCallModeRecorder({
-    echoGateActive: isCallAssistantSpeaking,
+    echoGateActive: isCallAssistantSpeaking && !isCallWakeWordMode,
     liveSessionId: callMode.isLive ? callMode.session?.id ?? null : null,
     onSubmitAudio: callMode.submitRecordedUtterance,
   });
@@ -557,18 +593,29 @@ export function CallConsole({
     )
   );
   callSpeechDuckingRef.current = callMode.isLive && callRecorder.isListening && !callRecorder.isMuted;
-  callSpeechBlockedRef.current = callMode.isLive && callRecorder.isVoiceActive && !callRecorder.isMuted;
+  callSpeechBlockedRef.current = callMode.isLive && !isCallWakeWordMode && callRecorder.isVoiceActive && !callRecorder.isMuted;
 
   const setCallTtsSettings = (next: CallTtsSettings) => {
-    const normalized = normalizeCallTtsSettings(next);
-    callTtsSettingsRef.current = normalized;
-    setCallTtsSettingsState(normalized);
-    saveCallTtsSettings(normalized);
+    const normalized = normalizeVoiceConsoleSettings({
+      ...voiceConsoleSettings,
+      tts: normalizeCallTtsSettings(next),
+    });
+    callTtsSettingsRef.current = normalized.tts;
+    setVoiceConsoleSettingsState(normalized);
+    saveVoiceConsoleSettings(normalized);
+  };
+
+  const setCallWakeSettings = (next: VoiceWakeSettings) => {
+    const normalized = normalizeVoiceConsoleSettings({
+      ...voiceConsoleSettings,
+      ...normalizeVoiceWakeSettings(next),
+    });
+    setVoiceConsoleSettingsState(normalized);
+    saveVoiceConsoleSettings(normalized);
   };
 
   const setCallSpeechQueue = (queue: QueuedCallSpeech[]) => {
     callSpeechQueueRef.current = queue;
-    setCallSpeechQueueDepth(queue.length);
   };
 
   function clearCallSpeechGapTimer() {
@@ -649,7 +696,6 @@ export function CallConsole({
     if (callSpeechSpeakingRef.current) return;
     if (callSpeechBlockedRef.current) return;
     const next = callSpeechQueueRef.current.shift();
-    setCallSpeechQueueDepth(callSpeechQueueRef.current.length);
     if (!next) {
       if (!callMode.isLive) {
         finalCallSpeechDrainSessionIdRef.current = null;
@@ -704,17 +750,45 @@ export function CallConsole({
     window.speechSynthesis.speak(utterance);
   }
 
-  function interruptCurrentCallSpeechForVoice() {
+  function interruptCurrentCallSpeechForVoice(options: { requeueCurrent?: boolean } = {}) {
+    const requeueCurrent = options.requeueCurrent ?? true;
     const current = callSpeechCurrentRef.current;
     callSpeechCurrentRef.current = null;
     callSpeechSpeakingRef.current = false;
     callSpeechUtteranceIdRef.current += 1;
     setIsCallAssistantSpeaking(false);
-    if (current) {
+    if (current && requeueCurrent) {
       setCallSpeechQueue([current, ...callSpeechQueueRef.current]);
     }
     stopCurrentCallAudio(false);
     cancelBrowserCallSpeech();
+    return current;
+  }
+
+  function queueBrowserCallSpeechAtFront(text: string, resumeQueue: QueuedCallSpeech[]) {
+    const trimmed = normalizeCallSpeechText(text);
+    const chunks = callSpeechChunks(trimmed);
+    if (
+      chunks.length === 0
+      || typeof window === "undefined"
+      || !("speechSynthesis" in window)
+      || typeof SpeechSynthesisUtterance === "undefined"
+    ) {
+      setCallSpeechQueue([...resumeQueue, ...callSpeechQueueRef.current]);
+      playNextCallSpeech();
+      return false;
+    }
+    const speechId = ++callSpeechMessageIdRef.current;
+    const wakeSpeech = chunks.map((chunk) => ({
+      id: ++callSpeechJobIdRef.current,
+      speechId,
+      text: chunk,
+      audioUrl: null,
+      provider: "browser" as const,
+    }));
+    setCallSpeechQueue([...wakeSpeech, ...resumeQueue, ...callSpeechQueueRef.current]);
+    playNextCallSpeech();
+    return true;
   }
 
   function flushReadyCallSpeech() {
@@ -749,6 +823,10 @@ export function CallConsole({
       || (settings.provider === "browser" && (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined"))
     ) {
       return false;
+    }
+    if (policy === "barge-in-resume") {
+      interruptCurrentCallSpeechForVoice({ requeueCurrent: false });
+      return queueBrowserCallSpeechAtFront(trimmed, []);
     }
     if (policy === "barge-in") {
       stopCallSpeech();
@@ -813,8 +891,23 @@ export function CallConsole({
   function queueCallAckSpeechResult(result: CallUtteranceSubmitResult) {
     if (queuedCallAckKeysRef.current.has(result.dispatch.id)) return;
     const sequence = result.utterance.sequence;
-    if (!Number.isFinite(sequence) || sequence <= lastQueuedCallAckSequenceRef.current) return;
     const text = callAckSpeechText(result);
+    if (!Number.isFinite(sequence)) {
+      if (text) {
+        queuedCallAckKeysRef.current.add(result.dispatch.id);
+        lastSpokenCallAckRef.current = result.dispatch.id;
+        enqueueCallSpeech(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
+      }
+      return;
+    }
+    if (sequence <= lastQueuedCallAckSequenceRef.current) {
+      queuedCallAckKeysRef.current.add(result.dispatch.id);
+      if (text) {
+        lastSpokenCallAckRef.current = result.dispatch.id;
+        enqueueCallSpeech(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
+      }
+      return;
+    }
     pendingCallAckSpeechBySequenceRef.current.set(sequence, {
       key: result.dispatch.id,
       text,
@@ -834,7 +927,11 @@ export function CallConsole({
       queuedCallAckKeysRef.current.add(next.key);
       if (next.text) {
         lastSpokenCallAckRef.current = next.key;
-        enqueueCallSpeech(next.text);
+        const submitResult = callMode.submitResults.find((result) => result.dispatch.id === next.key);
+        enqueueCallSpeech(
+          next.text,
+          submitResult && isWakeOnlyAckResult(submitResult) ? "barge-in-resume" : "queue",
+        );
       }
     }
   }
@@ -988,13 +1085,18 @@ export function CallConsole({
   }, [canPlayCallSpeech]);
 
   const callControlsBusy = callMode.isStarting || callMode.isStopping || callRecorder.isStopping;
-  const visibleCallSession = callMode.session ?? surfaceCallSession;
+  const callModeLabel = callConsoleModeLabel(effectiveCallConsoleMode);
+  const callSettingsSummary = [
+    callModeLabel,
+    callTtsSettings.provider === "edge" ? "Edge TTS" : "Browser TTS",
+    callTtsSettings.language,
+    `${callTtsSettings.rate.toFixed(2)}x`,
+  ].join(" · ");
   const visibleCallHistorySessions = useMemo(() => {
     const rows = [...surfaceCallSessions];
     if (
       visibleCallSession
-      && visibleCallSession.channel_id === null
-      && visibleCallSession.thread_root_id === null
+      && isVoiceConsoleSession(visibleCallSession)
       && !rows.some((session) => session.id === visibleCallSession.id)
     ) {
       rows.push(visibleCallSession);
@@ -1035,34 +1137,33 @@ export function CallConsole({
   const visibleLiveCallWorkBoardItems = visibleCallWorkBoardItems.filter((item) => item.isLive).slice(0, 3);
   const liveCallWorkCount = visibleCallWorkBoardItems.filter((item) => item.isLive).length;
   const visibleCallDuration = callDurationMs(visibleCallSession, callDurationNow);
-  const callAssistantThinking = callMode.isStarting
-    || callMode.isStopping
-    || callMode.isSubmitting
-    || callMode.isResolvingConfirmation
-    || callRecorder.isSubmittingAudio
-    || callRecorder.pendingSubmitCount > 0;
-  const callAssistantState = isCallAssistantSpeaking
-    ? "Speaking"
-    : callAssistantThinking
-    ? "Thinking"
-    : callMode.isLive
-    ? "Ready"
-    : "Idle";
-  const callAssistantDetail = isCallAssistantSpeaking
-    ? callSpeechQueueDepth > 0
-      ? `${callSpeechQueueDepth} queued; yielding to voice`
-      : "Yielding to voice"
-    : callRecorder.pendingSubmitCount > 0
-    ? `${callRecorder.pendingSubmitCount} utterance${callRecorder.pendingSubmitCount === 1 ? "" : "s"} sending`
-    : liveCallWorkCount > 0
-    ? `${liveCallWorkCount} live work item${liveCallWorkCount === 1 ? "" : "s"}`
-    : "No live work";
   const visibleCallTtsVoices = voicesForCallTtsProvider(callTtsSettings.provider, callTtsSettings.language);
   const visibleCallThreadRows = useMemo(() => buildCallThreadRows(visibleCallTurns, agents), [agents, visibleCallTurns]);
   const activeCallThread = useMemo<CallThreadRow | null>(() => {
     if (!activeCallThreadId) return null;
     return visibleCallThreadRows.find((thread) => thread.id === activeCallThreadId) ?? null;
   }, [activeCallThreadId, visibleCallThreadRows]);
+
+  function handleCallMessageListScroll() {
+    const element = callMessageListRef.current;
+    if (!element || element.scrollTop >= 96 || olderCallHistoryLoadInFlightRef.current || allOlderCallHistoryLoadedRef.current) {
+      return;
+    }
+    olderCallHistoryLoadInFlightRef.current = true;
+    const previousScrollHeight = element.scrollHeight;
+    void loadOlderCallHistory()
+      .then((loadedCount) => {
+        if (loadedCount === 0) allOlderCallHistoryLoadedRef.current = true;
+      })
+      .finally(() => {
+        window.requestAnimationFrame(() => {
+          const list = callMessageListRef.current;
+          if (list) list.scrollTop += list.scrollHeight - previousScrollHeight;
+          olderCallHistoryLoadInFlightRef.current = false;
+        });
+      });
+  }
+
   const pendingCallConfirmation = useMemo<PendingCallConfirmation | null>(() => {
     const confirmationRows = buildCallConfirmationRows(
       visibleCallSession,
@@ -1211,6 +1312,21 @@ export function CallConsole({
     else callRecorder.mute();
   }
 
+  function updateCallConsoleMode(mode: VoiceConsoleMode) {
+    if (callMode.isLive) return;
+    setCallWakeSettings({
+      ...callWakeSettings,
+      mode,
+    });
+  }
+
+  function updateCallWakeWords(wakeWords: string) {
+    setCallWakeSettings({
+      ...callWakeSettings,
+      wakeWords,
+    });
+  }
+
   function updateCallTtsProvider(provider: CallTtsProviderId) {
     const voices = voicesForCallTtsProvider(provider, callTtsSettings.language);
     setCallTtsSettings({
@@ -1282,9 +1398,20 @@ export function CallConsole({
         <div className="call-header-actions">
           <button
             type="button"
+            className={`call-header-button call-header-settings ${showCallSettings ? "active" : ""}`}
+            title="Voice settings"
+            aria-label="Voice settings"
+            aria-expanded={showCallSettings}
+            onClick={() => setShowCallSettings((open) => !open)}
+          >
+            <Settings size={17} />
+            <span className="call-header-label">Settings</span>
+          </button>
+          <button
+            type="button"
             className={`call-header-button ${callMode.isLive ? "live" : ""}`}
-            title={callMode.isLive ? "End Call Mode" : "Start Call Mode"}
-            aria-label={callMode.isLive ? "End Call Mode" : "Start Call Mode"}
+            title={callMode.isLive ? `End ${callModeLabel} Mode` : `Start ${callModeLabel} Mode`}
+            aria-label={callMode.isLive ? `End ${callModeLabel} Mode` : `Start ${callModeLabel} Mode`}
             aria-pressed={callMode.isLive}
             disabled={callControlsBusy}
             onClick={() => {
@@ -1294,12 +1421,153 @@ export function CallConsole({
             }}
           >
             {callMode.isLive ? <PhoneOff size={17} /> : <Phone size={17} />}
-            <span className="call-header-label">{callMode.isLive ? "End Call" : "Start Call"}</span>
+            <span className="call-header-label">{callMode.isLive ? `End ${callModeLabel}` : `Start ${callModeLabel}`}</span>
+          </button>
+          <button
+            type="button"
+            className={`call-header-button call-header-mic ${callRecorder.isMuted ? "muted" : ""}`}
+            title={callRecorder.isMuted ? "Unmute microphone" : "Mute microphone"}
+            aria-label={callRecorder.isMuted ? "Unmute microphone" : "Mute microphone"}
+            aria-pressed={callRecorder.isMuted}
+            disabled={!callMode.isLive || callRecorder.isStopping || callRecorder.isRequestingPermission || !callRecorder.isSupported}
+            onClick={toggleCallMute}
+          >
+            {callRecorder.isMuted ? <MicOff size={17} /> : <Mic size={17} />}
+            <span className="call-header-label">{callRecorder.isMuted ? "Muted" : "Mic"}</span>
           </button>
         </div>
       </header>
+      {showCallSettings && (
+        <aside className="call-settings-panel" aria-label="Voice settings panel">
+          <div className="call-settings-panel-header">
+            <div>
+              <strong>Voice settings</strong>
+              <span>{callSettingsSummary}</span>
+            </div>
+            <button type="button" aria-label="Close voice settings" onClick={() => setShowCallSettings(false)}>
+              <X size={15} />
+            </button>
+          </div>
+          <div className="call-settings-grid">
+            <div className="call-tts-card call-tts-provider-card">
+              <span><Sparkles size={13} /> Mode</span>
+              <div className="call-tts-segmented" role="group" aria-label="Call console mode">
+                <button
+                  type="button"
+                  className={effectiveCallConsoleMode === "call" ? "active" : ""}
+                  aria-pressed={effectiveCallConsoleMode === "call"}
+                  disabled={callMode.isLive}
+                  onClick={() => updateCallConsoleMode("call")}
+                >
+                  <Phone size={13} />
+                  Call
+                </button>
+                <button
+                  type="button"
+                  className={effectiveCallConsoleMode === "wake_word" ? "active" : ""}
+                  aria-pressed={effectiveCallConsoleMode === "wake_word"}
+                  disabled={callMode.isLive}
+                  onClick={() => updateCallConsoleMode("wake_word")}
+                >
+                  <Mic size={13} />
+                  Wake Word
+                </button>
+              </div>
+            </div>
+            <label className="call-tts-card call-wake-word-card">
+              <span><Mic size={13} /> Wake words</span>
+              <input
+                type="text"
+                value={callWakeSettings.wakeWords}
+                disabled={callMode.isLive || effectiveCallConsoleMode !== "wake_word"}
+                onChange={(event) => updateCallWakeWords(event.currentTarget.value)}
+                placeholder="兰托, 蓝托, Lantor"
+                aria-label="Call wake words"
+              />
+            </label>
+            <div className="call-tts-card call-tts-provider-card">
+              <span><MonitorSpeaker size={13} /> Provider</span>
+              <div className="call-tts-segmented" role="group" aria-label="Call voice provider">
+                <button
+                  type="button"
+                  className={callTtsSettings.provider === "browser" ? "active" : ""}
+                  aria-pressed={callTtsSettings.provider === "browser"}
+                  onClick={() => updateCallTtsProvider("browser")}
+                >
+                  <Laptop size={13} />
+                  Browser
+                </button>
+                <button
+                  type="button"
+                  className={callTtsSettings.provider === "edge" ? "active" : ""}
+                  aria-pressed={callTtsSettings.provider === "edge"}
+                  onClick={() => updateCallTtsProvider("edge")}
+                >
+                  <Sparkles size={13} />
+                  Edge
+                </button>
+              </div>
+            </div>
+            <div className="call-tts-card call-tts-language-card">
+              <span><Sparkles size={13} /> Language</span>
+              <div className="call-tts-segmented" role="group" aria-label="Call spoken language">
+                {CALL_VOICE_LANGUAGES.map((language) => (
+                  <button
+                    key={language.id}
+                    type="button"
+                    className={language.id === callTtsSettings.language ? "active" : ""}
+                    aria-pressed={language.id === callTtsSettings.language}
+                    onClick={() => updateCallVoiceLanguage(language.id)}
+                  >
+                    {language.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="call-tts-card call-tts-voice-card">
+              <span><Sparkles size={13} /> Voice</span>
+              <div className="call-tts-chip-row" role="group" aria-label="Call voice">
+                {visibleCallTtsVoices.map((voice) => (
+                  <button
+                    key={voice.id}
+                    type="button"
+                    className={voice.id === callTtsSettings.voice ? "active" : ""}
+                    aria-pressed={voice.id === callTtsSettings.voice}
+                    onClick={() => updateCallTtsVoice(voice.id)}
+                  >
+                    {voice.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="call-tts-card call-tts-speed-card">
+              <span><Gauge size={13} /> Speed</span>
+              <div className="call-tts-stepper">
+                <button
+                  type="button"
+                  aria-label="Decrease call voice speed"
+                  disabled={callTtsSettings.rate <= 0.5}
+                  onClick={() => updateCallTtsRate(-0.05)}
+                >
+                  -
+                </button>
+                <strong>{callTtsSettings.rate.toFixed(2)}x</strong>
+                <button
+                  type="button"
+                  aria-label="Increase call voice speed"
+                  disabled={callTtsSettings.rate >= 2}
+                  onClick={() => updateCallTtsRate(0.05)}
+                >
+                  +
+                </button>
+              </div>
+            </div>
+          </div>
+          {callTtsStatus && <small>{callTtsStatus}</small>}
+        </aside>
+      )}
 
-      <div className="message-list">
+      <div ref={callMessageListRef} className="message-list" onScroll={handleCallMessageListScroll}>
         <div className="message-list-content">
           {visibleCallThreadRows.length > 0 ? (
             <div className="beginning">Beginning of Voice</div>
@@ -1315,7 +1583,7 @@ export function CallConsole({
               <div className="call-mode-status">
                 <span className="call-mode-live-dot" aria-hidden="true" />
                 <div>
-                  <strong>{callMode.isLive ? "Call Console live" : "Call Console ended"}</strong>
+                  <strong>{callMode.isLive ? `${callModeLabel} Console live` : `${callModeLabel} Console ended`}</strong>
                   <span>{callModeStatusText(callMode.error, callMode.lastResult, visibleCallSession)}</span>
                 </div>
                 <mark
@@ -1346,112 +1614,8 @@ export function CallConsole({
                     <i />
                   </div>
                 </div>
-                <div className="call-mode-cockpit-item">
-                  {isCallAssistantSpeaking ? <Volume2 size={14} /> : <Activity size={14} />}
-                  <span>Assistant</span>
-                  <strong>{callAssistantState}</strong>
-                  <small>{callAssistantDetail}</small>
-                </div>
-                <div className="call-mode-cockpit-item">
-                  <BriefcaseBusiness size={14} />
-                  <span>Activity</span>
-                  <strong>{liveCallWorkCount > 0 ? `${liveCallWorkCount} live` : `${visibleCallThreadRows.length} threads`}</strong>
-                  <small>{visibleCallThreadRows.length > 0 ? "Voice threads tracked" : "Waiting for first request"}</small>
-                </div>
               </div>
-              <div className="call-tts-controls" role="group" aria-label="Call voice settings">
-                <button
-                  type="button"
-                  className={`call-tts-button ${callRecorder.isMuted ? "muted" : ""}`}
-                  title={callRecorder.isMuted ? "Unmute microphone" : "Mute microphone"}
-                  aria-label={callRecorder.isMuted ? "Unmute microphone" : "Mute microphone"}
-                  aria-pressed={callRecorder.isMuted}
-                  disabled={!callMode.isLive || callRecorder.isStopping || callRecorder.isRequestingPermission || !callRecorder.isSupported}
-                  onClick={toggleCallMute}
-                >
-                  {callRecorder.isMuted ? <MicOff size={14} /> : <Mic size={14} />}
-                  <span>Mic</span>
-                  <strong>{callRecorder.isMuted ? "Muted" : "Open"}</strong>
-                </button>
-                <div className="call-tts-card call-tts-provider-card">
-                  <span><MonitorSpeaker size={13} /> Provider</span>
-                  <div className="call-tts-segmented" role="group" aria-label="Call voice provider">
-                    <button
-                      type="button"
-                      className={callTtsSettings.provider === "browser" ? "active" : ""}
-                      aria-pressed={callTtsSettings.provider === "browser"}
-                      onClick={() => updateCallTtsProvider("browser")}
-                    >
-                      <Laptop size={13} />
-                      Browser
-                    </button>
-                    <button
-                      type="button"
-                      className={callTtsSettings.provider === "edge" ? "active" : ""}
-                      aria-pressed={callTtsSettings.provider === "edge"}
-                      onClick={() => updateCallTtsProvider("edge")}
-                    >
-                      <Sparkles size={13} />
-                      Edge
-                    </button>
-                  </div>
-                </div>
-                <div className="call-tts-card call-tts-language-card">
-                  <span><Sparkles size={13} /> Language</span>
-                  <div className="call-tts-segmented" role="group" aria-label="Call spoken language">
-                    {CALL_VOICE_LANGUAGES.map((language) => (
-                      <button
-                        key={language.id}
-                        type="button"
-                        className={language.id === callTtsSettings.language ? "active" : ""}
-                        aria-pressed={language.id === callTtsSettings.language}
-                        onClick={() => updateCallVoiceLanguage(language.id)}
-                      >
-                        {language.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="call-tts-card call-tts-voice-card">
-                  <span><Sparkles size={13} /> Voice</span>
-                  <div className="call-tts-chip-row" role="group" aria-label="Call voice">
-                    {visibleCallTtsVoices.map((voice) => (
-                      <button
-                        key={voice.id}
-                        type="button"
-                        className={voice.id === callTtsSettings.voice ? "active" : ""}
-                        aria-pressed={voice.id === callTtsSettings.voice}
-                        onClick={() => updateCallTtsVoice(voice.id)}
-                      >
-                        {voice.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="call-tts-card call-tts-speed-card">
-                  <span><Gauge size={13} /> Speed</span>
-                  <div className="call-tts-stepper">
-                    <button
-                      type="button"
-                      aria-label="Decrease call voice speed"
-                      disabled={callTtsSettings.rate <= 0.5}
-                      onClick={() => updateCallTtsRate(-0.05)}
-                    >
-                      -
-                    </button>
-                    <strong>{callTtsSettings.rate.toFixed(2)}x</strong>
-                    <button
-                      type="button"
-                      aria-label="Increase call voice speed"
-                      disabled={callTtsSettings.rate >= 2}
-                      onClick={() => updateCallTtsRate(0.05)}
-                    >
-                      +
-                    </button>
-                  </div>
-                </div>
-                {callTtsStatus && <small>{callTtsStatus}</small>}
-              </div>
+              {callTtsStatus && <small className="call-mode-status-error">{callTtsStatus}</small>}
               {visibleLiveCallWorkBoardItems.length > 0 && (
                 <details className="call-mode-work-board" open>
                   <summary className="call-mode-work-board-header">

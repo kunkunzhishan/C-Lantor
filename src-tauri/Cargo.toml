@@ -14,6 +14,7 @@ axum = "0.8.4"
 chrono = { version = "0.4.40", features = ["serde"] }
 async-stream = "0.3.6"
 mime_guess = "2.0.5"
+pinyin = { version = "0.11.0", default-features = false, features = ["plain"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.8"
