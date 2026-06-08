@@ -18114,9 +18114,8 @@ inline `@kunk` and after @longbaby
         assert!(prompt.contains("injected memory path"));
         assert!(prompt.contains("stable user preferences"));
         assert!(prompt.contains("Turn startup sequence:"));
-        assert!(
-            prompt.contains("Use history-read or message-search when older channel/thread context")
-        );
+        assert!(prompt.contains("Prefer memory for older durable context"));
+        assert!(prompt.contains("Use history-read or message-search as evidence retrieval"));
         assert!(prompt.contains("Reply briefly to direct greetings"));
         assert!(prompt.contains("Agent context tools"));
         assert!(prompt.contains("inbox-list"));
@@ -18340,7 +18339,8 @@ inline `@kunk` and after @longbaby
         assert!(context.contains("type=owner"));
         assert!(context.contains("Dylan: please use the latest numbers and reply directly"));
         assert!(context.contains("Warm-runtime guard"));
-        assert!(context.contains("use history-read on the default reply target"));
+        assert!(context.contains("use the current injected thread context and memory"));
+        assert!(context.contains("use history-read on the default reply target only"));
         assert!(context.contains(&format!("inbox_id: {inbox_id}")));
         assert!(context.contains("Other active inbox targets:"));
         assert!(context.contains("- dm:Hancock: 2 active"));
@@ -21053,7 +21053,16 @@ inline `@kunk` and after @longbaby
             let memory_series = ToolHost::new(&pool)
                 .query_monitoring_time_series(None, Some("monitor-agent"), "day", "memory_reads")
                 .await?;
-            assert_eq!(memory_series[0]["memory_reads"], 2);
+            let memory_series_total = memory_series
+                .as_array()
+                .map(|series| {
+                    series
+                        .iter()
+                        .filter_map(|point| point["memory_reads"].as_i64())
+                        .sum::<i64>()
+                })
+                .unwrap_or_default();
+            assert_eq!(memory_series_total, 2);
             Ok(())
         }
         .await;

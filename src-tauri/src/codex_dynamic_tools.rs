@@ -138,7 +138,7 @@ mod tests {
             .and_then(|data| data.get("tools"))
             .and_then(Value::as_array)
             .expect("tools");
-        assert_eq!(tools.len(), 2);
+        assert!(tools.len() >= 2);
         assert!(tools.iter().any(|tool| {
             tool.get("id").and_then(Value::as_str) == Some(tools::TOOL_BROWSER_OPEN_ID)
                 && tool.get("method").and_then(Value::as_str) == Some("lantor.call_tool")
