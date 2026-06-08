@@ -62,7 +62,8 @@ use call_mode::{
     call_dispatch_cancel_work_in_pool, call_dispatch_resolve_confirmation_in_pool,
     call_session_start_with_options_in_pool, call_session_stop_in_pool,
     call_session_submit_text_utterance_in_pool, call_session_submit_utterance_in_pool,
-    load_call_dispatches, load_call_sessions, load_call_utterances, CallUtteranceSubmitRequest,
+    fetch_call_history_page, load_call_dispatches, load_call_sessions, load_call_utterances,
+    CallUtteranceSubmitRequest,
 };
 use context_tool::{run_agent_context_tool, short_id};
 use dispatch::{
@@ -94,9 +95,9 @@ use long_task::{
 use models::{
     Agent, AgentActivity, AgentRun, AgentRunPatch, AgentSchedule, AgentWorkItem,
     AgentWorkItemPatch, AgentWorkspaceEntry, AgentWorkspaceFile, AgentWorkspaceListing, Artifact,
-    AttachmentUpload, Bootstrap, CallSession, CallUtteranceSubmitResult, Channel, ChannelMember,
-    LaunchAgentStatus, Message, MessageAttachment, OwnerProfile, Reminder, RuntimeCheck,
-    SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity, TodoItem,
+    AttachmentUpload, Bootstrap, CallHistoryPage, CallSession, CallUtteranceSubmitResult, Channel,
+    ChannelMember, LaunchAgentStatus, Message, MessageAttachment, OwnerProfile, Reminder,
+    RuntimeCheck, SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity, TodoItem,
 };
 #[cfg(test)]
 use prompts::WORK_ITEM_FINISH_PROMPT;
@@ -237,6 +238,7 @@ pub(crate) struct AgentWorkDispatchInput<'a> {
     pub(crate) agent_id: Uuid,
     pub(crate) channel_id: Option<Uuid>,
     pub(crate) thread_root_id: Option<Uuid>,
+    pub(crate) source_message_id: Option<Uuid>,
     pub(crate) task_id: Option<Uuid>,
     pub(crate) title: &'a str,
     pub(crate) context: &'a str,
@@ -2043,6 +2045,15 @@ async fn fetch_messages(
 }
 
 #[tauri::command]
+async fn fetch_call_history(
+    state: State<'_, AppState>,
+    before: DateTime<Utc>,
+    limit: Option<i64>,
+) -> CommandResult<CallHistoryPage> {
+    fetch_call_history_page(&state.pool, before, limit).await
+}
+
+#[tauri::command]
 async fn call_session_start(
     state: State<'_, AppState>,
     channel_id: Option<Uuid>,
@@ -3373,6 +3384,7 @@ async fn dispatch_agent_work(
             agent_id,
             channel_id,
             thread_root_id,
+            source_message_id: None,
             task_id,
             title: &title,
             context: &context,
@@ -3436,6 +3448,7 @@ pub(crate) async fn dispatch_agent_work_in_pool(
                     .map_err(to_string)?;
         }
     }
+    let resolved_source_message_id = input.source_message_id.or(resolved_thread_root_id);
 
     if resolved_title.is_empty() {
         resolved_title = match resolved_thread_root_id {
@@ -3497,7 +3510,7 @@ pub(crate) async fn dispatch_agent_work_in_pool(
             channel_id: resolved_channel_id,
             thread_root_id: resolved_thread_root_id,
             source_message_id: if input.provenance.is_some() {
-                None
+                resolved_source_message_id
             } else {
                 resolved_thread_root_id
             },
@@ -3514,17 +3527,18 @@ pub(crate) async fn dispatch_agent_work_in_pool(
     let work_item_id: Uuid = sqlx::query_scalar(
         r#"
         insert into agent_work_items (
-            agent_id, channel_id, thread_root_id, inbox_item_id, task_id,
+            agent_id, channel_id, thread_root_id, source_message_id, inbox_item_id, task_id,
             source_kind, title, context, status,
             call_session_id, call_utterance_id, call_dispatch_id
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, $11, $12)
         returning id
         "#,
     )
     .bind(agent_id)
     .bind(resolved_channel_id)
     .bind(resolved_thread_root_id)
+    .bind(resolved_source_message_id)
     .bind(inbox_item_id)
     .bind(input.task_id)
     .bind(source_kind)
@@ -6732,6 +6746,7 @@ async fn load_channels(pool: &SqlitePool) -> CommandResult<Vec<Channel>> {
         from channels c
         left join channel_read_state r on r.channel_id = c.id
         left join messages m on m.channel_id = c.id
+        where c.kind <> 'voice'
         group by c.id, c.name, c.description, c.kind, c.dm_agent_id
         order by
           case
@@ -8089,7 +8104,11 @@ async fn load_agent_work_items(pool: &SqlitePool) -> CommandResult<Vec<AgentWork
             w.source_kind,
             w.title,
             case when w.status in ('queued', 'running', 'cancelling') then substr(w.context, 1, 2000) else '' end as context,
-            case when w.status in ('running', 'cancelling') then substr(w.result_body, 1, 2000) else '' end as result_body,
+            case
+                when w.status in ('running', 'cancelling') then substr(w.result_body, 1, 2000)
+                when w.call_session_id is not null and w.status = 'done' then substr(w.result_body, 1, 2000)
+                else ''
+            end as result_body,
             w.status,
             w.run_id,
             w.created_at,
@@ -17594,6 +17613,7 @@ pub fn run() {
             delete_channel,
             delete_message,
             dispatch_agent_work,
+            fetch_call_history,
             fetch_messages,
             forward_task,
             install_supervisor_service,
@@ -21706,6 +21726,30 @@ inline `@kunk` and after @longbaby
                     "newer in absolute time",
                 ]
             );
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn load_channels_hides_voice_system_channel() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let regular_id = insert_test_channel(&pool, "regular-channel").await?;
+            let voice_id: Uuid = sqlx::query_scalar(
+                "insert into channels (name, kind) values ('voice-console', 'voice') returning id",
+            )
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            let channels = load_channels(&pool).await?;
+            assert!(channels.iter().any(|channel| channel.id == regular_id));
+            assert!(!channels.iter().any(|channel| channel.id == voice_id));
             Ok(())
         }
         .await;

@@ -274,6 +274,7 @@ export type CallUtterance = {
   id: string;
   session_id: string;
   thread_root_utterance_id: string | null;
+  source_message_id?: string | null;
   sequence: number;
   transcript: string;
   language: string;
@@ -329,6 +330,11 @@ export type CallUtteranceSubmitResult = {
   ack_text: string;
   work_item_id: string | null;
   long_task_id: string | null;
+};
+
+export type CallHistoryPage = {
+  utterances: CallUtterance[];
+  dispatches: CallDispatch[];
 };
 
 export type AgentActivity = {

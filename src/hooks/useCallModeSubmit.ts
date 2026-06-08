@@ -42,6 +42,29 @@ function belongsToSurface(
   return session.channel_id === channelId && session.thread_root_id === threadRootId;
 }
 
+function normalizeCallMode(mode: string | null | undefined): "call" | "wake_word" {
+  return mode === "wake_word" ? "wake_word" : "call";
+}
+
+function normalizeWakeWordsForCompare(wakeWords: string | null | undefined) {
+  return (wakeWords ?? "")
+    .split(/[,\n，、]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .join(",");
+}
+
+function sessionMatchesRequestedMode(
+  session: CallSession,
+  mode: "call" | "wake_word",
+  wakeWords: string | undefined,
+) {
+  const requestedMode = normalizeCallMode(mode);
+  if (normalizeCallMode(session.mode) !== requestedMode) return false;
+  if (requestedMode !== "wake_word") return true;
+  return normalizeWakeWordsForCompare(session.wake_words) === normalizeWakeWordsForCompare(wakeWords);
+}
+
 function upsertSubmitResult(
   results: CallUtteranceSubmitResult[],
   result: CallUtteranceSubmitResult,
@@ -95,6 +118,10 @@ export function useCallModeSubmit({
       && session.channel_id === channelId
       && (threadRootId ? session.thread_root_id === threadRootId : session.thread_root_id === null)
     ) {
+      if (!sessionMatchesRequestedMode(session, mode, wakeWords)) {
+        setError("Active Voice session mode does not match the selected mode. End the current session before switching modes.");
+        return null;
+      }
       return session;
     }
     setError(null);

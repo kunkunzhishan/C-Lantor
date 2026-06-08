@@ -49,13 +49,14 @@ type CallConsoleProps = {
   ownerProfile: OwnerProfile;
   activeCallThreadId: string | null;
   setActiveCallThreadId: (threadId: string | null) => void;
+  loadOlderCallHistory: () => Promise<number>;
   openMobileSidebar: () => void;
   onOpenWorkItem: (item: AgentWorkItem) => void;
 };
 
 const CALL_SPEECH_CHUNK_CHARS = 160;
 
-type CallSpeechPolicy = "queue" | "barge-in";
+type CallSpeechPolicy = "queue" | "barge-in" | "barge-in-resume";
 type CallConsoleMode = "call" | "wake_word";
 
 type CallWakeSettings = {
@@ -98,7 +99,7 @@ type CallWorkerReply = {
 const CALL_TTS_SETTINGS_STORAGE_KEY = "lantor.callTts";
 const CALL_WAKE_SETTINGS_STORAGE_KEY = "lantor.callWake";
 const DEFAULT_CALL_WAKE_SETTINGS: CallWakeSettings = {
-  mode: "call",
+  mode: "wake_word",
   wakeWords: "兰托, 蓝托, Lantor",
 };
 const SILENT_CALL_DISPATCH_STATUSES = new Set(["queued", "dispatching", "superseded", "ignored", "failed", "compensated"]);
@@ -127,6 +128,10 @@ function normalizeCallWakeSettings(value: Partial<CallWakeSettings> | null | und
   const mode = value?.mode === "wake_word" ? "wake_word" : "call";
   const wakeWords = value?.wakeWords?.trim() || DEFAULT_CALL_WAKE_SETTINGS.wakeWords;
   return { mode, wakeWords };
+}
+
+function callConsoleModeLabel(mode: string | null | undefined) {
+  return mode === "wake_word" ? "Wake Word" : "Call";
 }
 
 function loadCallWakeSettings(): CallWakeSettings {
@@ -281,6 +286,15 @@ function callAckSpeechText(result: CallUtteranceSubmitResult) {
   return normalizeCallSpeechText(ackText);
 }
 
+function isWakeOnlyAckResult(result: CallUtteranceSubmitResult) {
+  return result.session.mode === "wake_word"
+    && result.utterance.status === "acknowledged"
+    && result.dispatch.intent === "ack_only"
+    && result.dispatch.status === "acknowledged"
+    && result.work_item_id === null
+    && normalizeCallSpeechText(result.dispatch.ack_text).length > 0;
+}
+
 function callDispatchSpeechText(dispatch: CallDispatch) {
   if (SILENT_CALL_DISPATCH_STATUSES.has(dispatch.status) && !isSpeakableQueuedCallDispatch(dispatch)) return null;
   if (dispatch.intent === "coordinator_pending") return null;
@@ -294,8 +308,17 @@ function callDispatchSpeechText(dispatch: CallDispatch) {
 
 function isSpeakableQueuedCallDispatch(dispatch: CallDispatch) {
   return dispatch.status === "queued"
-    && dispatch.intent === "cancel_work"
-    && dispatch.outcome === "work_cancel_requested";
+    && (
+      (
+        dispatch.intent === "agent_work"
+        && dispatch.outcome === "work_queued"
+        && Boolean(dispatch.work_item_id)
+      )
+      || (
+        dispatch.intent === "cancel_work"
+        && dispatch.outcome === "work_cancel_requested"
+      )
+    );
 }
 
 function isRoutineTranscriptionDiagnostic(value: string | null | undefined) {
@@ -401,6 +424,10 @@ function compareCallSessionsByStart(left: CallSession, right: CallSession) {
   const startedDelta = new Date(left.started_at).getTime() - new Date(right.started_at).getTime();
   if (startedDelta !== 0) return startedDelta;
   return left.id.localeCompare(right.id);
+}
+
+function isVoiceConsoleSession(session: CallSession) {
+  return session.thread_root_id === null && (session.channel_id === null || session.title === "Voice Console");
 }
 
 const callSystemAvatarAgent: Agent = {
@@ -533,6 +560,7 @@ export function CallConsole({
   ownerProfile,
   activeCallThreadId,
   setActiveCallThreadId,
+  loadOlderCallHistory,
   openMobileSidebar,
   onOpenWorkItem,
 }: CallConsoleProps) {
@@ -549,9 +577,12 @@ export function CallConsole({
   const [callTtsStatus, setCallTtsStatus] = useState("");
   const [finalCallSpeechDrainSessionId, setFinalCallSpeechDrainSessionId] = useState<string | null>(null);
   const finalCallSpeechDrainSessionIdRef = useRef<string | null>(null);
+  const callMessageListRef = useRef<HTMLDivElement | null>(null);
+  const olderCallHistoryLoadInFlightRef = useRef(false);
+  const allOlderCallHistoryLoadedRef = useRef(false);
   const surfaceCallSessions = useMemo(() => {
     return callSessions
-      .filter((session) => session.channel_id === null && session.thread_root_id === null)
+      .filter(isVoiceConsoleSession)
       .sort(compareCallSessionsByStart);
   }, [callSessions]);
   const surfaceCallSession = useMemo(() => {
@@ -569,8 +600,13 @@ export function CallConsole({
     mode: callWakeSettings.mode,
     wakeWords: callWakeSettings.wakeWords,
   });
+  const visibleCallSession = callMode.session ?? surfaceCallSession;
+  const effectiveCallConsoleMode = visibleCallSession?.status === "active"
+    ? normalizeCallWakeSettings({ mode: visibleCallSession.mode as CallConsoleMode }).mode
+    : callWakeSettings.mode;
+  const isCallWakeWordMode = effectiveCallConsoleMode === "wake_word";
   const callRecorder = useCallModeRecorder({
-    echoGateActive: isCallAssistantSpeaking,
+    echoGateActive: isCallAssistantSpeaking && !isCallWakeWordMode,
     liveSessionId: callMode.isLive ? callMode.session?.id ?? null : null,
     onSubmitAudio: callMode.submitRecordedUtterance,
   });
@@ -604,7 +640,7 @@ export function CallConsole({
     )
   );
   callSpeechDuckingRef.current = callMode.isLive && callRecorder.isListening && !callRecorder.isMuted;
-  callSpeechBlockedRef.current = callMode.isLive && callRecorder.isVoiceActive && !callRecorder.isMuted;
+  callSpeechBlockedRef.current = callMode.isLive && !isCallWakeWordMode && callRecorder.isVoiceActive && !callRecorder.isMuted;
 
   const setCallTtsSettings = (next: CallTtsSettings) => {
     const normalized = normalizeCallTtsSettings(next);
@@ -755,17 +791,45 @@ export function CallConsole({
     window.speechSynthesis.speak(utterance);
   }
 
-  function interruptCurrentCallSpeechForVoice() {
+  function interruptCurrentCallSpeechForVoice(options: { requeueCurrent?: boolean } = {}) {
+    const requeueCurrent = options.requeueCurrent ?? true;
     const current = callSpeechCurrentRef.current;
     callSpeechCurrentRef.current = null;
     callSpeechSpeakingRef.current = false;
     callSpeechUtteranceIdRef.current += 1;
     setIsCallAssistantSpeaking(false);
-    if (current) {
+    if (current && requeueCurrent) {
       setCallSpeechQueue([current, ...callSpeechQueueRef.current]);
     }
     stopCurrentCallAudio(false);
     cancelBrowserCallSpeech();
+    return current;
+  }
+
+  function queueBrowserCallSpeechAtFront(text: string, resumeQueue: QueuedCallSpeech[]) {
+    const trimmed = normalizeCallSpeechText(text);
+    const chunks = callSpeechChunks(trimmed);
+    if (
+      chunks.length === 0
+      || typeof window === "undefined"
+      || !("speechSynthesis" in window)
+      || typeof SpeechSynthesisUtterance === "undefined"
+    ) {
+      setCallSpeechQueue([...resumeQueue, ...callSpeechQueueRef.current]);
+      playNextCallSpeech();
+      return false;
+    }
+    const speechId = ++callSpeechMessageIdRef.current;
+    const wakeSpeech = chunks.map((chunk) => ({
+      id: ++callSpeechJobIdRef.current,
+      speechId,
+      text: chunk,
+      audioUrl: null,
+      provider: "browser" as const,
+    }));
+    setCallSpeechQueue([...wakeSpeech, ...resumeQueue, ...callSpeechQueueRef.current]);
+    playNextCallSpeech();
+    return true;
   }
 
   function flushReadyCallSpeech() {
@@ -800,6 +864,10 @@ export function CallConsole({
       || (settings.provider === "browser" && (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined"))
     ) {
       return false;
+    }
+    if (policy === "barge-in-resume") {
+      interruptCurrentCallSpeechForVoice({ requeueCurrent: false });
+      return queueBrowserCallSpeechAtFront(trimmed, []);
     }
     if (policy === "barge-in") {
       stopCallSpeech();
@@ -869,7 +937,7 @@ export function CallConsole({
       if (text) {
         queuedCallAckKeysRef.current.add(result.dispatch.id);
         lastSpokenCallAckRef.current = result.dispatch.id;
-        enqueueCallSpeech(text);
+        enqueueCallSpeech(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
       }
       return;
     }
@@ -877,7 +945,7 @@ export function CallConsole({
       queuedCallAckKeysRef.current.add(result.dispatch.id);
       if (text) {
         lastSpokenCallAckRef.current = result.dispatch.id;
-        enqueueCallSpeech(text);
+        enqueueCallSpeech(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
       }
       return;
     }
@@ -900,7 +968,11 @@ export function CallConsole({
       queuedCallAckKeysRef.current.add(next.key);
       if (next.text) {
         lastSpokenCallAckRef.current = next.key;
-        enqueueCallSpeech(next.text);
+        const submitResult = callMode.submitResults.find((result) => result.dispatch.id === next.key);
+        enqueueCallSpeech(
+          next.text,
+          submitResult && isWakeOnlyAckResult(submitResult) ? "barge-in-resume" : "queue",
+        );
       }
     }
   }
@@ -1054,20 +1126,18 @@ export function CallConsole({
   }, [canPlayCallSpeech]);
 
   const callControlsBusy = callMode.isStarting || callMode.isStopping || callRecorder.isStopping;
-  const callModeLabel = callWakeSettings.mode === "wake_word" ? "Wake Word" : "Call";
+  const callModeLabel = callConsoleModeLabel(effectiveCallConsoleMode);
   const callSettingsSummary = [
     callModeLabel,
     callTtsSettings.provider === "edge" ? "Edge TTS" : "Browser TTS",
     callTtsSettings.language,
     `${callTtsSettings.rate.toFixed(2)}x`,
   ].join(" · ");
-  const visibleCallSession = callMode.session ?? surfaceCallSession;
   const visibleCallHistorySessions = useMemo(() => {
     const rows = [...surfaceCallSessions];
     if (
       visibleCallSession
-      && visibleCallSession.channel_id === null
-      && visibleCallSession.thread_root_id === null
+      && isVoiceConsoleSession(visibleCallSession)
       && !rows.some((session) => session.id === visibleCallSession.id)
     ) {
       rows.push(visibleCallSession);
@@ -1114,6 +1184,27 @@ export function CallConsole({
     if (!activeCallThreadId) return null;
     return visibleCallThreadRows.find((thread) => thread.id === activeCallThreadId) ?? null;
   }, [activeCallThreadId, visibleCallThreadRows]);
+
+  function handleCallMessageListScroll() {
+    const element = callMessageListRef.current;
+    if (!element || element.scrollTop >= 96 || olderCallHistoryLoadInFlightRef.current || allOlderCallHistoryLoadedRef.current) {
+      return;
+    }
+    olderCallHistoryLoadInFlightRef.current = true;
+    const previousScrollHeight = element.scrollHeight;
+    void loadOlderCallHistory()
+      .then((loadedCount) => {
+        if (loadedCount === 0) allOlderCallHistoryLoadedRef.current = true;
+      })
+      .finally(() => {
+        window.requestAnimationFrame(() => {
+          const list = callMessageListRef.current;
+          if (list) list.scrollTop += list.scrollHeight - previousScrollHeight;
+          olderCallHistoryLoadInFlightRef.current = false;
+        });
+      });
+  }
+
   const pendingCallConfirmation = useMemo<PendingCallConfirmation | null>(() => {
     const confirmationRows = buildCallConfirmationRows(
       visibleCallSession,
@@ -1404,8 +1495,8 @@ export function CallConsole({
               <div className="call-tts-segmented" role="group" aria-label="Call console mode">
                 <button
                   type="button"
-                  className={callWakeSettings.mode === "call" ? "active" : ""}
-                  aria-pressed={callWakeSettings.mode === "call"}
+                  className={effectiveCallConsoleMode === "call" ? "active" : ""}
+                  aria-pressed={effectiveCallConsoleMode === "call"}
                   disabled={callMode.isLive}
                   onClick={() => updateCallConsoleMode("call")}
                 >
@@ -1414,8 +1505,8 @@ export function CallConsole({
                 </button>
                 <button
                   type="button"
-                  className={callWakeSettings.mode === "wake_word" ? "active" : ""}
-                  aria-pressed={callWakeSettings.mode === "wake_word"}
+                  className={effectiveCallConsoleMode === "wake_word" ? "active" : ""}
+                  aria-pressed={effectiveCallConsoleMode === "wake_word"}
                   disabled={callMode.isLive}
                   onClick={() => updateCallConsoleMode("wake_word")}
                 >
@@ -1429,7 +1520,7 @@ export function CallConsole({
               <input
                 type="text"
                 value={callWakeSettings.wakeWords}
-                disabled={callMode.isLive || callWakeSettings.mode !== "wake_word"}
+                disabled={callMode.isLive || effectiveCallConsoleMode !== "wake_word"}
                 onChange={(event) => updateCallWakeWords(event.currentTarget.value)}
                 placeholder="兰托, 蓝托, Lantor"
                 aria-label="Call wake words"
@@ -1517,7 +1608,7 @@ export function CallConsole({
         </aside>
       )}
 
-      <div className="message-list">
+      <div ref={callMessageListRef} className="message-list" onScroll={handleCallMessageListScroll}>
         <div className="message-list-content">
           {visibleCallThreadRows.length > 0 ? (
             <div className="beginning">Beginning of Voice</div>
