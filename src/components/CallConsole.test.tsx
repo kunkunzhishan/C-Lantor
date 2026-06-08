@@ -427,7 +427,7 @@ describe("Call Console controls", () => {
     Object.defineProperty(globalThis.window, "localStorage", {
       configurable: true,
       value: {
-        getItem: vi.fn((key: string) => key === "lantor.callWake"
+        getItem: vi.fn((key: string) => key === "lantor.voiceConsoleSettings"
           ? JSON.stringify({ mode: "wake_word", wakeWords: "小美" })
           : null),
         setItem: vi.fn(),
@@ -953,7 +953,7 @@ describe("Call Console controls", () => {
     Object.defineProperty(globalThis.window, "localStorage", {
       configurable: true,
       value: {
-        getItem: vi.fn((key: string) => key === "lantor.callWake"
+        getItem: vi.fn((key: string) => key === "lantor.voiceConsoleSettings"
           ? JSON.stringify({ mode: "wake_word", wakeWords: "小美" })
           : null),
         setItem: vi.fn(),
@@ -2200,7 +2200,9 @@ describe("Call Console controls", () => {
     Object.defineProperty(globalThis.window, "localStorage", {
       configurable: true,
       value: {
-        getItem: vi.fn(() => JSON.stringify({ provider: "edge", voice: "zh-CN-XiaoxiaoNeural", rate: 1 })),
+        getItem: vi.fn(() => JSON.stringify({
+          tts: { provider: "edge", voice: "zh-CN-XiaoxiaoNeural", rate: 1 },
+        })),
         setItem: vi.fn(),
       },
     });

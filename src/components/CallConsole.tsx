@@ -21,7 +21,6 @@ import {
   CALL_TTS_VOICES,
   CALL_TTS_DEFAULT_GAP_MS,
   CALL_VOICE_LANGUAGES,
-  DEFAULT_CALL_TTS_SETTINGS,
   normalizeCallTtsSettings,
   synthesizeCallTtsAudio,
   voicesForCallTtsProvider,
@@ -36,6 +35,14 @@ import { useCallModeRecorder } from "../hooks/useCallModeRecorder";
 import { useCallModeSubmit } from "../hooks/useCallModeSubmit";
 import type { Agent, AgentWorkItem, CallDispatch, CallSession, CallUtterance, CallUtteranceSubmitResult, Message, OwnerProfile } from "../types";
 import { formatDateDivider, formatTime, isSameCalendarDay, ownerAsAvatarAgent } from "../ui-utils";
+import {
+  loadVoiceConsoleSettings,
+  normalizeVoiceConsoleSettings,
+  normalizeVoiceWakeSettings,
+  saveVoiceConsoleSettings,
+  type VoiceConsoleMode,
+  type VoiceWakeSettings,
+} from "../voiceConsoleSettings";
 import { AgentAvatar } from "./AgentAvatar";
 import { MessageMarkdown } from "./MessageMarkdown";
 
@@ -57,12 +64,6 @@ type CallConsoleProps = {
 const CALL_SPEECH_CHUNK_CHARS = 160;
 
 type CallSpeechPolicy = "queue" | "barge-in" | "barge-in-resume";
-type CallConsoleMode = "call" | "wake_word";
-
-type CallWakeSettings = {
-  mode: CallConsoleMode;
-  wakeWords: string;
-};
 
 type QueuedCallSpeech = {
   id: number;
@@ -96,62 +97,10 @@ type CallWorkerReply = {
   workItem: AgentWorkItem;
 };
 
-const CALL_TTS_SETTINGS_STORAGE_KEY = "lantor.callTts";
-const CALL_WAKE_SETTINGS_STORAGE_KEY = "lantor.callWake";
-const DEFAULT_CALL_WAKE_SETTINGS: CallWakeSettings = {
-  mode: "wake_word",
-  wakeWords: "兰托, 蓝托, Lantor",
-};
 const SILENT_CALL_DISPATCH_STATUSES = new Set(["queued", "dispatching", "superseded", "ignored", "failed", "compensated"]);
-
-function loadCallTtsSettings(): CallTtsSettings {
-  if (typeof window === "undefined" || !("localStorage" in window)) return DEFAULT_CALL_TTS_SETTINGS;
-  try {
-    const raw = window.localStorage.getItem(CALL_TTS_SETTINGS_STORAGE_KEY);
-    if (!raw) return DEFAULT_CALL_TTS_SETTINGS;
-    return normalizeCallTtsSettings(JSON.parse(raw) as Partial<CallTtsSettings>);
-  } catch {
-    return DEFAULT_CALL_TTS_SETTINGS;
-  }
-}
-
-function saveCallTtsSettings(settings: CallTtsSettings) {
-  if (typeof window === "undefined" || !("localStorage" in window)) return;
-  try {
-    window.localStorage.setItem(CALL_TTS_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    // Settings persistence should never affect live call playback.
-  }
-}
-
-function normalizeCallWakeSettings(value: Partial<CallWakeSettings> | null | undefined): CallWakeSettings {
-  const mode = value?.mode === "wake_word" ? "wake_word" : "call";
-  const wakeWords = value?.wakeWords?.trim() || DEFAULT_CALL_WAKE_SETTINGS.wakeWords;
-  return { mode, wakeWords };
-}
 
 function callConsoleModeLabel(mode: string | null | undefined) {
   return mode === "wake_word" ? "Wake Word" : "Call";
-}
-
-function loadCallWakeSettings(): CallWakeSettings {
-  if (typeof window === "undefined" || !("localStorage" in window)) return DEFAULT_CALL_WAKE_SETTINGS;
-  try {
-    const raw = window.localStorage.getItem(CALL_WAKE_SETTINGS_STORAGE_KEY);
-    if (!raw) return DEFAULT_CALL_WAKE_SETTINGS;
-    return normalizeCallWakeSettings(JSON.parse(raw) as Partial<CallWakeSettings>);
-  } catch {
-    return DEFAULT_CALL_WAKE_SETTINGS;
-  }
-}
-
-function saveCallWakeSettings(settings: CallWakeSettings) {
-  if (typeof window === "undefined" || !("localStorage" in window)) return;
-  try {
-    window.localStorage.setItem(CALL_WAKE_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    // Wake-word settings should never affect live call capture.
-  }
 }
 
 function cancelBrowserCallSpeech() {
@@ -571,8 +520,12 @@ export function CallConsole({
   const [callThreadReplyDraft, setCallThreadReplyDraft] = useState("");
   const [isSubmittingTypedCallUtterance, setIsSubmittingTypedCallUtterance] = useState(false);
   const [isSubmittingCallThreadReply, setIsSubmittingCallThreadReply] = useState(false);
-  const [callTtsSettings, setCallTtsSettingsState] = useState<CallTtsSettings>(loadCallTtsSettings);
-  const [callWakeSettings, setCallWakeSettingsState] = useState<CallWakeSettings>(loadCallWakeSettings);
+  const [voiceConsoleSettings, setVoiceConsoleSettingsState] = useState(loadVoiceConsoleSettings);
+  const callTtsSettings = voiceConsoleSettings.tts;
+  const callWakeSettings = useMemo<VoiceWakeSettings>(() => ({
+    mode: voiceConsoleSettings.mode,
+    wakeWords: voiceConsoleSettings.wakeWords,
+  }), [voiceConsoleSettings.mode, voiceConsoleSettings.wakeWords]);
   const [showCallSettings, setShowCallSettings] = useState(false);
   const [callTtsStatus, setCallTtsStatus] = useState("");
   const [finalCallSpeechDrainSessionId, setFinalCallSpeechDrainSessionId] = useState<string | null>(null);
@@ -602,7 +555,7 @@ export function CallConsole({
   });
   const visibleCallSession = callMode.session ?? surfaceCallSession;
   const effectiveCallConsoleMode = visibleCallSession?.status === "active"
-    ? normalizeCallWakeSettings({ mode: visibleCallSession.mode as CallConsoleMode }).mode
+    ? (visibleCallSession.mode === "wake_word" ? "wake_word" : "call")
     : callWakeSettings.mode;
   const isCallWakeWordMode = effectiveCallConsoleMode === "wake_word";
   const callRecorder = useCallModeRecorder({
@@ -643,16 +596,22 @@ export function CallConsole({
   callSpeechBlockedRef.current = callMode.isLive && !isCallWakeWordMode && callRecorder.isVoiceActive && !callRecorder.isMuted;
 
   const setCallTtsSettings = (next: CallTtsSettings) => {
-    const normalized = normalizeCallTtsSettings(next);
-    callTtsSettingsRef.current = normalized;
-    setCallTtsSettingsState(normalized);
-    saveCallTtsSettings(normalized);
+    const normalized = normalizeVoiceConsoleSettings({
+      ...voiceConsoleSettings,
+      tts: normalizeCallTtsSettings(next),
+    });
+    callTtsSettingsRef.current = normalized.tts;
+    setVoiceConsoleSettingsState(normalized);
+    saveVoiceConsoleSettings(normalized);
   };
 
-  const setCallWakeSettings = (next: CallWakeSettings) => {
-    const normalized = normalizeCallWakeSettings(next);
-    setCallWakeSettingsState(normalized);
-    saveCallWakeSettings(normalized);
+  const setCallWakeSettings = (next: VoiceWakeSettings) => {
+    const normalized = normalizeVoiceConsoleSettings({
+      ...voiceConsoleSettings,
+      ...normalizeVoiceWakeSettings(next),
+    });
+    setVoiceConsoleSettingsState(normalized);
+    saveVoiceConsoleSettings(normalized);
   };
 
   const setCallSpeechQueue = (queue: QueuedCallSpeech[]) => {
@@ -1353,7 +1312,7 @@ export function CallConsole({
     else callRecorder.mute();
   }
 
-  function updateCallConsoleMode(mode: CallConsoleMode) {
+  function updateCallConsoleMode(mode: VoiceConsoleMode) {
     if (callMode.isLive) return;
     setCallWakeSettings({
       ...callWakeSettings,
