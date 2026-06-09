@@ -4723,7 +4723,7 @@ async fn sync_inbox_for_work_item(pool: &SqlitePool, work_item_id: Uuid) -> Comm
     Ok(())
 }
 
-async fn ensure_agent_inbox_wake_work_item(
+pub(crate) async fn ensure_agent_inbox_wake_work_item(
     pool: &SqlitePool,
     agent_id: Uuid,
 ) -> CommandResult<Option<(Uuid, bool)>> {
@@ -18519,7 +18519,14 @@ inline `@kunk` and after @longbaby
                     "base_thread_version": 2,
                     "draft_body": "old answer",
                     "allowed_actions": ["revise", "yield", "force_send"],
-                    "held_visible_events": []
+                    "held_visible_events": [],
+                    "arrived_during_composition": [
+                        {
+                            "sender_name": "Dylan",
+                            "sender_role": "owner",
+                            "body_preview": "newer room message"
+                        }
+                    ]
                 })
                 .to_string(),
                 message_created_at: None,
@@ -18534,8 +18541,12 @@ inline `@kunk` and after @longbaby
         assert!(context.contains("do not ask the user to choose"));
         assert!(context.contains("allowed_actions: [\"revise\",\"yield\",\"force_send\"]"));
         assert!(context.contains("draft_body: old answer"));
+        assert!(context.contains("arrived_during_composition_count: 1"));
+        assert!(context.contains("newer room message"));
         assert!(context.contains("interrupted_action_resolve"));
-        assert!(context.contains("prefer revise for stale public replies"));
+        assert!(context.contains("the backend provides facts and actions"));
+        assert!(context.contains("to stay silent"));
+        assert!(context.contains("to revise"));
         assert!(context.contains("then continue with the revised visible reply"));
         assert!(!context.contains("revise is not allowed for this interruption"));
     }
@@ -24899,6 +24910,152 @@ inline `@kunk` and after @longbaby
             .await
             .map_err(|err| err.to_string())?;
             assert_eq!(held_messages, 0);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn held_public_reply_creates_recovery_wake_with_arrived_delta() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "held-recovery-agent").await?;
+            let channel_id = insert_test_channel(&pool, "held-recovery-channel").await?;
+            let (work_item_id, run_id) =
+                insert_publish_gate_work(&pool, agent_id, channel_id, None, 0).await?;
+            sqlx::query(
+                r#"
+                update agent_work_items
+                set created_at = '2026-06-09T07:00:00.000+00:00'
+                where id = $1
+                "#,
+            )
+            .bind(work_item_id)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            sqlx::query(
+                r#"
+                update agent_runs
+                set started_at = '2026-06-09T07:00:01.000+00:00'
+                where id = $1
+                "#,
+            )
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            sqlx::query(
+                r#"
+                insert into messages (
+                    channel_id, sender_name, sender_role, body, created_at
+                )
+                values (
+                    $1, 'Dylan', 'owner',
+                    'new message that arrived while the draft was being composed',
+                    '2026-06-09T07:00:02.000+00:00'
+                )
+                "#,
+            )
+            .bind(channel_id)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            super::publish_guard::bump_thread_version(&pool, channel_id, None).await?;
+            let stream_key = format!("{run_id}:held-recovery-reply");
+
+            super::publish_guard::hold_streaming_public_output(
+                &pool,
+                agent_id,
+                run_id,
+                Some(work_item_id),
+                channel_id,
+                None,
+                &stream_key,
+                "draft written against stale context",
+                true,
+                super::publish_guard::PublishDecision::HoldStale {
+                    base_version: 0,
+                    current_version: 1,
+                },
+            )
+            .await?;
+
+            let old_work_status: String =
+                sqlx::query_scalar("select status from agent_work_items where id = $1")
+                    .bind(work_item_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(old_work_status, "interrupted");
+
+            let inbox = sqlx::query(
+                r#"
+                select
+                    state,
+                    work_item_id,
+                    json_extract(payload, '$.original_work_item_id') as original_work_item_id,
+                    json_extract(payload, '$.arrived_during_composition[0].body_preview') as arrived_body
+                from agent_inbox_items
+                where kind = 'interrupted_action'
+                  and json_extract(payload, '$.stream_key') = $1
+                order by updated_at desc
+                limit 1
+                "#,
+            )
+            .bind(&stream_key)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(inbox.get::<String, _>("state"), "processing");
+            assert_eq!(
+                inbox.get::<Option<String>, _>("original_work_item_id"),
+                Some(work_item_id.to_string())
+            );
+            assert_eq!(
+                inbox.get::<Option<String>, _>("arrived_body"),
+                Some("new message that arrived while the draft was being composed".to_owned())
+            );
+            let recovery_work_item_id: Uuid = inbox.get("work_item_id");
+            assert_ne!(recovery_work_item_id, work_item_id);
+            let recovery = sqlx::query(
+                r#"
+                select status, source_kind, context
+                from agent_work_items
+                where id = $1
+                "#,
+            )
+            .bind(recovery_work_item_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(recovery.get::<String, _>("status"), "queued");
+            assert_eq!(recovery.get::<String, _>("source_kind"), "inbox_wake");
+            let context: String = recovery.get("context");
+            assert!(context.contains("arrived_during_composition_count: 1"));
+            assert!(context.contains("new message that arrived while the draft was being composed"));
+            assert!(context.contains("interrupted_action_resolve"));
+
+            let pending_start: i64 = sqlx::query_scalar(
+                r#"
+                select count(*)
+                from supervisor_commands
+                where command_type = 'start_agent'
+                  and agent_id = $1
+                  and work_item_id = $2
+                  and status = 'pending'
+                "#,
+            )
+            .bind(agent_id)
+            .bind(recovery_work_item_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(pending_start, 1);
             Ok(())
         }
         .await;

@@ -3,9 +3,10 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
-    handle_claimed_agent_event_json, handle_streaming_agent_event_json,
-    insert_agent_message_with_options, load_message, notify_ui_message_upsert, notify_ui_refresh,
-    notify_ui_work_item_changed, queue_agent_message_mentions, record_agent_activity,
+    compact_chars_middle, ensure_agent_inbox_wake_work_item, handle_claimed_agent_event_json,
+    handle_streaming_agent_event_json, insert_agent_message_with_options, load_message,
+    notify_ui_message_upsert, notify_ui_refresh, notify_ui_work_item_changed,
+    queue_agent_message_mentions, record_agent_activity,
     split_complete_streaming_agent_event_lines, split_terminal_streaming_agent_event_lines,
     streaming_agent_event_is_visible_side_effect, to_string, CommandResult,
 };
@@ -86,6 +87,91 @@ impl InterruptedActionKind {
         };
         self.allowed_actions().contains(&normalized)
     }
+}
+
+async fn arrived_during_composition(
+    pool: &SqlitePool,
+    agent_id: Uuid,
+    run_id: Uuid,
+    work_item_id: Option<Uuid>,
+    channel_id: Uuid,
+    thread_root_id: Option<Uuid>,
+) -> CommandResult<Value> {
+    let since: Option<String> = if let Some(work_item_id) = work_item_id {
+        sqlx::query_scalar(
+            r#"
+            select coalesce(
+                (select started_at from agent_runs where id = $2),
+                created_at
+            )
+            from agent_work_items
+            where id = $1
+            "#,
+        )
+        .bind(work_item_id)
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(to_string)?
+    } else {
+        sqlx::query_scalar("select started_at from agent_runs where id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?
+    };
+    let Some(since) = since else {
+        return Ok(json!([]));
+    };
+
+    let own_run_stream_prefix = format!("{run_id}:%");
+    let rows = sqlx::query(
+        r#"
+        select
+            id,
+            sender_name,
+            sender_role,
+            sender_agent_id,
+            body,
+            created_at
+        from messages
+        where channel_id = $1
+          and thread_root_id is not distinct from $2
+          and created_at > $3
+          and body <> ''
+          and not (
+              sender_agent_id is not distinct from $4
+              and stream_key like $5
+          )
+        order by created_at asc
+        limit 12
+        "#,
+    )
+    .bind(channel_id)
+    .bind(thread_root_id)
+    .bind(since)
+    .bind(agent_id)
+    .bind(own_run_stream_prefix)
+    .fetch_all(pool)
+    .await
+    .map_err(to_string)?;
+
+    let messages: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            let id: Uuid = row.get("id");
+            let body: String = row.get("body");
+            json!({
+                "message_id": id,
+                "sender_name": row.get::<String, _>("sender_name"),
+                "sender_role": row.get::<String, _>("sender_role"),
+                "sender_agent_id": row.get::<Option<Uuid>, _>("sender_agent_id"),
+                "created_at": row.get::<String, _>("created_at"),
+                "body_preview": compact_chars_middle(&body, 600),
+            })
+        })
+        .collect();
+    Ok(json!(messages))
 }
 
 pub(crate) fn control_action_kind_for_event_type(event_type: &str) -> PublishActionKind {
@@ -482,13 +568,23 @@ pub(crate) async fn hold_visible_control_event(
         "base_thread_version": current_version,
         "stream_key": stream_key,
         "action_kind": payload_action_kind,
+        "original_work_item_id": work_item_id,
+        "arrived_during_composition": arrived_during_composition(
+            pool,
+            agent_id,
+            run_id,
+            work_item_id,
+            channel_id,
+            thread_root_id,
+        )
+        .await?,
         "held_visible_events": held_visible_events,
         "allowed_actions": kind.allowed_actions(),
     });
     upsert_interrupted_action(
         pool,
         agent_id,
-        work_item_id,
+        None,
         channel_id,
         thread_root_id,
         &stream_key,
@@ -496,6 +592,7 @@ pub(crate) async fn hold_visible_control_event(
         payload,
     )
     .await?;
+    let _ = ensure_agent_inbox_wake_work_item(pool, agent_id).await?;
     record_agent_activity(
         pool,
         Some(agent_id),
@@ -759,7 +856,6 @@ pub(crate) async fn hold_streaming_public_output(
     .map_err(to_string)?;
     let existing_reason = existing.as_ref().map(|row| row.2.clone());
     let existing_base_version = existing.as_ref().map(|row| row.3);
-    let existing_current_version = existing.as_ref().map(|row| row.4);
     let reason = existing_reason
         .as_deref()
         .or_else(|| decision.reason())
@@ -770,8 +866,7 @@ pub(crate) async fn hold_streaming_public_output(
             .await?
             .unwrap_or(0),
     });
-    let current_version = existing_current_version
-        .unwrap_or(current_thread_version(pool, channel_id, thread_root_id).await?);
+    let current_version = current_thread_version(pool, channel_id, thread_root_id).await?;
 
     let (existing_body, existing_held_events) = existing
         .map(|(body, events, _, _, _)| (body, events))
@@ -842,13 +937,23 @@ pub(crate) async fn hold_streaming_public_output(
         "base_thread_version": current_version,
         "stream_key": buffer_stream_key,
         "action_kind": PublishActionKind::ReplyText.as_str(),
+        "original_work_item_id": work_item_id,
+        "arrived_during_composition": arrived_during_composition(
+            pool,
+            agent_id,
+            run_id,
+            work_item_id,
+            channel_id,
+            thread_root_id,
+        )
+        .await?,
         "held_visible_events": held_visible_events,
         "allowed_actions": kind.allowed_actions(),
     });
     upsert_interrupted_action(
         pool,
         agent_id,
-        work_item_id,
+        None,
         channel_id,
         thread_root_id,
         &buffer_stream_key,
@@ -856,6 +961,7 @@ pub(crate) async fn hold_streaming_public_output(
         payload,
     )
     .await?;
+    let _ = ensure_agent_inbox_wake_work_item(pool, agent_id).await?;
     record_agent_activity(
         pool,
         Some(agent_id),

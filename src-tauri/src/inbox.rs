@@ -116,6 +116,7 @@ impl InboxWakeItem {
             "base_version",
             "current_version",
             "base_thread_version",
+            "original_work_item_id",
         ] {
             if let Some(value) = payload.get(key) {
                 lines.push(format!("   {key}: {}", compact_payload_value(value, 512)));
@@ -136,9 +137,26 @@ impl InboxWakeItem {
         if let Some(events) = payload.get("held_visible_events").and_then(Value::as_array) {
             lines.push(format!("   held_visible_events_count: {}", events.len()));
         }
-        lines.push("   protocol: for yield or force_send, emit LANTOR_EVENT {\"type\":\"interrupted_action_resolve\",\"stream_key\":\"<stream_key>\",\"action\":\"yield|force_send\"} and do not also post a normal reply.".to_owned());
+        if let Some(messages) = payload
+            .get("arrived_during_composition")
+            .and_then(Value::as_array)
+        {
+            lines.push(format!(
+                "   arrived_during_composition_count: {}",
+                messages.len()
+            ));
+            for message in messages.iter().take(8) {
+                lines.push(format!(
+                    "   arrived_during_composition: {}",
+                    compact_payload_value(message, 900)
+                ));
+            }
+        }
+        lines.push("   protocol: decide from the draft, arrived_during_composition, and current thread context; the backend provides facts and actions, not a semantic decision.".to_owned());
+        lines.push("   protocol: to stay silent, emit LANTOR_EVENT {\"type\":\"interrupted_action_resolve\",\"stream_key\":\"<stream_key>\",\"action\":\"yield\"} and do not also post a normal reply.".to_owned());
+        lines.push("   protocol: to send the held draft as an explicit override, emit LANTOR_EVENT {\"type\":\"interrupted_action_resolve\",\"stream_key\":\"<stream_key>\",\"action\":\"force_send\"} and do not also post a normal reply.".to_owned());
         if can_revise {
-            lines.push("   protocol: prefer revise for stale public replies when it is allowed; emit LANTOR_EVENT {\"type\":\"interrupted_action_resolve\",\"stream_key\":\"<stream_key>\",\"action\":\"revise\"}, then continue with the revised visible reply in this same turn.".to_owned());
+            lines.push("   protocol: to revise, emit LANTOR_EVENT {\"type\":\"interrupted_action_resolve\",\"stream_key\":\"<stream_key>\",\"action\":\"revise\"}, then continue with the revised visible reply in this same turn.".to_owned());
         } else {
             lines.push("   protocol: revise is not allowed for this interruption (no draft reply to rewrite); resolve with yield or force_send yourself.".to_owned());
         }
