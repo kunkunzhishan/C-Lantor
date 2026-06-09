@@ -2525,7 +2525,7 @@ function App() {
     // Bootstrap thread activity is a fallback; live message upserts/deltas are authoritative.
     for (const activity of data?.thread_activities ?? []) {
       if (summaries[activity.thread_root_id]) continue;
-      const current: ThreadReplySummary = { count: activity.reply_count, latest: null, participants: [] };
+      const current: ThreadReplySummary = { count: activity.reply_count, latest: null, participants: activity.participants ?? [] };
       const latest = activity.latest_visible_message_id
         ? visibleMessageById.get(activity.latest_visible_message_id) ?? null
         : null;

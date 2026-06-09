@@ -88,7 +88,7 @@ export type Message = {
 export type ThreadReplySummary = {
   count: number;
   latest: Message | null;
-  participants: Message[];
+  participants: ThreadParticipant[];
 };
 
 export type ThreadActivity = {
@@ -97,7 +97,10 @@ export type ThreadActivity = {
   unread_count: number;
   latest_visible_message_id: string | null;
   latest_visible_at: string | null;
+  participants: ThreadParticipant[];
 };
+
+export type ThreadParticipant = Pick<Message, "sender_agent_id" | "sender_name" | "sender_role">;
 
 export type SavedMessage = {
   id: string;

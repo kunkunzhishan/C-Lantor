@@ -117,6 +117,14 @@ pub(crate) struct ThreadActivity {
     pub(crate) unread_count: i32,
     pub(crate) latest_visible_message_id: Option<Uuid>,
     pub(crate) latest_visible_at: Option<DateTime<Utc>>,
+    pub(crate) participants: Vec<ThreadActivityParticipant>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct ThreadActivityParticipant {
+    pub(crate) sender_agent_id: Option<Uuid>,
+    pub(crate) sender_name: String,
+    pub(crate) sender_role: String,
 }
 
 #[derive(Debug, Serialize)]

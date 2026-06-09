@@ -97,7 +97,8 @@ use models::{
     AgentWorkItemPatch, AgentWorkspaceEntry, AgentWorkspaceFile, AgentWorkspaceListing, Artifact,
     AttachmentUpload, Bootstrap, CallHistoryPage, CallSession, CallUtteranceSubmitResult, Channel,
     ChannelMember, LaunchAgentStatus, Message, MessageAttachment, OwnerProfile, Reminder,
-    RuntimeCheck, SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity, TodoItem,
+    RuntimeCheck, SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity,
+    ThreadActivityParticipant, TodoItem,
 };
 #[cfg(test)]
 use prompts::WORK_ITEM_FINISH_PROMPT;
@@ -6884,6 +6885,59 @@ async fn load_thread_activities(pool: &SqlitePool) -> CommandResult<Vec<ThreadAc
     .await
     .map_err(to_string)?;
 
+    let participant_rows = sqlx::query(&format!(
+        r#"
+        with ranked_participants as (
+            select
+                m.thread_root_id,
+                m.sender_agent_id,
+                m.sender_name,
+                m.sender_role,
+                m.created_at,
+                m.id,
+                row_number() over (
+                    partition by
+                        m.thread_root_id,
+                        coalesce(lower(hex(m.sender_agent_id)), ''),
+                        m.sender_name,
+                        m.sender_role
+                    order by julianday(m.created_at) desc, m.created_at desc, lower(hex(m.id)) desc
+                ) as sender_rank
+            from messages m
+            where m.thread_root_id is not null
+              and m.sender_role <> 'system'
+              and {visible_message_sql}
+        )
+        select
+            thread_root_id,
+            sender_agent_id,
+            sender_name,
+            sender_role,
+            created_at,
+            lower(hex(id)) as message_hex_id
+        from ranked_participants
+        where sender_rank = 1
+        order by thread_root_id, julianday(created_at) desc, created_at desc, message_hex_id desc
+        "#
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(to_string)?;
+
+    let mut participants_by_thread: HashMap<Uuid, Vec<ThreadActivityParticipant>> = HashMap::new();
+    for row in participant_rows {
+        let thread_root_id: Uuid = row.get("thread_root_id");
+        let participants = participants_by_thread.entry(thread_root_id).or_default();
+        if participants.len() >= 3 {
+            continue;
+        }
+        participants.push(ThreadActivityParticipant {
+            sender_agent_id: row.get("sender_agent_id"),
+            sender_name: row.get("sender_name"),
+            sender_role: row.get("sender_role"),
+        });
+    }
+
     Ok(rows
         .into_iter()
         .map(|row| ThreadActivity {
@@ -6892,6 +6946,9 @@ async fn load_thread_activities(pool: &SqlitePool) -> CommandResult<Vec<ThreadAc
             unread_count: row.get("unread_count"),
             latest_visible_message_id: row.get("latest_visible_message_id"),
             latest_visible_at: row.get("latest_visible_at"),
+            participants: participants_by_thread
+                .remove(&row.get::<Uuid, _>("thread_root_id"))
+                .unwrap_or_default(),
         })
         .collect())
 }
@@ -22074,6 +22131,13 @@ inline `@kunk` and after @longbaby
                 activity.latest_visible_at.map(|value| value.to_rfc3339()),
                 Some("2026-05-20T00:40:00+00:00".to_owned())
             );
+            assert_eq!(activity.participants.len(), 2);
+            assert_eq!(activity.participants[0].sender_agent_id, Some(agent_id));
+            assert_eq!(activity.participants[0].sender_name, "Agent");
+            assert_eq!(activity.participants[0].sender_role, "agent");
+            assert_eq!(activity.participants[1].sender_agent_id, None);
+            assert_eq!(activity.participants[1].sender_name, "Dylan");
+            assert_eq!(activity.participants[1].sender_role, "owner");
             Ok(())
         }
         .await;
