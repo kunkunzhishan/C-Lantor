@@ -59,6 +59,7 @@ import {
   CallHistoryPage,
   CallSession,
   CallUtterance,
+  Channel,
   ChannelMember,
   DraftAttachment,
   EMPTY_AGENT_FORM,
@@ -219,6 +220,7 @@ const MOBILE_SIDEBAR_FLING_VELOCITY = 0.45;
 const BACKEND_CONNECTED_FULL_REFRESH_MS = 60_000;
 const BACKEND_DISCONNECTED_REFRESH_MS = 5_000;
 const REFRESH_METRICS_SUMMARY_MS = 30_000;
+const LOCAL_EVENT_MUTATIONS = new Set(["update_channel", "set_channel_agent_membership"]);
 const SAVED_MESSAGES_READ_DISMISS_ID = "saved-messages";
 const CHANNEL_MESSAGE_PAGE_SIZE = 120;
 const CALL_HISTORY_PAGE_SIZE = 160;
@@ -270,6 +272,7 @@ type UiBackendEvent =
   | { type: "call_session_upsert"; reason?: string; session: CallSession }
   | { type: "call_utterance_upsert"; reason?: string; utterance: CallUtterance }
   | { type: "call_dispatch_upsert"; reason?: string; dispatch: CallDispatch }
+  | { type: "channel_upsert"; reason?: string; channel: Channel }
   | { type: "artifact_upsert"; reason?: string; artifact: Artifact }
   | { type: "channel_member_upsert"; reason?: string; member: ChannelMember }
   | { type: "channel_member_delete"; reason?: string; channel_id: string; agent_id: string }
@@ -1453,6 +1456,7 @@ function App() {
       event.type === "message_upsert"
       || event.type === "message_delete"
       || event.type === "agent_upsert"
+      || event.type === "channel_upsert"
       || event.type === "activity_upsert"
       || event.type === "agent_run_upsert"
       || event.type === "work_item_upsert"
@@ -1478,6 +1482,7 @@ function App() {
       }
 
       let messages = current.messages;
+      let channels = current.channels;
       let agents = current.agents;
       let agentActivities = current.agent_activities;
       let agentRuns = current.agent_runs;
@@ -1488,6 +1493,7 @@ function App() {
       let channelMembers = current.channel_members;
       let artifacts = Array.isArray(current.artifacts) ? current.artifacts : [];
       let messagesChanged = false;
+      let channelsChanged = false;
       let agentsChanged = false;
       let activitiesChanged = false;
       let runsChanged = false;
@@ -1504,6 +1510,11 @@ function App() {
             ? agents.map((item) => item.id === event.agent.id ? event.agent : item)
             : [...agents, event.agent];
           agentsChanged = true;
+        } else if (event.type === "channel_upsert") {
+          channels = channels.some((item) => item.id === event.channel.id)
+            ? channels.map((item) => item.id === event.channel.id ? event.channel : item)
+            : [...channels, event.channel];
+          channelsChanged = true;
         } else if (event.type === "message_upsert") {
           const existingIndex = messages.findIndex((item) => item.id === event.message.id);
           if (existingIndex >= 0) {
@@ -1614,6 +1625,7 @@ function App() {
       const next = {
         ...current,
         ...(messagesChanged ? { messages: sortedMessages(messages) } : null),
+        ...(channelsChanged ? { channels } : null),
         ...(agentsChanged ? { agents } : null),
         ...(activitiesChanged ? { agent_activities: limitActivitiesPerAgent(agentActivities) } : null),
         ...(runsChanged
@@ -1721,6 +1733,7 @@ function App() {
           case "message_upsert":
           case "message_delete":
           case "agent_upsert":
+          case "channel_upsert":
           case "work_item_upsert":
           case "call_session_upsert":
           case "call_utterance_upsert":
@@ -1759,7 +1772,9 @@ function App() {
   async function mutate<T = unknown>(command: string, args: Record<string, unknown> = {}): Promise<T> {
     try {
       const result = await apiInvoke<T>(command, args);
-      await refresh({ reason: `mutation:${command}`, source: "mutation" });
+      if (!LOCAL_EVENT_MUTATIONS.has(command)) {
+        await refresh({ reason: `mutation:${command}`, source: "mutation" });
+      }
       return result;
     } catch (err) {
       const message = errorMessage(err, `${command} failed`);

@@ -327,6 +327,12 @@ describe("Call Console controls", () => {
         clearInterval: globalThis.clearInterval,
         clearTimeout: globalThis.clearTimeout,
         getSelection: vi.fn(() => ({ toString: () => "" })),
+        localStorage: {
+          getItem: vi.fn(() => JSON.stringify({
+            tts: { provider: "browser", language: "zh-CN", voice: "browser-auto", rate: 1 },
+          })),
+          setItem: vi.fn(),
+        },
         matchMedia: vi.fn(() => ({ matches: false })),
         removeEventListener: vi.fn(),
         requestAnimationFrame: vi.fn((callback: FrameRequestCallback) => {
@@ -457,6 +463,59 @@ describe("Call Console controls", () => {
     const [callButton, wakeWordButton] = modeGroup.findAllByType("button");
     expect(callButton.props["aria-pressed"]).toBe(true);
     expect(wakeWordButton.props["aria-pressed"]).toBe(false);
+
+    await act(async () => {
+      renderer.unmount();
+    });
+  });
+
+  it("updates TTS provider settings while Voice is live", async () => {
+    const setItem = vi.fn();
+    Object.defineProperty(globalThis.window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: vi.fn((key: string) => key === "lantor.voiceConsoleSettings"
+          ? JSON.stringify({
+            mode: "wake_word",
+            wakeWords: "小美",
+            tts: { provider: "browser", language: "zh-CN", voice: "browser-auto", rate: 1 },
+          })
+          : null),
+        setItem,
+      },
+    });
+    mockCallModeState({
+      isLive: true,
+      session: {
+        ...activeSession,
+        mode: "wake_word",
+        wake_words: "小美",
+      },
+    });
+
+    let renderer!: ReactTestRenderer;
+    await act(async () => {
+      renderer = create(<CallConsole {...baseCallConsoleProps()} />);
+    });
+    await act(async () => {
+      findButtonByLabel(renderer, "Voice settings").props.onClick();
+    });
+
+    const providerGroup = renderer.root.findByProps({ "aria-label": "Call voice provider" });
+    const [browserButton, edgeButton] = providerGroup.findAllByType("button");
+    expect(browserButton.props["aria-pressed"]).toBe(true);
+    expect(edgeButton.props["aria-pressed"]).toBe(false);
+
+    await act(async () => {
+      edgeButton.props.onClick();
+    });
+
+    expect(browserButton.props["aria-pressed"]).toBe(false);
+    expect(edgeButton.props["aria-pressed"]).toBe(true);
+    expect(setItem).toHaveBeenCalledWith(
+      "lantor.voiceConsoleSettings",
+      expect.stringContaining("\"provider\":\"edge\""),
+    );
 
     await act(async () => {
       renderer.unmount();
@@ -1033,6 +1092,110 @@ describe("Call Console controls", () => {
     await act(async () => {
       renderer.unmount();
     });
+  });
+
+  it("uses the selected Edge provider for wake-only acknowledgement barge-in speech", async () => {
+    Object.defineProperty(globalThis.window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: vi.fn((key: string) => key === "lantor.voiceConsoleSettings"
+          ? JSON.stringify({
+            mode: "wake_word",
+            wakeWords: "小美",
+            tts: { provider: "edge", language: "zh-CN", voice: "zh-CN-XiaoxiaoNeural", rate: 1 },
+          })
+          : null),
+        setItem: vi.fn(),
+      },
+    });
+    const originalAudio = globalThis.Audio;
+    const createObjectUrlDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeObjectUrlDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const audioPlay = vi.fn(async () => undefined);
+    const audioPause = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:wake-edge-tts"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    Object.defineProperty(globalThis, "Audio", {
+      configurable: true,
+      value: class {
+        onended: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        src: string;
+        volume = 1;
+
+        constructor(src: string) {
+          this.src = src;
+        }
+
+        play = audioPlay;
+        pause = audioPause;
+      },
+    });
+    apiInvokeMock.mockResolvedValueOnce({
+      provider: "edge",
+      mime_type: "audio/mpeg",
+      bytes: [1, 2, 3],
+    });
+    const wakeAckBase = sequencedSubmitResult(1, "我在，您说。");
+    const wakeAckResult: CallUtteranceSubmitResult = {
+      ...wakeAckBase,
+      session: {
+        ...activeSession,
+        mode: "wake_word",
+        wake_words: "小美",
+      },
+      utterance: {
+        ...wakeAckBase.utterance,
+        transcript: "小美小美",
+        status: "acknowledged",
+      },
+      dispatch: {
+        ...wakeAckBase.dispatch,
+        intent: "ack_only",
+        status: "acknowledged",
+        work_item_id: null,
+      },
+      work_item_id: null,
+    };
+    const wakeWordSession: CallSession = {
+      ...activeSession,
+      mode: "wake_word",
+      wake_words: "小美",
+    };
+
+    let renderer!: ReactTestRenderer;
+    try {
+      mockCallModeState({ session: wakeWordSession, submitResults: [wakeAckResult] });
+      await act(async () => {
+        renderer = create(<CallConsole {...baseCallConsoleProps()} />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(apiInvokeMock).toHaveBeenCalledWith("synthesize_tts_audio", expect.objectContaining({
+        provider: "edge",
+        text: "我在，您说。",
+        voice: "zh-CN-XiaoxiaoNeural",
+      }));
+      expect(audioPlay).toHaveBeenCalledTimes(1);
+      expect(speechSpeak).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => {
+        renderer?.unmount();
+      });
+      if (originalAudio === undefined) delete (globalThis as Partial<typeof globalThis>).Audio;
+      else Object.defineProperty(globalThis, "Audio", { configurable: true, value: originalAudio });
+      if (createObjectUrlDescriptor) Object.defineProperty(URL, "createObjectURL", createObjectUrlDescriptor);
+      else delete (URL as Partial<typeof URL>).createObjectURL;
+      if (revokeObjectUrlDescriptor) Object.defineProperty(URL, "revokeObjectURL", revokeObjectUrlDescriptor);
+      else delete (URL as Partial<typeof URL>).revokeObjectURL;
+    }
   });
 
   it("seeds ordered ACK speech from resumed call state", async () => {
