@@ -104,7 +104,11 @@ function callConsoleModeLabel(mode: string | null | undefined) {
 }
 
 function cancelBrowserCallSpeech() {
-  if (typeof window !== "undefined" && "speechSynthesis" in window) {
+  if (
+    typeof window !== "undefined"
+    && "speechSynthesis" in window
+    && window.speechSynthesis
+  ) {
     window.speechSynthesis.cancel();
   }
 }
@@ -765,29 +769,70 @@ export function CallConsole({
     return current;
   }
 
-  function queueBrowserCallSpeechAtFront(text: string, resumeQueue: QueuedCallSpeech[]) {
+  function queueCallSpeechAtFront(text: string, resumeQueue: QueuedCallSpeech[]) {
     const trimmed = normalizeCallSpeechText(text);
+    const settings = callTtsSettingsRef.current;
     const chunks = callSpeechChunks(trimmed);
     if (
       chunks.length === 0
       || typeof window === "undefined"
-      || !("speechSynthesis" in window)
-      || typeof SpeechSynthesisUtterance === "undefined"
+      || (settings.provider === "browser" && (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined"))
     ) {
       setCallSpeechQueue([...resumeQueue, ...callSpeechQueueRef.current]);
       playNextCallSpeech();
       return false;
     }
     const speechId = ++callSpeechMessageIdRef.current;
-    const wakeSpeech = chunks.map((chunk) => ({
-      id: ++callSpeechJobIdRef.current,
-      speechId,
-      text: chunk,
-      audioUrl: null,
-      provider: "browser" as const,
-    }));
-    setCallSpeechQueue([...wakeSpeech, ...resumeQueue, ...callSpeechQueueRef.current]);
-    playNextCallSpeech();
+    if (settings.provider === "browser") {
+      const wakeSpeech = chunks.map((chunk) => ({
+        id: ++callSpeechJobIdRef.current,
+        speechId,
+        text: chunk,
+        audioUrl: null,
+        provider: "browser" as const,
+      }));
+      setCallSpeechQueue([...wakeSpeech, ...resumeQueue, ...callSpeechQueueRef.current]);
+      playNextCallSpeech();
+      return true;
+    }
+    const generation = callSpeechGenerationRef.current;
+    const jobs = chunks.map((chunk) => {
+      const id = ++callSpeechJobIdRef.current;
+      return synthesizeCallTtsAudio(chunk, settings)
+        .then((audio) => ({
+          id,
+          speechId,
+          text: chunk,
+          audioUrl: audio.url,
+          provider: settings.provider,
+        }))
+        .catch((err) => {
+          if (generation !== callSpeechGenerationRef.current) return null;
+          setCallTtsStatus(err instanceof Error ? err.message : "TTS provider failed; using browser voice.");
+          return {
+            id,
+            speechId,
+            text: chunk,
+            audioUrl: null,
+            provider: "browser" as const,
+          };
+        });
+    });
+    void Promise.all(jobs).then((wakeSpeech) => {
+      if (generation !== callSpeechGenerationRef.current) {
+        for (const item of wakeSpeech) {
+          if (item?.audioUrl) URL.revokeObjectURL(item.audioUrl);
+        }
+        return;
+      }
+      if (wakeSpeech.every((item) => item?.provider === settings.provider)) setCallTtsStatus("");
+      setCallSpeechQueue([
+        ...wakeSpeech.filter((item): item is QueuedCallSpeech => item !== null),
+        ...resumeQueue,
+        ...callSpeechQueueRef.current,
+      ]);
+      playNextCallSpeech();
+    });
     return true;
   }
 
@@ -826,7 +871,9 @@ export function CallConsole({
     }
     if (policy === "barge-in-resume") {
       interruptCurrentCallSpeechForVoice({ requeueCurrent: false });
-      return queueBrowserCallSpeechAtFront(trimmed, []);
+      const resumeQueue = callSpeechQueueRef.current;
+      setCallSpeechQueue([]);
+      return queueCallSpeechAtFront(trimmed, resumeQueue);
     }
     if (policy === "barge-in") {
       stopCallSpeech();

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     models::{
         Agent, AgentActivity, AgentRunPatch, AgentWorkItemPatch, Artifact, CallDispatch,
-        CallSession, CallUtterance, ChannelMember, Message,
+        CallSession, CallUtterance, Channel, ChannelMember, Message,
     },
     CommandResult, SUPERVISOR_WAKE_CHANNEL, UI_REFRESH_CHANNEL,
 };
@@ -295,6 +295,19 @@ pub(crate) async fn notify_ui_refresh(pool: &SqlitePool, reason: &str) -> Comman
         pool,
         UI_REFRESH_CHANNEL,
         &json!({ "type": "refresh", "reason": reason }).to_string(),
+    )
+    .await
+}
+
+pub(crate) async fn notify_ui_channel_upsert(
+    pool: &SqlitePool,
+    channel: &Channel,
+    reason: &str,
+) -> CommandResult<()> {
+    notify_database_event(
+        pool,
+        UI_REFRESH_CHANNEL,
+        &json!({ "type": "channel_upsert", "reason": reason, "channel": channel }).to_string(),
     )
     .await
 }

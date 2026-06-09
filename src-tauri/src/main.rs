@@ -74,8 +74,8 @@ use dispatch::{
 use events::{
     load_ui_backend_event_payload, notify_supervisor_wake, notify_ui_activity_upsert,
     notify_ui_agent_run_upsert, notify_ui_agent_upsert, notify_ui_artifact_upsert,
-    notify_ui_channel_member_delete, notify_ui_channel_member_upsert, notify_ui_message_delete,
-    notify_ui_message_delta, notify_ui_message_upsert, notify_ui_refresh,
+    notify_ui_channel_member_delete, notify_ui_channel_member_upsert, notify_ui_channel_upsert,
+    notify_ui_message_delete, notify_ui_message_delta, notify_ui_message_upsert, notify_ui_refresh,
     notify_ui_work_item_upsert,
 };
 #[cfg(test)]
@@ -147,6 +147,7 @@ const MAX_FETCH_MESSAGES_LIMIT: i64 = 500;
 const CODEX_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CODEX_IDLE_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const CODEX_TURN_START_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(test)]
 const CODEX_ACTIVE_TURN_IDLE_TIMEOUT: Duration = CODEX_IDLE_TIMEOUT;
 const SUPERVISOR_COMMAND_CONCURRENCY: usize = 4;
 const SUPERVISOR_IDLE_SLEEP: Duration = Duration::from_secs(2);
@@ -2645,7 +2646,11 @@ pub(crate) async fn update_channel_in_pool(
     .await
     .map_err(to_string)?;
 
-    let _ = notify_ui_refresh(pool, "channel_updated").await;
+    if let Some(channel) = load_channel(pool, channel_id).await? {
+        let _ = notify_ui_channel_upsert(pool, &channel, "channel_updated").await;
+    } else {
+        let _ = notify_ui_refresh(pool, "channel_updated").await;
+    }
     Ok(())
 }
 
@@ -6772,6 +6777,46 @@ async fn load_channels(pool: &SqlitePool) -> CommandResult<Vec<Channel>> {
             unread_count: row.get("unread_count"),
         })
         .collect())
+}
+
+async fn load_channel(pool: &SqlitePool, channel_id: Uuid) -> CommandResult<Option<Channel>> {
+    let visible_message_sql = backend_visible_message_sql("m");
+    let row = sqlx::query(&format!(
+        r#"
+        select
+            c.id,
+            c.name,
+            c.description,
+            c.kind,
+            c.dm_agent_id,
+            cast(count(m.id) filter (
+                where julianday(m.created_at) > julianday(
+                    coalesce(r.last_read_at, '0001-01-01T00:00:00+00:00')
+                )
+                  and m.sender_role <> 'owner'
+                  and {visible_message_sql}
+            ) as integer) as unread_count
+        from channels c
+        left join channel_read_state r on r.channel_id = c.id
+        left join messages m on m.channel_id = c.id
+        where c.id = $1
+          and c.kind <> 'voice'
+        group by c.id, c.name, c.description, c.kind, c.dm_agent_id
+        "#
+    ))
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+
+    Ok(row.map(|row| Channel {
+        id: row.get("id"),
+        name: row.get("name"),
+        description: row.get("description"),
+        kind: row.get("kind"),
+        dm_agent_id: row.get("dm_agent_id"),
+        unread_count: row.get("unread_count"),
+    }))
 }
 
 async fn load_thread_activities(pool: &SqlitePool) -> CommandResult<Vec<ThreadActivity>> {
@@ -22391,6 +22436,72 @@ inline `@kunk` and after @longbaby
                 Err(err) => err,
             };
             assert_eq!(err, "channel #alpha already exists");
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn channel_update_emits_targeted_ui_event() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let channel_id = create_channel_in_pool(&pool, "settings-room", "old").await?;
+            let last_event_id = latest_ui_event_id(&pool).await?;
+
+            update_channel_in_pool(
+                &pool,
+                channel_id,
+                "renamed-room".to_owned(),
+                "new description".to_owned(),
+            )
+            .await?;
+
+            let payload: String = sqlx::query_scalar(
+                r#"
+                select event_json
+                from ui_events
+                where id > $1 and json_extract(event_json, '$.type') = 'channel_upsert'
+                order by id desc
+                limit 1
+                "#,
+            )
+            .bind(last_event_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let event: Value = serde_json::from_str(&payload).map_err(|err| err.to_string())?;
+            let channel_id_string = channel_id.to_string();
+            assert_eq!(
+                event.pointer("/channel/id").and_then(Value::as_str),
+                Some(channel_id_string.as_str())
+            );
+            assert_eq!(
+                event.pointer("/channel/name").and_then(Value::as_str),
+                Some("renamed-room")
+            );
+            assert_eq!(
+                event
+                    .pointer("/channel/description")
+                    .and_then(Value::as_str),
+                Some("new description")
+            );
+
+            let refresh_count: i64 = sqlx::query_scalar(
+                r#"
+                select count(*)
+                from ui_events
+                where id > $1 and json_extract(event_json, '$.type') = 'refresh'
+                "#,
+            )
+            .bind(last_event_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(refresh_count, 0);
             Ok(())
         }
         .await;

@@ -92,6 +92,41 @@ db_active_pids() {
   " 2>/dev/null | awk '/^[0-9]+$/ {print}' | sort -u
 }
 
+active_agent_runs() {
+  if [[ ! -f "$DB_PATH" ]] || ! command -v sqlite3 >/dev/null 2>&1; then
+    return
+  fi
+  sqlite3 "$DB_PATH" "
+    select
+      coalesce(a.handle, hex(r.agent_id)) || ' run=' || lower(hex(r.id)) ||
+      case when r.work_item_id is not null then ' work=' || lower(hex(r.work_item_id)) else '' end ||
+      case when r.pid is not null then ' pid=' || r.pid else '' end ||
+      ' status=' || r.status
+    from agent_runs r
+    left join agents a on a.id = r.agent_id
+    where r.stopped_at is null
+      and r.status in ('starting','running','stopping')
+    order by r.started_at asc;
+  " 2>/dev/null
+}
+
+guard_no_active_agent_runs() {
+  local active
+  active="$(active_agent_runs || true)"
+  if [[ -z "$active" || "${LANTOR_FORCE_RESTART:-}" == "1" ]]; then
+    if [[ -n "$active" && "${LANTOR_FORCE_RESTART:-}" == "1" ]]; then
+      log "LANTOR_FORCE_RESTART=1 set; restarting despite active agent runs:"
+      printf '%s\n' "$active" >&2
+    fi
+    return
+  fi
+
+  log "refusing restart because active agent runs would be orphaned:"
+  printf '%s\n' "$active" >&2
+  log "wait for them to finish, cancel them first, or rerun with LANTOR_FORCE_RESTART=1"
+  exit 3
+}
+
 stop_lantor_dev() {
   log "repo: $ROOT_DIR"
   log "database: $DB_PATH"
@@ -152,6 +187,7 @@ case "$MODE" in
     status_lantor_dev
     ;;
   restart)
+    guard_no_active_agent_runs
     stop_lantor_dev
     log "starting npm run tauri:dev"
     cd "$ROOT_DIR"

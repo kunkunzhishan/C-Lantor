@@ -24,7 +24,9 @@ export const DEFAULT_VOICE_CONSOLE_SETTINGS: VoiceConsoleSettings = {
 
 export function normalizeVoiceWakeSettings(value: Partial<VoiceWakeSettings> | null | undefined): VoiceWakeSettings {
   const mode = value?.mode === "call" ? "call" : DEFAULT_VOICE_CONSOLE_SETTINGS.mode;
-  const wakeWords = value?.wakeWords?.trim() || DEFAULT_VOICE_CONSOLE_SETTINGS.wakeWords;
+  const wakeWords = typeof value?.wakeWords === "string"
+    ? value.wakeWords
+    : DEFAULT_VOICE_CONSOLE_SETTINGS.wakeWords;
   return { mode, wakeWords };
 }
 
