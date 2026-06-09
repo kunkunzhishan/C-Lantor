@@ -796,17 +796,17 @@ export function CallConsole({
       return true;
     }
     const generation = callSpeechGenerationRef.current;
-    const jobs = chunks.map((chunk) => {
+    const jobs: Promise<QueuedCallSpeech | null>[] = chunks.map((chunk) => {
       const id = ++callSpeechJobIdRef.current;
       return synthesizeCallTtsAudio(chunk, settings)
-        .then((audio) => ({
+        .then((audio): QueuedCallSpeech => ({
           id,
           speechId,
           text: chunk,
           audioUrl: audio.url,
           provider: settings.provider,
         }))
-        .catch((err) => {
+        .catch((err): QueuedCallSpeech | null => {
           if (generation !== callSpeechGenerationRef.current) return null;
           setCallTtsStatus(err instanceof Error ? err.message : "TTS provider failed; using browser voice.");
           return {
