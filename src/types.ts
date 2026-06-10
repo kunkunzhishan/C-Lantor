@@ -217,6 +217,23 @@ export type AgentSchedule = {
   updated_at: string;
 };
 
+export type EventHook = {
+  id: string;
+  agent_id: string;
+  agent_handle: string;
+  channel_id: string;
+  channel_name: string;
+  thread_root_id: string | null;
+  title: string;
+  body_preview: string;
+  external_resources: unknown[];
+  status: string;
+  fired_count: number;
+  max_fires: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type AgentRun = {
   id: string;
   agent_id: string;
@@ -393,6 +410,7 @@ export type Bootstrap = {
   long_tasks: LongTask[];
   reminders: Reminder[];
   agent_schedules: AgentSchedule[];
+  event_hooks: EventHook[];
   agent_runs: AgentRun[];
   agent_work_items: AgentWorkItem[];
   call_sessions: CallSession[];
@@ -486,7 +504,16 @@ export type SearchResult = {
   senderRole?: string | null;
 };
 
-export type ActivityFeedKind = "mention" | "dm" | "thread" | "task" | "reminder" | "channel";
+export type ActivityFeedKind =
+  | "mention"
+  | "dm"
+  | "thread"
+  | "task"
+  | "reminder"
+  | "channel"
+  | "schedule"
+  | "hook"
+  | "activity";
 
 export type ActivityFeedItem = {
   id: string;

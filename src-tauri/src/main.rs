@@ -51,7 +51,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, State, WindowEvent
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
     process::Command,
-    sync::{Mutex as AsyncMutex, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, Semaphore},
     time::sleep,
 };
 use uuid::Uuid;
@@ -96,8 +96,8 @@ use models::{
     Agent, AgentActivity, AgentRun, AgentRunPatch, AgentSchedule, AgentWorkItem,
     AgentWorkItemPatch, AgentWorkspaceEntry, AgentWorkspaceFile, AgentWorkspaceListing, Artifact,
     AttachmentUpload, Bootstrap, CallHistoryPage, CallSession, CallUtteranceSubmitResult, Channel,
-    ChannelMember, LaunchAgentStatus, Message, MessageAttachment, OwnerProfile, Reminder,
-    RuntimeCheck, SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity,
+    ChannelMember, EventHook, LaunchAgentStatus, Message, MessageAttachment, OwnerProfile,
+    Reminder, RuntimeCheck, SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity,
     ThreadActivityParticipant, TodoItem,
 };
 #[cfg(test)]
@@ -167,6 +167,7 @@ const UI_REFRESH_METRICS_MAX_BYTES: usize = 5 * 1024 * 1024;
 const MAIN_WINDOW_STATE_FILE: &str = "main-window-state.json";
 const MAIN_WINDOW_MIN_WIDTH: u32 = 1180;
 const MAIN_WINDOW_MIN_HEIGHT: u32 = 760;
+const TRIGGER_WORKER_INTERVAL: Duration = Duration::from_secs(15);
 fn expand_home_path(value: &str) -> String {
     let value = value.trim();
     if value == "~" {
@@ -184,6 +185,25 @@ fn expand_home_path(value: &str) -> String {
 struct AppState {
     pool: SqlitePool,
     db_url: String,
+    trigger_notifier: Arc<Notify>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateEventHookInput {
+    agent_id: Uuid,
+    channel_id: Uuid,
+    thread_root_id: Option<Uuid>,
+    title: String,
+    body_preview: Option<String>,
+    code_language: Option<String>,
+    code_body: String,
+    hook_context: Option<Value>,
+    external_resources: Option<Value>,
+    fixture_request: Option<Value>,
+    timeout_ms: Option<i64>,
+    max_output_bytes: Option<i64>,
+    max_fires: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -872,18 +892,673 @@ async fn maybe_insert_work_item_system_message(
     Ok(())
 }
 
-fn spawn_reminder_worker(pool: SqlitePool) {
+fn notify_trigger_worker(notifier: &Notify) {
+    notifier.notify_one();
+}
+
+async fn run_trigger_pass(pool: &SqlitePool) -> CommandResult<()> {
+    process_due_reminders(pool).await?;
+    process_due_agent_schedules(pool).await?;
+    Ok(())
+}
+
+fn spawn_trigger_worker_with_interval(
+    pool: SqlitePool,
+    notifier: Arc<Notify>,
+    interval: Duration,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         loop {
-            if let Err(err) = process_due_reminders(&pool).await {
-                eprintln!("Lantor reminder worker failed: {err}");
+            if let Err(err) = run_trigger_pass(&pool).await {
+                eprintln!("Lantor trigger worker failed: {err}");
             }
-            if let Err(err) = process_due_agent_schedules(&pool).await {
-                eprintln!("Lantor schedule worker failed: {err}");
+            tokio::select! {
+                _ = sleep(interval) => {}
+                _ = notifier.notified() => {}
             }
-            sleep(Duration::from_secs(15)).await;
         }
+    })
+}
+
+fn spawn_trigger_worker(pool: SqlitePool, notifier: Arc<Notify>) {
+    let _ = spawn_trigger_worker_with_interval(pool, notifier, TRIGGER_WORKER_INTERVAL);
+}
+
+fn normalize_hook_code_language(value: Option<String>) -> CommandResult<String> {
+    let language = value.unwrap_or_else(|| "javascript".to_owned());
+    let language = language.trim().to_ascii_lowercase();
+    if matches!(language.as_str(), "javascript" | "js") {
+        Ok("javascript".to_owned())
+    } else {
+        Err(format!("unsupported hook code language: {language}"))
+    }
+}
+
+fn normalize_hook_code_body(value: &str) -> CommandResult<String> {
+    let code = value.trim();
+    if code.is_empty() {
+        return Err("hook code is empty".to_owned());
+    }
+    if code.len() > 32 * 1024 {
+        return Err("hook code is too large".to_owned());
+    }
+    Ok(code.to_owned())
+}
+
+fn normalize_hook_context(value: Option<Value>) -> CommandResult<Value> {
+    let context = value.unwrap_or_else(|| json!({}));
+    if !context.is_object() {
+        return Err("hook context must be a JSON object".to_owned());
+    }
+    Ok(context)
+}
+
+fn normalize_hook_external_resources(value: Option<Value>) -> CommandResult<Value> {
+    let resources = value.unwrap_or_else(|| json!([]));
+    if !resources.is_array() {
+        return Err("hook external_resources must be a JSON array".to_owned());
+    }
+    if resources.to_string().len() > 16 * 1024 {
+        return Err("hook external_resources is too large".to_owned());
+    }
+    Ok(resources)
+}
+
+fn normalize_hook_timeout_ms(value: Option<i64>) -> CommandResult<i64> {
+    let timeout_ms = value.unwrap_or(1000);
+    if !(50..=10_000).contains(&timeout_ms) {
+        return Err("hook timeout_ms must be between 50 and 10000".to_owned());
+    }
+    Ok(timeout_ms)
+}
+
+fn normalize_hook_max_output_bytes(value: Option<i64>) -> CommandResult<i64> {
+    let max_output_bytes = value.unwrap_or(4096);
+    if !(256..=65_536).contains(&max_output_bytes) {
+        return Err("hook max_output_bytes must be between 256 and 65536".to_owned());
+    }
+    Ok(max_output_bytes)
+}
+
+fn new_hook_ingress_token() -> String {
+    format!("hk_{}", Uuid::new_v4().simple())
+}
+
+fn hook_code_hash(code: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(code.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug)]
+struct HookEvaluationInput {
+    hook_id: Uuid,
+    request: Option<Value>,
+    code_language: String,
+    code_body: String,
+    hook_context: Value,
+    timeout_ms: i64,
+    max_output_bytes: i64,
+}
+
+#[derive(Debug)]
+struct HookEvaluationOutput {
+    triggered: bool,
+    status: String,
+    stdout: String,
+    stderr: String,
+    duration_ms: i64,
+}
+
+fn truncate_hook_output(value: &[u8], max_output_bytes: i64) -> String {
+    let limit = max_output_bytes.max(0) as usize;
+    let bytes = if value.len() > limit {
+        &value[..limit]
+    } else {
+        value
+    };
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+async fn evaluate_hook_code(input: HookEvaluationInput) -> HookEvaluationOutput {
+    let started = Instant::now();
+    if input.code_language != "javascript" {
+        return HookEvaluationOutput {
+            triggered: false,
+            status: "failed".to_owned(),
+            stdout: String::new(),
+            stderr: format!("unsupported hook code language: {}", input.code_language),
+            duration_ms: 0,
+        };
+    }
+
+    let runner_script = r#"
+const fs = require("fs");
+const vm = require("vm");
+(async () => {
+  const input = JSON.parse(fs.readFileSync(0, "utf8"));
+  const sandbox = {
+    __hookJson: JSON.stringify(input.hook),
+    __contextJson: JSON.stringify(input.hook && input.hook.context ? input.hook.context : {}),
+    __requestJson: JSON.stringify(input.request || null)
+  };
+  const wrapped = `"use strict";
+const hook = JSON.parse(__hookJson);
+const context = JSON.parse(__contextJson);
+const request = JSON.parse(__requestJson);
+(async () => {
+${input.code}
+})()`;
+  const result = await vm.runInNewContext(wrapped, sandbox, {
+    timeout: input.timeout_ms,
+    codeGeneration: { strings: false, wasm: false }
+  });
+  if (typeof result !== "boolean") {
+    throw new Error("hook code must return a boolean");
+  }
+  process.stdout.write(JSON.stringify({ triggered: result }));
+})().catch((err) => {
+  process.stderr.write(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+"#;
+    let stdin_payload = json!({
+        "code": input.code_body,
+        "request": input.request,
+        "hook": {
+            "id": input.hook_id,
+            "context": input.hook_context,
+        },
+        "timeout_ms": input.timeout_ms,
+    })
+    .to_string();
+    let mut child = match Command::new("node")
+        .arg("-e")
+        .arg(runner_script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return HookEvaluationOutput {
+                triggered: false,
+                status: "failed".to_owned(),
+                stdout: String::new(),
+                stderr: err.to_string(),
+                duration_ms: started.elapsed().as_millis() as i64,
+            };
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(err) = stdin.write_all(stdin_payload.as_bytes()).await {
+            return HookEvaluationOutput {
+                triggered: false,
+                status: "failed".to_owned(),
+                stdout: String::new(),
+                stderr: err.to_string(),
+                duration_ms: started.elapsed().as_millis() as i64,
+            };
+        }
+    }
+    let output = match tokio::time::timeout(
+        Duration::from_millis(input.timeout_ms as u64),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            return HookEvaluationOutput {
+                triggered: false,
+                status: "failed".to_owned(),
+                stdout: String::new(),
+                stderr: err.to_string(),
+                duration_ms: started.elapsed().as_millis() as i64,
+            };
+        }
+        Err(_) => {
+            return HookEvaluationOutput {
+                triggered: false,
+                status: "timeout".to_owned(),
+                stdout: String::new(),
+                stderr: "hook code timed out".to_owned(),
+                duration_ms: started.elapsed().as_millis() as i64,
+            };
+        }
+    };
+    let stdout = truncate_hook_output(&output.stdout, input.max_output_bytes);
+    let stderr = truncate_hook_output(&output.stderr, input.max_output_bytes);
+    if !output.status.success() {
+        return HookEvaluationOutput {
+            triggered: false,
+            status: "failed".to_owned(),
+            stdout,
+            stderr,
+            duration_ms: started.elapsed().as_millis() as i64,
+        };
+    }
+    let result = serde_json::from_str::<Value>(&stdout).unwrap_or_else(|_| json!({}));
+    let Some(triggered) = result.get("triggered").and_then(Value::as_bool) else {
+        return HookEvaluationOutput {
+            triggered: false,
+            status: "failed".to_owned(),
+            stdout,
+            stderr: "hook runner returned invalid output".to_owned(),
+            duration_ms: started.elapsed().as_millis() as i64,
+        };
+    };
+    HookEvaluationOutput {
+        triggered,
+        status: if triggered {
+            "triggered"
+        } else {
+            "not_triggered"
+        }
+        .to_owned(),
+        stdout,
+        stderr,
+        duration_ms: started.elapsed().as_millis() as i64,
+    }
+}
+
+pub(crate) async fn process_hook_ingress_in_pool(
+    pool: &SqlitePool,
+    ingress_token: &str,
+    method: &str,
+    path: &str,
+    query: Value,
+    headers: Value,
+    body: Value,
+) -> CommandResult<Value> {
+    let token = ingress_token.trim();
+    if token.is_empty() {
+        return Err("hook ingress token is required".to_owned());
+    }
+    let hook_row = sqlx::query(
+        r#"
+        select id, agent_id, channel_id, thread_root_id, title, body_preview,
+               code_language, code_body, hook_context,
+               timeout_ms, max_output_bytes, max_fires, fired_count
+        from event_hooks
+        where ingress_token = $1 and status = 'active'
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    let Some(hook_row) = hook_row else {
+        return Err("hook ingress not found".to_owned());
+    };
+
+    let hook_id: Uuid = hook_row.get("id");
+    let max_fires: i64 = hook_row.get("max_fires");
+    let fired_count: i64 = hook_row.get("fired_count");
+    if fired_count >= max_fires {
+        return Ok(json!({"ok": true, "triggered": false, "status": "completed"}));
+    }
+
+    let request = json!({
+        "method": method,
+        "path": path,
+        "query": query,
+        "headers": headers,
+        "body": body,
+        "received_at": Utc::now().to_rfc3339(),
     });
+    let payload = json!({ "request": request.clone() });
+
+    let hook_context_json: String = hook_row.get("hook_context");
+    let hook_context =
+        serde_json::from_str::<Value>(&hook_context_json).unwrap_or_else(|_| json!({}));
+    let evaluation = evaluate_hook_code(HookEvaluationInput {
+        hook_id,
+        request: Some(request),
+        code_language: hook_row.get("code_language"),
+        code_body: hook_row.get("code_body"),
+        hook_context: hook_context.clone(),
+        timeout_ms: hook_row.get("timeout_ms"),
+        max_output_bytes: hook_row.get("max_output_bytes"),
+    })
+    .await;
+    sqlx::query(
+        r#"
+        insert into event_hook_runs (
+            hook_id, status, triggered,
+            stdout, stderr, duration_ms
+        )
+        values ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(hook_id)
+    .bind(&evaluation.status)
+    .bind(evaluation.triggered)
+    .bind(&evaluation.stdout)
+    .bind(&evaluation.stderr)
+    .bind(evaluation.duration_ms)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+
+    if !evaluation.triggered {
+        return Ok(json!({
+            "ok": true,
+            "triggered": false,
+            "status": evaluation.status
+        }));
+    }
+    fire_event_hook_to_agent(
+        pool,
+        hook_id,
+        hook_row.get("agent_id"),
+        hook_row.get("channel_id"),
+        hook_row.get("thread_root_id"),
+        &hook_row.get::<String, _>("title"),
+        &hook_row.get::<String, _>("body_preview"),
+        &payload,
+        &hook_context,
+    )
+    .await?;
+    sqlx::query(
+        r#"
+        update event_hooks
+        set fired_count = fired_count + 1,
+            status = case when fired_count + 1 >= max_fires then 'completed' else status end,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+        where id = $1
+        "#,
+    )
+    .bind(hook_id)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+    let _ = notify_ui_refresh(pool, "event_hook_fired").await;
+    Ok(json!({
+        "ok": true,
+        "triggered": true,
+        "status": evaluation.status
+    }))
+}
+
+async fn create_event_hook_in_pool(
+    pool: &SqlitePool,
+    input: CreateEventHookInput,
+) -> CommandResult<Uuid> {
+    let title = input.title.trim();
+    if title.is_empty() {
+        return Err("hook title is empty".to_owned());
+    }
+    let code_language = normalize_hook_code_language(input.code_language)?;
+    let code_body = normalize_hook_code_body(&input.code_body)?;
+    let code_hash = hook_code_hash(&code_body);
+    let hook_context = normalize_hook_context(input.hook_context)?;
+    let external_resources = normalize_hook_external_resources(input.external_resources)?;
+    let timeout_ms = normalize_hook_timeout_ms(input.timeout_ms)?;
+    let max_output_bytes = normalize_hook_max_output_bytes(input.max_output_bytes)?;
+    let max_fires = input.max_fires.unwrap_or(1);
+    if !(1..=10_000).contains(&max_fires) {
+        return Err("hook max_fires must be between 1 and 10000".to_owned());
+    }
+    let agent_exists: bool =
+        sqlx::query_scalar("select exists(select 1 from agents where id = $1)")
+            .bind(input.agent_id)
+            .fetch_one(pool)
+            .await
+            .map_err(to_string)?;
+    if !agent_exists {
+        return Err("agent does not exist".to_owned());
+    }
+    let channel_exists: bool =
+        sqlx::query_scalar("select exists(select 1 from channels where id = $1)")
+            .bind(input.channel_id)
+            .fetch_one(pool)
+            .await
+            .map_err(to_string)?;
+    if !channel_exists {
+        return Err("channel does not exist".to_owned());
+    }
+    if let Some(thread_root_id) = input.thread_root_id {
+        let root_channel: Option<Uuid> = sqlx::query_scalar(
+            "select channel_id from messages where id = $1 and thread_root_id is null",
+        )
+        .bind(thread_root_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(to_string)?;
+        if root_channel != Some(input.channel_id) {
+            return Err("thread root does not belong to target channel".to_owned());
+        }
+    }
+    sqlx::query(
+        r#"
+        insert into channel_members (channel_id, agent_id)
+        values ($1, $2)
+        on conflict (channel_id, agent_id) do nothing
+        "#,
+    )
+    .bind(input.channel_id)
+    .bind(input.agent_id)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+
+    let validation = evaluate_hook_code(HookEvaluationInput {
+        hook_id: Uuid::nil(),
+        request: input.fixture_request.clone(),
+        code_language: code_language.clone(),
+        code_body: code_body.clone(),
+        hook_context: hook_context.clone(),
+        timeout_ms,
+        max_output_bytes,
+    })
+    .await;
+    if !matches!(validation.status.as_str(), "triggered" | "not_triggered") {
+        return Err(format!("hook validation failed: {}", validation.stderr));
+    }
+    let body_preview = input
+        .body_preview
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(500)
+        .collect::<String>();
+    let hook_id: Uuid = sqlx::query_scalar(
+        r#"
+        insert into event_hooks (
+            agent_id, channel_id, thread_root_id, title, body_preview,
+            source_type, ingress_token, event_type, subject, code_language, code_body, code_hash,
+            hook_context, external_resources, fixture_event, validation_status, timeout_ms,
+            max_output_bytes, max_fires
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'valid', $16, $17, $18)
+        returning id
+        "#,
+    )
+    .bind(input.agent_id)
+    .bind(input.channel_id)
+    .bind(input.thread_root_id)
+    .bind(title)
+    .bind(body_preview)
+    .bind("hook")
+    .bind(Some(new_hook_ingress_token()))
+    .bind("hook.request")
+    .bind(Option::<String>::None)
+    .bind(code_language)
+    .bind(code_body)
+    .bind(&code_hash)
+    .bind(hook_context.to_string())
+    .bind(external_resources.to_string())
+    .bind(json!({}).to_string())
+    .bind(timeout_ms)
+    .bind(max_output_bytes)
+    .bind(max_fires)
+    .fetch_one(pool)
+    .await
+    .map_err(to_string)?;
+    sqlx::query(
+        r#"
+        insert into event_hook_events (hook_id, event_type, detail)
+        values ($1, 'created', $2)
+        "#,
+    )
+    .bind(hook_id)
+    .bind(
+        json!({
+        "validation_status": validation.status,
+            "validation_stdout": validation.stdout,
+            "validation_stderr": validation.stderr,
+            "code_hash": code_hash
+        })
+        .to_string(),
+    )
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+    Ok(hook_id)
+}
+
+async fn delete_event_hook_in_pool(
+    pool: &SqlitePool,
+    agent_id: Option<Uuid>,
+    hook_id: Uuid,
+) -> CommandResult<Value> {
+    let hook_row = sqlx::query(
+        r#"
+        select id, agent_id, title, ingress_token, external_resources
+        from event_hooks
+        where id = $1
+        "#,
+    )
+    .bind(hook_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    let Some(hook_row) = hook_row else {
+        return Err("hook not found".to_owned());
+    };
+    let hook_agent_id: Uuid = hook_row.get("agent_id");
+    if agent_id.is_some_and(|agent_id| agent_id != hook_agent_id) {
+        return Err("hook belongs to another agent".to_owned());
+    }
+
+    let ingress_token: Option<String> = hook_row.get("ingress_token");
+    let title: String = hook_row.get("title");
+    let external_resources_json: String = hook_row.get("external_resources");
+    let external_resources =
+        serde_json::from_str::<Value>(&external_resources_json).unwrap_or_else(|_| json!([]));
+    sqlx::query("delete from event_hook_runs where hook_id = $1")
+        .bind(hook_id)
+        .execute(pool)
+        .await
+        .map_err(to_string)?;
+    sqlx::query("delete from event_hook_events where hook_id = $1")
+        .bind(hook_id)
+        .execute(pool)
+        .await
+        .map_err(to_string)?;
+    sqlx::query("delete from event_hooks where id = $1")
+        .bind(hook_id)
+        .execute(pool)
+        .await
+        .map_err(to_string)?;
+
+    let lantor_ingress = ingress_token.as_ref().map(|token| {
+        json!({
+            "kind": "lantor_ingress",
+            "token": token,
+            "path": format!("/api/hooks/{token}/ingress"),
+            "cleanup": "deleted with this hook inside Lantor"
+        })
+    });
+    Ok(json!({
+        "hook_id": hook_id,
+        "title": title,
+        "internal_cleanup": {
+            "event_hook": true,
+            "runs": true,
+            "events": true
+        },
+        "removed_lantor_resources": {
+            "ingress": lantor_ingress
+        },
+        "pending_external_cleanup": external_resources,
+        "agent_responsibility": "inspect pending_external_cleanup and remove those provider-side or network resources if they still exist"
+    }))
+}
+
+async fn fire_event_hook_to_agent(
+    pool: &SqlitePool,
+    hook_id: Uuid,
+    agent_id: Uuid,
+    channel_id: Uuid,
+    thread_root_id: Option<Uuid>,
+    title: &str,
+    body_preview: &str,
+    payload: &Value,
+    hook_context: &Value,
+) -> CommandResult<()> {
+    if !agent_accepts_new_work(pool, agent_id).await? {
+        return Ok(());
+    }
+    sqlx::query(
+        r#"
+        insert into channel_members (channel_id, agent_id)
+        values ($1, $2)
+        on conflict (channel_id, agent_id) do nothing
+        "#,
+    )
+    .bind(channel_id)
+    .bind(agent_id)
+    .execute(pool)
+    .await
+    .map_err(to_string)?;
+
+    let inbox_item_id = create_agent_inbox_item(
+        pool,
+        AgentInboxItemInput {
+            agent_id,
+            channel_id: Some(channel_id),
+            thread_root_id,
+            source_message_id: None,
+            task_id: None,
+            kind: "event_hook_fired",
+            priority: 85,
+            title,
+            body_preview,
+            payload: json!({
+                "hook_id": hook_id,
+                "payload": payload,
+                "hook_context": hook_context
+            }),
+        },
+    )
+    .await?;
+    let wake = ensure_agent_inbox_wake_work_item(pool, agent_id).await?;
+    let scheduled = wake.is_some_and(|(_, scheduled)| scheduled);
+    record_agent_activity(
+        pool,
+        Some(agent_id),
+        None,
+        "hook",
+        if scheduled {
+            "Event hook dispatched"
+        } else {
+            "Event hook queued"
+        },
+        json!({
+            "hook_id": hook_id,
+            "inbox_item_id": inbox_item_id,
+            "title": title,
+            "body_preview": body_preview,
+            "channel_id": channel_id,
+            "thread_root_id": thread_root_id
+        })
+        .to_string(),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn process_due_reminders(pool: &SqlitePool) -> CommandResult<()> {
@@ -951,30 +1626,41 @@ async fn process_due_reminders(pool: &SqlitePool) -> CommandResult<()> {
         .await?;
 
         if let Some(channel_id) = channel_id {
-            let mut body = format!("Reminder: {title}");
-            if !note.trim().is_empty() {
-                body.push_str(&format!("\n{}", note.trim()));
+            if let Some(agent_id) = creator_agent_id {
+                let _ = dispatch_due_reminder_to_agent(
+                    pool,
+                    reminder_id,
+                    agent_id,
+                    channel_id,
+                    thread_root_id,
+                    &title,
+                    &note,
+                    next_status,
+                    stored_due_at,
+                )
+                .await;
             }
-            if next_status == "scheduled" {
-                body.push_str(&format!("\nNext reminder: {}", stored_due_at.to_rfc3339()));
-            }
-            if let Ok(message_id) =
-                insert_system_message(pool, channel_id, thread_root_id, body).await
-            {
-                if let Some(agent_id) = creator_agent_id {
-                    let _ = dispatch_due_reminder_to_agent(
-                        pool,
-                        reminder_id,
-                        agent_id,
-                        channel_id,
-                        thread_root_id,
-                        message_id,
-                        &title,
-                        &note,
-                    )
-                    .await;
-                }
-            }
+            let _ = record_agent_activity(
+                pool,
+                creator_agent_id,
+                None,
+                "reminder",
+                "Reminder fired",
+                json!({
+                    "reminder_id": reminder_id,
+                    "title": title,
+                    "note": note,
+                    "channel_id": channel_id,
+                    "next_status": next_status,
+                    "next_due_at": if next_status == "scheduled" {
+                        Some(stored_due_at.to_rfc3339())
+                    } else {
+                        None
+                    }
+                })
+                .to_string(),
+            )
+            .await;
         }
     }
     if fired_any {
@@ -989,9 +1675,10 @@ async fn dispatch_due_reminder_to_agent(
     agent_id: Uuid,
     channel_id: Uuid,
     thread_root_id: Option<Uuid>,
-    source_message_id: Uuid,
     title: &str,
     note: &str,
+    next_status: &str,
+    stored_due_at: DateTime<Utc>,
 ) -> CommandResult<()> {
     if !agent_accepts_new_work(pool, agent_id).await? {
         return Ok(());
@@ -1009,20 +1696,29 @@ async fn dispatch_due_reminder_to_agent(
     .await
     .map_err(to_string)?;
 
-    let work_thread_root_id = thread_root_id.or(Some(source_message_id));
     let inbox_item_id = create_agent_inbox_item(
         pool,
         AgentInboxItemInput {
             agent_id,
             channel_id: Some(channel_id),
-            thread_root_id: work_thread_root_id,
-            source_message_id: Some(source_message_id),
+            thread_root_id,
+            source_message_id: None,
             task_id: None,
             kind: "reminder_due",
             priority: 90,
             title,
             body_preview: note,
-            payload: json!({"reminder_id": reminder_id}),
+            payload: json!({
+                "reminder_id": reminder_id,
+                "title": title,
+                "note": note,
+                "next_status": next_status,
+                "next_due_at": if next_status == "scheduled" {
+                    Some(stored_due_at.to_rfc3339())
+                } else {
+                    None
+                }
+            }),
         },
     )
     .await?;
@@ -1041,7 +1737,11 @@ async fn dispatch_due_reminder_to_agent(
         json!({
             "reminder_id": reminder_id,
             "inbox_item_id": inbox_item_id,
-            "source_message_id": source_message_id
+            "title": title,
+            "note": note,
+            "channel_id": channel_id,
+            "thread_root_id": thread_root_id,
+            "next_status": next_status
         })
         .to_string(),
     )
@@ -1090,7 +1790,7 @@ async fn process_due_agent_schedules(pool: &SqlitePool) -> CommandResult<()> {
     for row in rows {
         let schedule_id: Uuid = row.get("id");
         let agent_id: Uuid = row.get("agent_id");
-        let agent_handle: String = row.get("agent_handle");
+        let _agent_handle: String = row.get("agent_handle");
         let channel_id: Uuid = row.get("channel_id");
         let channel_name: String = row.get("channel_name");
         let thread_root_id: Option<Uuid> = row.get("thread_root_id");
@@ -1102,26 +1802,28 @@ async fn process_due_agent_schedules(pool: &SqlitePool) -> CommandResult<()> {
             continue;
         }
 
-        let system_body = format!(
-            "Scheduled routine for @{agent_handle}: {title}\nNext run: {}",
-            next_run_at.to_rfc3339()
-        );
-        let source_message_id =
-            insert_system_message(pool, channel_id, thread_root_id, system_body).await?;
-        let work_thread_root_id = thread_root_id.or(Some(source_message_id));
         let inbox_item_id = create_agent_inbox_item(
             pool,
             AgentInboxItemInput {
                 agent_id,
                 channel_id: Some(channel_id),
-                thread_root_id: work_thread_root_id,
-                source_message_id: Some(source_message_id),
+                thread_root_id,
+                source_message_id: None,
                 task_id: None,
                 kind: "schedule_due",
                 priority: 75,
                 title: &title,
                 body_preview: &prompt,
-                payload: json!({"schedule_id": schedule_id, "cadence": &cadence}),
+                payload: json!({
+                    "schedule_id": schedule_id,
+                    "title": title,
+                    "prompt": prompt,
+                    "cadence": &cadence,
+                    "next_run_at": next_run_at.to_rfc3339(),
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "thread_root_id": thread_root_id
+                }),
             },
         )
         .await?;
@@ -1152,6 +1854,10 @@ async fn process_due_agent_schedules(pool: &SqlitePool) -> CommandResult<()> {
                 "schedule_id": schedule_id,
                 "work_item_id": work_item_id,
                 "inbox_item_id": inbox_item_id,
+                "title": title,
+                "prompt": prompt,
+                "channel_id": channel_id,
+                "thread_root_id": thread_root_id,
                 "channel": format!("#{channel_name}"),
                 "cadence": cadence,
                 "next_run_at": next_run_at.to_rfc3339()
@@ -1384,6 +2090,56 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )
         "#,
         r#"
+        create table if not exists event_hooks (
+            id blob primary key not null default (randomblob(16)),
+            agent_id blob not null references agents(id) on delete cascade,
+            channel_id blob not null references channels(id) on delete cascade,
+            thread_root_id blob references messages(id) on delete set null,
+            title text not null,
+            body_preview text not null default '',
+            source_type text not null default 'hook',
+            ingress_token text unique,
+            event_type text not null default 'hook.request',
+            subject text,
+            code_language text not null default 'javascript',
+            code_body text not null,
+            code_hash text not null default '',
+            hook_context text not null default '{}',
+            external_resources text not null default '[]',
+            fixture_event text not null default '{}',
+            validation_status text not null default 'pending',
+            timeout_ms integer not null default 1000,
+            max_output_bytes integer not null default 4096,
+            status text not null default 'active',
+            max_fires integer not null default 1,
+            fired_count integer not null default 0,
+            last_event_row_id integer not null default 0,
+            created_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),
+            updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now'))
+        )
+        "#,
+        r#"
+        create table if not exists event_hook_runs (
+            id blob primary key not null default (randomblob(16)),
+            hook_id blob not null references event_hooks(id) on delete cascade,
+            status text not null,
+            triggered boolean not null default 0,
+            stdout text not null default '',
+            stderr text not null default '',
+            duration_ms integer not null default 0,
+            created_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now'))
+        )
+        "#,
+        r#"
+        create table if not exists event_hook_events (
+            id blob primary key not null default (randomblob(16)),
+            hook_id blob not null references event_hooks(id) on delete cascade,
+            event_type text not null,
+            detail text not null default '',
+            created_at text not null default (strftime('%Y-%m-%dT%H:%M:%f+00:00','now'))
+        )
+        "#,
+        r#"
         create table if not exists agent_schedules (
             id blob primary key not null default (randomblob(16)),
             agent_id blob not null references agents(id) on delete cascade,
@@ -1580,6 +2336,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         sqlx::query(statement).execute(pool).await?;
     }
 
+    migrate_event_hooks_schema(pool).await?;
+
     for statement in [
         "create unique index if not exists channels_dm_unique on channels(dm_agent_id) where kind = 'dm' and dm_agent_id is not null",
         "create unique index if not exists messages_stream_key_unique on messages(stream_key) where stream_key <> ''",
@@ -1589,6 +2347,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "create index if not exists artifacts_message_id_idx on artifacts(message_id)",
         "create index if not exists artifacts_channel_id_idx on artifacts(channel_id)",
         "create index if not exists reminders_due_idx on reminders(status, due_at)",
+        "create unique index if not exists event_hooks_ingress_token_unique on event_hooks(ingress_token) where ingress_token is not null",
+        "create index if not exists event_hook_events_hook_created_idx on event_hook_events(hook_id, created_at)",
         "create index if not exists agent_schedules_due_idx on agent_schedules(status, next_run_at)",
         "create index if not exists agent_memory_observations_agent_created_idx on agent_memory_observations(agent_id, created_at desc)",
         "create index if not exists agent_memory_observations_layer_created_idx on agent_memory_observations(layer, created_at desc)",
@@ -1726,6 +2486,98 @@ async fn backfill_agent_memory_observations(pool: &SqlitePool) -> Result<(), sql
 
     backfill_agent_memory_observations_from_run_logs(pool).await?;
 
+    Ok(())
+}
+
+async fn migrate_event_hooks_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query("pragma table_info(event_hooks)")
+        .fetch_all(pool)
+        .await?;
+    let mut columns = rows
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<HashSet<_>>();
+    if !columns.contains("source_type") {
+        sqlx::query("alter table event_hooks add column source_type text not null default 'hook'")
+            .execute(pool)
+            .await?;
+        columns.insert("source_type".to_owned());
+    }
+    if !columns.contains("ingress_token") {
+        sqlx::query("alter table event_hooks add column ingress_token text")
+            .execute(pool)
+            .await?;
+        columns.insert("ingress_token".to_owned());
+    }
+    if !columns.contains("code_language") {
+        sqlx::query(
+            "alter table event_hooks add column code_language text not null default 'javascript'",
+        )
+        .execute(pool)
+        .await?;
+        columns.insert("code_language".to_owned());
+    }
+    if !columns.contains("code_body") {
+        sqlx::query(
+            "alter table event_hooks add column code_body text not null default 'return false;'",
+        )
+        .execute(pool)
+        .await?;
+        columns.insert("code_body".to_owned());
+    }
+    if !columns.contains("code_hash") {
+        sqlx::query("alter table event_hooks add column code_hash text not null default ''")
+            .execute(pool)
+            .await?;
+        columns.insert("code_hash".to_owned());
+    }
+    if !columns.contains("hook_context") {
+        sqlx::query("alter table event_hooks add column hook_context text not null default '{}'")
+            .execute(pool)
+            .await?;
+        columns.insert("hook_context".to_owned());
+    }
+    if !columns.contains("external_resources") {
+        sqlx::query(
+            "alter table event_hooks add column external_resources text not null default '[]'",
+        )
+        .execute(pool)
+        .await?;
+        columns.insert("external_resources".to_owned());
+    }
+    if !columns.contains("fixture_event") {
+        sqlx::query("alter table event_hooks add column fixture_event text not null default '{}'")
+            .execute(pool)
+            .await?;
+        columns.insert("fixture_event".to_owned());
+    }
+    if !columns.contains("validation_status") {
+        sqlx::query(
+            "alter table event_hooks add column validation_status text not null default 'pending'",
+        )
+        .execute(pool)
+        .await?;
+        columns.insert("validation_status".to_owned());
+    }
+    if !columns.contains("timeout_ms") {
+        sqlx::query("alter table event_hooks add column timeout_ms integer not null default 1000")
+            .execute(pool)
+            .await?;
+        columns.insert("timeout_ms".to_owned());
+    }
+    if !columns.contains("max_output_bytes") {
+        sqlx::query(
+            "alter table event_hooks add column max_output_bytes integer not null default 4096",
+        )
+        .execute(pool)
+        .await?;
+        columns.insert("max_output_bytes".to_owned());
+    }
+    sqlx::query(
+        "update event_hooks set source_type = 'hook' where source_type is null or source_type = '' or source_type = 'event'",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2414,6 +3266,7 @@ pub(crate) async fn load_bootstrap(pool: &SqlitePool, db_url: String) -> Command
     let long_tasks = load_long_tasks(pool).await?;
     let reminders = load_reminders(pool).await?;
     let agent_schedules = load_agent_schedules(pool).await?;
+    let event_hooks = load_event_hooks(pool).await?;
     let agent_runs = load_agent_runs(pool).await?;
     let agent_work_items = load_agent_work_items(pool).await?;
     let call_sessions = load_call_sessions(pool).await?;
@@ -2441,6 +3294,7 @@ pub(crate) async fn load_bootstrap(pool: &SqlitePool, db_url: String) -> Command
         long_tasks,
         reminders,
         agent_schedules,
+        event_hooks,
         agent_runs,
         agent_work_items,
         call_sessions,
@@ -6198,7 +7052,7 @@ async fn create_reminder(
     state: State<'_, AppState>,
 ) -> CommandResult<Uuid> {
     let due_at = parse_due_at(&due_at)?;
-    create_reminder_in_pool(
+    let reminder_id = create_reminder_in_pool(
         &state.pool,
         None,
         channel_id,
@@ -6209,7 +7063,9 @@ async fn create_reminder(
         due_at,
         &recurrence,
     )
-    .await
+    .await?;
+    notify_trigger_worker(&state.trigger_notifier);
+    Ok(reminder_id)
 }
 
 #[tauri::command]
@@ -6243,6 +7099,7 @@ async fn snooze_reminder(
     )
     .await?;
     let _ = notify_ui_refresh(&state.pool, "reminder_snoozed").await;
+    notify_trigger_worker(&state.trigger_notifier);
     Ok(())
 }
 
@@ -6387,6 +7244,7 @@ async fn create_agent_schedule(
     )
     .await?;
     let _ = notify_ui_refresh(&state.pool, "agent_schedule_created").await;
+    notify_trigger_worker(&state.trigger_notifier);
     Ok(schedule_id)
 }
 
@@ -6433,6 +7291,9 @@ async fn update_agent_schedule_status(
     )
     .await?;
     let _ = notify_ui_refresh(&state.pool, "agent_schedule_updated").await;
+    if status == "active" {
+        notify_trigger_worker(&state.trigger_notifier);
+    }
     Ok(())
 }
 
@@ -8076,6 +8937,62 @@ async fn load_agent_schedules(pool: &SqlitePool) -> CommandResult<Vec<AgentSched
             next_run_at: row.get("next_run_at"),
             last_run_at: row.get("last_run_at"),
             last_work_item_id: row.get("last_work_item_id"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
+}
+
+async fn load_event_hooks(pool: &SqlitePool) -> CommandResult<Vec<EventHook>> {
+    let rows = sqlx::query(
+        r#"
+        select
+            h.id,
+            h.agent_id,
+            a.handle as agent_handle,
+            h.channel_id,
+            c.name as channel_name,
+            h.thread_root_id,
+            h.title,
+            h.body_preview,
+            h.external_resources,
+            h.status,
+            h.fired_count,
+            h.max_fires,
+            h.created_at,
+            h.updated_at
+        from event_hooks h
+        join agents a on a.id = h.agent_id
+        join channels c on c.id = h.channel_id
+        where h.status in ('active', 'completed')
+        order by
+            case h.status when 'active' then 0 else 1 end,
+            h.updated_at desc
+        limit 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(to_string)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EventHook {
+            id: row.get("id"),
+            agent_id: row.get("agent_id"),
+            agent_handle: row.get("agent_handle"),
+            channel_id: row.get("channel_id"),
+            channel_name: row.get("channel_name"),
+            thread_root_id: row.get("thread_root_id"),
+            title: row.get("title"),
+            body_preview: row.get("body_preview"),
+            external_resources: serde_json::from_str::<Value>(
+                &row.get::<String, _>("external_resources"),
+            )
+            .unwrap_or_else(|_| json!([])),
+            status: row.get("status"),
+            fired_count: row.get("fired_count"),
+            max_fires: row.get("max_fires"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
@@ -9887,6 +10804,93 @@ async fn handle_agent_event(
             )
             .await?;
             Ok(format!("reminder cancelled {reminder_id}"))
+        }
+        AgentEvent::HookCreate {
+            channel,
+            channel_id,
+            thread_root_id,
+            title,
+            body_preview,
+            code_language,
+            code_body,
+            hook_context,
+            external_resources,
+            fixture_request,
+            timeout_ms,
+            max_output_bytes,
+            max_fires,
+        } => {
+            let (default_channel_id, default_thread_root_id, _) =
+                resolve_run_reminder_anchor(pool, agent_id, run_id).await?;
+            let resolved_channel_id = if channel_id.is_some() || channel.is_some() {
+                resolve_event_channel(pool, channel_id, channel.as_deref()).await?
+            } else {
+                default_channel_id
+                    .ok_or_else(|| "hook_create requires channel or channel_id".to_owned())?
+            };
+            let resolved_thread_root_id = thread_root_id.or(default_thread_root_id);
+            ensure_agent_channel_member(pool, agent_id, resolved_channel_id, "hook_create").await?;
+            let hook_id = create_event_hook_in_pool(
+                pool,
+                CreateEventHookInput {
+                    agent_id,
+                    channel_id: resolved_channel_id,
+                    thread_root_id: resolved_thread_root_id,
+                    title: title.clone(),
+                    body_preview,
+                    code_language,
+                    code_body,
+                    hook_context,
+                    external_resources: external_resources.clone(),
+                    fixture_request,
+                    timeout_ms,
+                    max_output_bytes,
+                    max_fires,
+                },
+            )
+            .await?;
+            let hook_ingress_token: Option<String> =
+                sqlx::query_scalar("select ingress_token from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(to_string)?;
+            record_agent_activity(
+                pool,
+                Some(agent_id),
+                Some(run_id),
+                "hook",
+                "Hook registered",
+                json!({
+                    "hook_id": hook_id,
+                    "title": title.trim(),
+                    "channel_id": resolved_channel_id,
+                    "thread_root_id": resolved_thread_root_id,
+                    "ingress_token": hook_ingress_token.clone(),
+                    "external_resources": external_resources.unwrap_or_else(|| json!([]))
+                })
+                .to_string(),
+            )
+            .await?;
+            let ingress_suffix = hook_ingress_token
+                .as_deref()
+                .map(|token| format!(" ingress_token={token}"))
+                .unwrap_or_default();
+            Ok(format!("hook created {hook_id}{ingress_suffix}"))
+        }
+        AgentEvent::HookDelete { hook_id } => {
+            let result = delete_event_hook_in_pool(pool, Some(agent_id), hook_id).await?;
+            record_agent_activity(
+                pool,
+                Some(agent_id),
+                Some(run_id),
+                "hook",
+                "Hook deleted",
+                result.to_string(),
+            )
+            .await?;
+            let _ = notify_ui_refresh(pool, "event_hook_deleted").await;
+            Ok(format!("hook deleted {hook_id}; cleanup={result}"))
         }
         AgentEvent::Usage {
             input_tokens,
@@ -17678,16 +18682,23 @@ pub fn run() {
     launch_agent::spawn_supervisor_process(&database_url);
     let state_db_url = database_url.clone();
     let reminder_pool = pool.clone();
+    let trigger_notifier = Arc::new(Notify::new());
+    let state_trigger_notifier = trigger_notifier.clone();
 
     tauri::Builder::default()
         .manage(AppState {
             pool,
             db_url: state_db_url,
+            trigger_notifier: state_trigger_notifier,
         })
         .setup(move |app| {
             spawn_ui_refresh_listener(app.handle().clone(), reminder_pool.clone());
-            web::spawn_web_server_if_configured(reminder_pool.clone(), database_url.clone());
-            spawn_reminder_worker(reminder_pool.clone());
+            web::spawn_web_server_if_configured(
+                reminder_pool.clone(),
+                database_url.clone(),
+                trigger_notifier.clone(),
+            );
+            spawn_trigger_worker(reminder_pool.clone(), trigger_notifier.clone());
             configure_main_window(app);
             Ok(())
         })
@@ -17826,8 +18837,9 @@ mod tests {
             agent_context_run_read, agent_context_workspace_info, agent_context_workspace_list,
             short_id,
         },
-        create_agent_inbox_item, create_channel_in_pool, db_connect_with_url, delete_agent_in_pool,
-        delete_channel_in_pool, delete_intermediate_run_messages,
+        create_agent_inbox_item, create_channel_in_pool, create_event_hook_in_pool,
+        db_connect_with_url, delete_agent_in_pool, delete_channel_in_pool,
+        delete_event_hook_in_pool, delete_intermediate_run_messages,
         demux_agent_message_control_delta, dismiss_inbox_items_in_pool,
         dispatch_streaming_agent_message_mentions, ensure_agent_workspace,
         ensure_streaming_agent_message, extract_agent_event_json, extract_agent_mentions,
@@ -17838,14 +18850,15 @@ mod tests {
         load_reminders, load_runtime_thread_id, load_thread_activities,
         load_unread_inbox_wake_batch, mark_all_owner_inbox_read_in_pool,
         mark_inbox_items_read_in_pool, maybe_hide_silent_streaming_reply, memory_observation_layer,
-        migrate, normalize_open_link_target, notify_ui_work_item_changed,
+        migrate, normalize_open_link_target, notify_trigger_worker, notify_ui_work_item_changed,
         open_dm_with_agent_in_pool, parse_activity_metadata, parse_tailscale_ipv4_from_text,
         prepend_inbox_context, process_due_agent_schedules, process_due_reminders,
-        queue_mentions_as_work_items, reassign_agent_work_in_pool, record_agent_activity,
-        record_codex_memory_read_observation, recover_supervisor_commands_at_startup,
-        sanitize_window_state, send_owner_message_in_pool, set_channel_agent_membership_in_pool,
-        should_append_codex_stream_line_to_run_log, should_keep_ui_refresh_metric_line,
-        silent_reply_reason, split_complete_streaming_agent_event_lines,
+        process_hook_ingress_in_pool, queue_mentions_as_work_items, reassign_agent_work_in_pool,
+        record_agent_activity, record_codex_memory_read_observation,
+        recover_supervisor_commands_at_startup, sanitize_window_state, send_owner_message_in_pool,
+        set_channel_agent_membership_in_pool, should_append_codex_stream_line_to_run_log,
+        should_keep_ui_refresh_metric_line, silent_reply_reason,
+        spawn_trigger_worker_with_interval, split_complete_streaming_agent_event_lines,
         split_streaming_agent_event_lines, split_terminal_streaming_agent_event_lines,
         streaming_message_body_is_empty, supervisor_start_codex_streaming_agent,
         tools::ToolHost,
@@ -17855,12 +18868,12 @@ mod tests {
         validate_event_ingest_work_item_done, wait_for_agent_run, AgentAttachmentFile, AgentEvent,
         AgentInboxItemInput, AgentMessageControlDemuxState, ClaudeActiveTurn, ClaudeSurface,
         CodexActiveTurn, CodexActiveTurnReapReason, CodexActiveTurnScheduleState,
-        CodexInboundMessage, InboxWakeItem, InboxWakeSummary, MentionDispatchOrigin,
-        WarmClaudeRuntime, WarmClaudeState, WarmCodexRegistry, WarmCodexRuntime, WarmCodexState,
-        WindowMonitorBounds, WindowState, CODEX_ACTIVE_TURN_IDLE_TIMEOUT,
-        CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS, CODEX_TURN_START_TIMEOUT,
-        MEMORY_READ_ACTIVITY_TITLE, STREAMING_MESSAGE_BODY_LIMIT, STREAMING_TRUNCATION_MARKER,
-        UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
+        CodexInboundMessage, CreateEventHookInput, InboxWakeItem, InboxWakeSummary,
+        MentionDispatchOrigin, WarmClaudeRuntime, WarmClaudeState, WarmCodexRegistry,
+        WarmCodexRuntime, WarmCodexState, WindowMonitorBounds, WindowState,
+        CODEX_ACTIVE_TURN_IDLE_TIMEOUT, CODEX_CONTEXT_ROTATE_DEFAULT_INPUT_TOKENS,
+        CODEX_TURN_START_TIMEOUT, MEMORY_READ_ACTIVITY_TITLE, STREAMING_MESSAGE_BODY_LIMIT,
+        STREAMING_TRUNCATION_MARKER, UI_REFRESH_METRICS_MAX_BYTES, WORK_ITEM_FINISH_PROMPT,
     };
     use chrono::NaiveDate;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -17874,7 +18887,11 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
-    use tokio::{process::Command, sync::Mutex as AsyncMutex};
+    use tokio::{
+        process::Command,
+        sync::{Mutex as AsyncMutex, Notify},
+        time::sleep,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -18328,6 +19345,7 @@ inline `@kunk` and after @longbaby
         assert!(streaming.contains("attachment_create"));
         assert!(streaming.contains("channel_message_create"));
         assert!(streaming.contains("handoff_create"));
+        assert!(streaming.contains("hook_create"));
         assert!(streaming.contains("owner_profile_update"));
         assert!(streaming.contains("task_handoff"));
         assert!(streaming.contains("task_claim"));
@@ -28793,7 +29811,7 @@ inline `@kunk` and after @longbaby
     }
 
     #[tokio::test]
-    async fn due_reminder_fires_system_message() {
+    async fn due_reminder_fires_without_channel_system_message() {
         let Some((pool, schema)) = test_pool().await else {
             return;
         };
@@ -28832,7 +29850,307 @@ inline `@kunk` and after @longbaby
             .fetch_one(&pool)
             .await
             .map_err(|err| err.to_string())?;
-            assert_eq!(system_messages, 1);
+            assert_eq!(system_messages, 0);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn trigger_worker_notify_processes_due_reminder_without_waiting_for_tick() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let notifier = Arc::new(Notify::new());
+            let worker = spawn_trigger_worker_with_interval(
+                pool.clone(),
+                notifier.clone(),
+                Duration::from_secs(60),
+            );
+            sleep(Duration::from_millis(50)).await;
+
+            let channel_id = insert_test_channel(&pool, "notify-reminders").await?;
+            let reminder_id: Uuid = sqlx::query_scalar(
+                r#"
+                insert into reminders (channel_id, title, note, due_at, recurrence, status)
+                values ($1, 'Wake now', 'Triggered by notify', strftime('%Y-%m-%dT%H:%M:%f+00:00','now','-1 minute'), 'none', 'scheduled')
+                returning id
+                "#,
+            )
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            notify_trigger_worker(&notifier);
+
+            let fired = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let status: String =
+                        sqlx::query_scalar("select status from reminders where id = $1")
+                            .bind(reminder_id)
+                            .fetch_one(&pool)
+                            .await
+                            .map_err(|err| err.to_string())?;
+                    if status == "fired" {
+                        return Ok::<_, String>(());
+                    }
+                    sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .map_err(|_| "trigger worker did not process notify before timeout".to_owned())?;
+            worker.abort();
+            fired?;
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn push_ingress_hook_runs_single_dynamic_code_body() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "push-hook-agent").await?;
+            let channel_id = insert_test_channel(&pool, "push-hook-events").await?;
+            let hook_id = create_event_hook_in_pool(
+                &pool,
+                CreateEventHookInput {
+                    agent_id,
+                    channel_id,
+                    thread_root_id: None,
+                    title: "External issue opened".to_owned(),
+                    body_preview: Some("Report the pushed issue".to_owned()),
+                    code_language: Some("javascript".to_owned()),
+                    code_body: r#"
+return request.method === "POST"
+  && request.headers["x-github-event"] === "issues"
+  && request.body.action === "opened"
+  && request.body.repository.full_name === context.repo;
+"#
+                    .to_owned(),
+                    hook_context: Some(json!({"repo": "example-org/example-repo"})),
+                    external_resources: None,
+                    fixture_request: Some(json!({
+                        "method": "POST",
+                        "path": "/api/hooks/example/ingress",
+                        "query": {},
+                        "headers": {"x-github-event": "issues"},
+                        "body": {
+                            "action": "opened",
+                            "repository": {"full_name": "example-org/example-repo"}
+                        }
+                    })),
+                    timeout_ms: Some(1000),
+                    max_output_bytes: Some(4096),
+                    max_fires: Some(1),
+                },
+            )
+            .await?;
+            let ingress_token: String =
+                sqlx::query_scalar("select ingress_token from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert!(ingress_token.starts_with("hk_"));
+
+            let unmatched = process_hook_ingress_in_pool(
+                &pool,
+                &ingress_token,
+                "POST",
+                "/api/hooks/test/ingress",
+                json!({}),
+                json!({"x-github-event": "issues"}),
+                json!({
+                    "action": "closed",
+                    "repository": {"full_name": "example-org/example-repo"}
+                }),
+            )
+            .await?;
+            assert_eq!(unmatched.get("triggered").and_then(Value::as_bool), Some(false));
+
+            let matched = process_hook_ingress_in_pool(
+                &pool,
+                &ingress_token,
+                "POST",
+                "/api/hooks/test/ingress",
+                json!({"source": "github"}),
+                json!({"x-github-event": "issues"}),
+                json!({
+                    "action": "opened",
+                    "repository": {"full_name": "example-org/example-repo"},
+                    "issue": {"number": 7, "title": "Bug", "html_url": "https://example.test/7"}
+                }),
+            )
+            .await?;
+            assert_eq!(matched.get("triggered").and_then(Value::as_bool), Some(true));
+
+            let inbox_payload: String = sqlx::query_scalar(
+                "select payload from agent_inbox_items where agent_id = $1 and kind = 'event_hook_fired'",
+            )
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let inbox_payload: Value =
+                serde_json::from_str(&inbox_payload).map_err(|err| err.to_string())?;
+            assert_eq!(
+                inbox_payload
+                    .pointer("/payload/request/body/issue/number")
+                    .and_then(Value::as_i64),
+                Some(7)
+            );
+
+            let hook_status: String =
+                sqlx::query_scalar("select status from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(hook_status, "completed");
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn hook_code_cannot_escape_to_node_process() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "hook-sandbox-agent").await?;
+            let channel_id = insert_test_channel(&pool, "hook-sandbox").await?;
+            let err = create_event_hook_in_pool(
+                &pool,
+                CreateEventHookInput {
+                    agent_id,
+                    channel_id,
+                    thread_root_id: None,
+                    title: "Escaping hook".to_owned(),
+                    body_preview: None,
+                    code_language: Some("javascript".to_owned()),
+                    code_body: r#"return request.constructor.constructor("return process")().env !== undefined;"#
+                        .to_owned(),
+                    hook_context: None,
+                    external_resources: None,
+                    fixture_request: Some(json!({
+                        "method": "POST",
+                        "headers": {},
+                        "query": {},
+                        "body": {}
+                    })),
+                    timeout_ms: Some(1000),
+                    max_output_bytes: Some(4096),
+                    max_fires: Some(1),
+                },
+            )
+            .await
+            .expect_err("sandbox escape should fail validation");
+            assert!(
+                err.contains("hook validation failed"),
+                "unexpected error: {err}"
+            );
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn delete_event_hook_removes_internal_state_and_reports_external_cleanup() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "hook-delete-agent").await?;
+            let channel_id = insert_test_channel(&pool, "hook-delete-events").await?;
+            let hook_id = create_event_hook_in_pool(
+                &pool,
+                CreateEventHookInput {
+                    agent_id,
+                    channel_id,
+                    thread_root_id: None,
+                    title: "Provider issue opened".to_owned(),
+                    body_preview: Some("Report the pushed issue".to_owned()),
+                    code_language: Some("javascript".to_owned()),
+                    code_body: "return request.body.action === 'opened';".to_owned(),
+                    hook_context: None,
+                    external_resources: Some(json!([
+                        {
+                            "kind": "github_webhook",
+                            "id": 12345,
+                            "url": "https://github.example.test/org/repo/settings/hooks/12345",
+                            "cleanup": "delete this provider webhook"
+                        }
+                    ])),
+                    fixture_request: Some(json!({
+                        "method": "POST",
+                        "headers": {},
+                        "query": {},
+                        "body": {"action": "opened"}
+                    })),
+                    timeout_ms: Some(1000),
+                    max_output_bytes: Some(4096),
+                    max_fires: Some(10),
+                },
+            )
+            .await?;
+            let ingress_token: String =
+                sqlx::query_scalar("select ingress_token from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            process_hook_ingress_in_pool(
+                &pool,
+                &ingress_token,
+                "POST",
+                "/api/hooks/test/ingress",
+                json!({}),
+                json!({}),
+                json!({"action": "opened"}),
+            )
+            .await?;
+
+            let result = delete_event_hook_in_pool(&pool, Some(agent_id), hook_id).await?;
+            assert_eq!(
+                result
+                    .pointer("/pending_external_cleanup/0/kind")
+                    .and_then(Value::as_str),
+                Some("github_webhook")
+            );
+            assert_eq!(
+                result
+                    .pointer("/removed_lantor_resources/ingress/token")
+                    .and_then(Value::as_str),
+                Some(ingress_token.as_str())
+            );
+            let remaining_hooks: i64 =
+                sqlx::query_scalar("select count(*) from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            let remaining_runs: i64 =
+                sqlx::query_scalar("select count(*) from event_hook_runs where hook_id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(remaining_hooks, 0);
+            assert_eq!(remaining_runs, 0);
             Ok(())
         }
         .await;
@@ -28874,22 +30192,41 @@ inline `@kunk` and after @longbaby
             assert!(due_at > Utc::now() + ChronoDuration::minutes(18));
             assert!(due_at <= Utc::now() + ChronoDuration::minutes(21));
 
-            let system_body: String = sqlx::query_scalar(
+            let system_messages: i64 = sqlx::query_scalar(
                 r#"
-                select body
+                select count(*)
                 from messages
                 where channel_id = $1
                   and sender_role = 'system'
                   and body like 'Reminder:%'
-                order by created_at desc
-                limit 1
                 "#,
             )
             .bind(channel_id)
             .fetch_one(&pool)
             .await
             .map_err(|err| err.to_string())?;
-            assert!(system_body.contains("Next reminder:"));
+            assert_eq!(system_messages, 0);
+            let activity_detail: String = sqlx::query_scalar(
+                r#"
+                select detail
+                from agent_activities
+                where kind = 'reminder'
+                  and title = 'Reminder fired'
+                order by created_at desc
+                limit 1
+                "#,
+            )
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let activity_detail: Value =
+                serde_json::from_str(&activity_detail).map_err(|err| err.to_string())?;
+            assert_eq!(
+                activity_detail
+                    .get("next_status")
+                    .and_then(Value::as_str),
+                Some("scheduled")
+            );
             Ok(())
         }
         .await;
@@ -29181,7 +30518,7 @@ inline `@kunk` and after @longbaby
             .fetch_one(&pool)
             .await
             .map_err(|err| err.to_string())?;
-            assert_eq!(system_messages, 1);
+            assert_eq!(system_messages, 0);
             Ok(())
         }
         .await;

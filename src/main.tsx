@@ -204,7 +204,6 @@ const RUN_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "stop
 const DEFAULT_OWNER_DISPLAY_NAME = "Me";
 const DEFAULT_OWNER_AVATAR = "dicebear:dylan:owner";
 const DEFAULT_OWNER_DESCRIPTION = "local owner";
-const OWNER_MENTION_HANDLES = ["@Theo", "@Dylan"];
 const CHANNEL_THREAD_MEMORY_STORAGE_KEY = "lantor.channelThreadMemory";
 const THREAD_PANEL_WIDTH_STORAGE_KEY = "lantor.threadPanelWidth";
 const AGENT_DRAWER_WIDTH_STORAGE_KEY = "lantor.agentDrawerWidth";
@@ -666,11 +665,6 @@ function percentile(values: number[], ratio: number) {
   const sorted = [...values].sort((left, right) => left - right);
   const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * ratio) - 1);
   return sorted[index];
-}
-
-function messageMentionsOwner(message: Message) {
-  const body = message.body.toLowerCase();
-  return OWNER_MENTION_HANDLES.some((handle) => body.includes(handle.toLowerCase()));
 }
 
 function budgetMicrosFromForm(value: string) {
@@ -2587,24 +2581,22 @@ function App() {
     };
     const timestamp = (value: string | null | undefined) => value || new Date(0).toISOString();
     const items: ActivityFeedItem[] = [];
-    const threadRootIdsForActivityFeed = new Set(allThreadRootMessages.map((message) => message.id));
 
     for (const channel of data.channels) {
       const unread = channel.unread_count > 0 || channelAlertIds.has(channel.id);
-      if (!unread) continue;
       const latest = latestByChannel.get(channel.id);
-      if (latest?.thread_root_id && threadRootIdsForActivityFeed.has(latest.thread_root_id)) continue;
+      if (!latest && !unread) continue;
       const dmAgent = channel.kind === "dm" && channel.dm_agent_id ? agentsById.get(channel.dm_agent_id) : null;
       items.push({
         id: `${channel.kind}:${channel.id}`,
         dismissId: `${channel.kind}:${channel.id}`,
         kind: channel.kind === "dm" ? "dm" : "channel",
-        title: channel.kind === "dm" ? `DM with @${dmAgent?.handle ?? "agent"}` : `New activity in #${channel.name}`,
+        title: channel.kind === "dm" ? `DM with @${dmAgent?.handle ?? "agent"}` : `#${channel.name}`,
         excerpt: latest?.body ?? visibleChannelDescription(channel.description),
         surface: channel.kind === "dm" ? "Direct message" : `#${channel.name}`,
         actor: latest ? displayNameForSender(latest, data.owner_profile) : "",
         timestamp: timestamp(latest?.created_at),
-        unread: true,
+        unread,
         actorAgentId: latest?.sender_agent_id ?? dmAgent?.id ?? null,
         actorRole: latest?.sender_role ?? (channel.kind === "dm" ? "agent" : null),
         channelId: channel.id,
@@ -2647,35 +2639,7 @@ function App() {
       });
     }
 
-    visibleMessages
-      .filter((message) => message.sender_role !== "owner" && messageMentionsOwner(message))
-      .sort((left, right) => timestampMs(right.created_at) - timestampMs(left.created_at))
-      .forEach((message) => {
-        const rootId = message.thread_root_id ?? message.id;
-        items.push({
-          id: `mention:${message.id}`,
-          dismissId: `mention:${message.id}`,
-          kind: "mention",
-          title: firstLines(message.body, 1),
-          excerpt: message.body,
-          surface: channelLabel(message.channel_id),
-          actor: message.sender_name,
-          timestamp: message.created_at,
-          unread: channelAlertIds.has(message.channel_id) || (message.thread_root_id ? (threadUnreadCounts[message.thread_root_id] ?? 0) > 0 : false),
-          actorAgentId: message.sender_agent_id,
-          actorRole: message.sender_role,
-          channelId: message.channel_id,
-          threadId: rootId,
-          messageId: message.id,
-          taskId: null,
-          reminderId: null,
-          replyCount: threadReplyCounts[rootId] ?? 0,
-          newCount: message.thread_root_id ? (threadUnreadCounts[message.thread_root_id] ?? 0) : 0,
-        });
-      });
-
     data.tasks
-      .filter((task) => task.status !== "done")
       .forEach((task) => {
         items.push({
           id: `task:${task.id}`,
@@ -2698,8 +2662,8 @@ function App() {
       });
 
     data.reminders
-      .filter((reminder) => reminder.status === "fired")
       .forEach((reminder) => {
+        const due = reminder.status === "fired";
         items.push({
           id: `reminder:${reminder.id}`,
           dismissId: `reminder:${reminder.id}`,
@@ -2707,9 +2671,9 @@ function App() {
           title: reminder.title,
           excerpt: reminder.note,
           surface: reminder.channel_id ? channelLabel(reminder.channel_id) : "Reminder",
-          actor: "Reminder due",
+          actor: due ? "Reminder due" : reminder.recurrence === "none" ? "Reminder scheduled" : `Reminder ${reminder.recurrence}`,
           timestamp: reminder.fired_at ?? reminder.due_at,
-          unread: true,
+          unread: due,
           channelId: reminder.channel_id,
           threadId: reminder.thread_root_id,
           messageId: reminder.message_id,
@@ -2717,6 +2681,54 @@ function App() {
           reminderId: reminder.id,
           replyCount: reminder.thread_root_id ? (threadReplyCounts[reminder.thread_root_id] ?? 0) : 0,
           newCount: 1,
+        });
+      });
+
+    data.agent_schedules
+      .forEach((schedule) => {
+        items.push({
+          id: `schedule:${schedule.id}`,
+          dismissId: `schedule:${schedule.id}`,
+          kind: "schedule",
+          title: schedule.title,
+          excerpt: schedule.prompt,
+          surface: channelLabel(schedule.channel_id),
+          actor: `@${schedule.agent_handle}`,
+          timestamp: schedule.last_run_at ?? schedule.next_run_at,
+          unread: false,
+          actorAgentId: schedule.agent_id,
+          actorRole: "agent",
+          channelId: schedule.channel_id,
+          threadId: schedule.thread_root_id,
+          messageId: null,
+          taskId: null,
+          reminderId: null,
+          replyCount: schedule.thread_root_id ? (threadReplyCounts[schedule.thread_root_id] ?? 0) : 0,
+          newCount: 0,
+        });
+      });
+
+    data.event_hooks
+      .forEach((hook) => {
+        items.push({
+          id: `hook:${hook.id}`,
+          dismissId: `hook:${hook.id}`,
+          kind: "hook",
+          title: hook.title,
+          excerpt: hook.body_preview || "Public hook endpoint",
+          surface: channelLabel(hook.channel_id),
+          actor: `@${hook.agent_handle}`,
+          timestamp: hook.updated_at || hook.created_at,
+          unread: false,
+          actorAgentId: hook.agent_id,
+          actorRole: "agent",
+          channelId: hook.channel_id,
+          threadId: hook.thread_root_id,
+          messageId: null,
+          taskId: null,
+          reminderId: null,
+          replyCount: hook.thread_root_id ? (threadReplyCounts[hook.thread_root_id] ?? 0) : 0,
+          newCount: 0,
         });
       });
 
@@ -4096,7 +4108,7 @@ function App() {
     }
     const targetThreadId = item.threadId ?? item.messageId;
     if (item.channelId) selectChannel(item.channelId);
-    setSelectedAgentId(null);
+    setSelectedAgentId(["activity", "schedule", "hook"].includes(item.kind) ? item.actorAgentId ?? null : null);
     setActiveTab("chat");
     if (targetThreadId) {
       revealThread(targetThreadId, item.channelId ?? activeChannelId);

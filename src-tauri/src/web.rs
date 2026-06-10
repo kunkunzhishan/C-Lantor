@@ -8,7 +8,7 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
     http::{header, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 use tokio::{
     net::TcpListener,
+    sync::Notify,
     time::{sleep, Duration},
 };
 use tower_http::{
@@ -57,21 +58,23 @@ use crate::{
     fetch_messages_in_pool, forward_task_in_pool, load_artifact, load_bootstrap,
     load_ui_backend_event_payload, mark_all_owner_inbox_read_in_pool, mark_channel_read_in_pool,
     mark_inbox_items_read_in_pool, notify_ui_refresh, open_dm_with_agent_in_pool,
-    reassign_agent_work_in_pool, retry_agent_work_in_pool, send_owner_message_in_pool,
-    set_channel_agent_membership_in_pool, set_message_saved_in_pool, set_message_todo_in_pool,
-    start_agent_in_pool, to_string, update_agent_in_pool, update_channel_in_pool,
-    update_owner_profile_in_pool, update_task_status_in_pool, update_task_title_in_pool,
-    FetchMessagesRequest,
+    process_hook_ingress_in_pool, reassign_agent_work_in_pool, retry_agent_work_in_pool,
+    send_owner_message_in_pool, set_channel_agent_membership_in_pool, set_message_saved_in_pool,
+    set_message_todo_in_pool, start_agent_in_pool, to_string, update_agent_in_pool,
+    update_channel_in_pool, update_owner_profile_in_pool, update_task_status_in_pool,
+    update_task_title_in_pool, FetchMessagesRequest,
 };
 
 const WEB_SEND_MESSAGE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 const WEB_TRANSCRIBE_VOICE_AUDIO_BODY_LIMIT: usize = 128 * 1024 * 1024;
+const WEB_HOOK_INGRESS_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 struct WebState {
     pool: SqlitePool,
     db_url: String,
     web_token: Option<String>,
+    trigger_notifier: Arc<Notify>,
 }
 
 #[derive(Serialize)]
@@ -398,7 +401,11 @@ pub(crate) fn resolve_web_bind() -> Option<String> {
     }
 }
 
-pub(crate) fn spawn_web_server_if_configured(pool: SqlitePool, db_url: String) {
+pub(crate) fn spawn_web_server_if_configured(
+    pool: SqlitePool,
+    db_url: String,
+    trigger_notifier: Arc<Notify>,
+) {
     let Some(bind) = resolve_web_bind() else {
         return;
     };
@@ -413,6 +420,7 @@ pub(crate) fn spawn_web_server_if_configured(pool: SqlitePool, db_url: String) {
             pool,
             db_url,
             web_token: web_token(),
+            trigger_notifier,
         });
         let app = web_router(state, dist_dir);
         match TcpListener::bind(addr).await {
@@ -538,6 +546,10 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
             state.clone(),
             require_web_auth,
         ))
+        .route(
+            "/api/hooks/{ingress_token}/ingress",
+            post(api_hook_ingress).layer(DefaultBodyLimit::max(WEB_HOOK_INGRESS_BODY_LIMIT)),
+        )
         .with_state(state);
 
     let router = if index.is_file() {
@@ -2597,6 +2609,51 @@ async fn api_record_ui_refresh_metric(
     append_ui_refresh_metrics_log(&state.db_url, request.metric)
         .map(|_| Json(json!({ "ok": true })))
         .map_err(api_error)
+}
+
+async fn api_hook_ingress(
+    State(state): State<Arc<WebState>>,
+    AxumPath(ingress_token): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request: Request<Body>,
+) -> Result<impl IntoResponse, Response> {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let headers = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let body_bytes = to_bytes(request.into_body(), WEB_HOOK_INGRESS_BODY_LIMIT)
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    let body = if body_bytes.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice::<Value>(&body_bytes).unwrap_or_else(|_| {
+            json!({
+                "text": String::from_utf8_lossy(&body_bytes).to_string()
+            })
+        })
+    };
+    let result = process_hook_ingress_in_pool(
+        &state.pool,
+        &ingress_token,
+        &method,
+        &path,
+        json!(query),
+        json!(headers),
+        body,
+    )
+    .await
+    .map_err(api_error)?;
+    state.trigger_notifier.notify_one();
+    Ok(Json(result))
 }
 
 async fn api_send_message(

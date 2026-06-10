@@ -19,7 +19,7 @@ import {
   modelLabel,
 } from "../types";
 import { AgentAvatar } from "./AgentAvatar";
-import { sourceKindMeta } from "./ActivityProgressDock";
+import { sourceKindMeta, type SourceKindMeta } from "./ActivityProgressDock";
 import { MessageMarkdown } from "./MessageMarkdown";
 import { agentRequestSourceLabel, formatTime } from "../ui-utils";
 
@@ -180,10 +180,46 @@ function stringifyMetadata(value: unknown) {
   return JSON.stringify(value);
 }
 
-function compactValue(value: string, maxLength = 54) {
+function compactValue(value: string, maxLength = 72) {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength - 1)}…`;
+  return `${normalized.slice(0, maxLength - 1).trim()}…`;
+}
+
+function metadataValue(activity: AgentActivity, key: string) {
+  return stringifyMetadata((activity.metadata ?? {})[key]).trim();
+}
+
+function nestedMetadataValue(activity: AgentActivity, path: string[]) {
+  let current: unknown = activity.metadata;
+  for (const segment of path) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return "";
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return stringifyMetadata(current).trim();
+}
+
+function metadataLabel(key: string) {
+  const labels: Record<string, string> = {
+    event_type: "event",
+    channel_name: "channel",
+    next_run_at: "next",
+    next_status: "next status",
+    duration_ms: "duration",
+    exit_code: "exit",
+    inbox_item_id: "inbox",
+    work_item_id: "work item",
+    domain_event_id: "event id",
+    domain_event_row_id: "event row",
+  };
+  return labels[key] ?? key.replace(/_/g, " ");
+}
+
+function metadataDisplayValue(key: string, value: string) {
+  if ((key === "channel" || key === "channel_name") && value && !value.startsWith("#")) {
+    return `#${value}`;
+  }
+  return value;
 }
 
 function metadataEntries(activity: AgentActivity) {
@@ -194,7 +230,27 @@ function metadataEntries(activity: AgentActivity) {
 }
 
 function visibleMetadataEntries(activity: AgentActivity) {
-  const priority = ["command", "file", "operation", "tool", "duration_ms", "exit_code", "status", "type", "reason"];
+  const priority = [
+    "event_type",
+    "subject",
+    "title",
+    "channel",
+    "channel_name",
+    "cadence",
+    "next_run_at",
+    "next_status",
+    "operation",
+    "tool",
+    "command",
+    "file",
+    "inbox_item_id",
+    "work_item_id",
+    "duration_ms",
+    "exit_code",
+    "status",
+    "type",
+    "reason",
+  ];
   const entries = metadataEntries(activity)
     .filter(([key]) => !["rate_limit_info", "uuid", "pid", "session_id", "request_id"].includes(key));
 
@@ -207,7 +263,58 @@ function visibleMetadataEntries(activity: AgentActivity) {
       if (rightIndex === -1) return -1;
       return leftIndex - rightIndex;
     })
-    .slice(0, 3);
+    .slice(0, 6)
+    .map(([key, value]) => [metadataLabel(key), metadataDisplayValue(key, value)] as const);
+}
+
+function sourceKindMetaForActivity(activity: AgentActivity, workItem: AgentWorkItem | null): SourceKindMeta {
+  if (workItem) return sourceKindMeta(workItem);
+  const meta = sourceKindMeta(null);
+  switch (activity.kind || activity.phase) {
+    case "hook":
+      return { ...meta, label: "Event hook", tone: "hook" };
+    case "schedule":
+      return { ...meta, label: "Routine", tone: "schedule" };
+    case "reminder":
+      return { ...meta, label: "Reminder", tone: "reminder" };
+    case "memory":
+      return { ...meta, label: "Memory", tone: "memory" };
+    case "task":
+      return { ...meta, label: "Task event", tone: "task" };
+    default:
+      return meta;
+  }
+}
+
+function activityRuntimePath(activity: AgentActivity) {
+  const metadata = activity.metadata ?? {};
+  const channel = metadataValue(activity, "channel") || metadataValue(activity, "channel_name");
+  const title = metadataValue(activity, "title");
+  const eventType = metadataValue(activity, "event_type");
+  const subject = metadataValue(activity, "subject");
+  const cadence = metadataValue(activity, "cadence");
+  const segments: string[] = [];
+
+  if (channel) segments.push(metadataDisplayValue("channel", channel));
+  if (title) segments.push(title);
+  if (eventType) segments.push(subject ? `${eventType} · ${subject}` : eventType);
+  if (cadence) segments.push(cadence);
+
+  if (segments.length > 0) return segments.join(" > ");
+  return userFacingActivityCategory(activity);
+}
+
+function activityRuntimePreview(activity: AgentActivity) {
+  const candidates = [
+    metadataValue(activity, "body_preview"),
+    metadataValue(activity, "prompt"),
+    metadataValue(activity, "reason"),
+    nestedMetadataValue(activity, ["payload", "issue", "title"]),
+    nestedMetadataValue(activity, ["payload", "title"]),
+    nestedMetadataValue(activity, ["payload", "action"]),
+    userFacingActivityDetail(activity),
+  ];
+  return candidates.find((value) => value.length > 0) ?? "";
 }
 
 function formatActivityTime(value: string) {
@@ -766,13 +873,13 @@ export function AgentDetailDrawer({
     );
     const groupedActivities = new Map<string, AgentActivity[]>();
     activities.forEach((activity) => {
-      const key = activity.run_id ?? "system-runtime";
+      const key = activity.run_id ?? `activity:${activity.id}`;
       groupedActivities.set(key, [...(groupedActivities.get(key) ?? []), activity]);
     });
     const activityGroups = Array.from(groupedActivities.entries())
       .map(([runId, groupActivities]) => {
         const sorted = [...groupActivities].sort((left, right) => activityTimestamp(right) - activityTimestamp(left));
-        const workItem = runId === "system-runtime" ? null : workItemsByRun.get(runId) ?? null;
+        const workItem = runId.startsWith("activity:") ? null : workItemsByRun.get(runId) ?? null;
         const latest = sorted[0];
         const queuedBehind = workItem
           ? workItems.filter((item) =>
@@ -781,7 +888,7 @@ export function AgentDetailDrawer({
             && item.agent_id === workItem.agent_id
             && workItemSurfaceKey(item) === workItemSurfaceKey(workItem))
           : [];
-        const kindMeta = sourceKindMeta(workItem);
+        const kindMeta = sourceKindMetaForActivity(latest, workItem);
         const sourceMessage = workItem?.source_message_id
           ? messagesById.get(workItem.source_message_id) ?? null
           : null;
@@ -802,11 +909,12 @@ export function AgentDetailDrawer({
             if (threadLabel) pathSegments.push(threadLabel);
           }
         } else {
-          pathSegments.push("Runtime");
+          pathSegments.push(activityRuntimePath(latest));
         }
         const path = pathSegments.join(" > ");
         const previewSource = sourceMessage?.body
           ?? (workItem && !workItem.source_message_id && workItem.context ? workItem.context : "")
+          ?? (!workItem ? activityRuntimePreview(latest) : "")
           ?? "";
         const preview = previewSource ? firstLinePreview(previewSource, 80) : "";
         return {

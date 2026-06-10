@@ -249,6 +249,24 @@ pub(crate) struct AgentSchedule {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct EventHook {
+    pub(crate) id: Uuid,
+    pub(crate) agent_id: Uuid,
+    pub(crate) agent_handle: String,
+    pub(crate) channel_id: Uuid,
+    pub(crate) channel_name: String,
+    pub(crate) thread_root_id: Option<Uuid>,
+    pub(crate) title: String,
+    pub(crate) body_preview: String,
+    pub(crate) external_resources: Value,
+    pub(crate) status: String,
+    pub(crate) fired_count: i64,
+    pub(crate) max_fires: i64,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct AgentRun {
     pub(crate) id: Uuid,
     pub(crate) agent_id: Uuid,
@@ -470,6 +488,7 @@ pub(crate) struct Bootstrap {
     pub(crate) long_tasks: Vec<LongTask>,
     pub(crate) reminders: Vec<Reminder>,
     pub(crate) agent_schedules: Vec<AgentSchedule>,
+    pub(crate) event_hooks: Vec<EventHook>,
     pub(crate) agent_runs: Vec<AgentRun>,
     pub(crate) agent_work_items: Vec<AgentWorkItem>,
     pub(crate) call_sessions: Vec<CallSession>,
