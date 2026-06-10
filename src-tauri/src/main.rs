@@ -128,6 +128,9 @@ const AGENT_EVENT_PREFIX: &str = "LANTOR_EVENT";
 const SILENT_REPLY_PREFIX: &str = "LANTOR_SILENT_REPLY";
 pub(crate) const UI_REFRESH_CHANNEL: &str = "lantor_ui_refresh";
 const SUPERVISOR_WAKE_CHANNEL: &str = "lantor_supervisor_wake";
+const BOOTSTRAP_THREAD_ACTIVITY_LIMIT: i64 = 160;
+const BOOTSTRAP_ARTIFACT_LIMIT: i64 = 120;
+const BOOTSTRAP_RECENT_CALL_WORK_ITEM_LIMIT: i64 = 120;
 const UI_REFRESH_EVENT: &str = "lantor://refresh";
 const LANTOR_CONTEXT_TOOL_ENV: &str = "LANTOR_CONTEXT_TOOL";
 const STREAMING_MESSAGE_BODY_LIMIT: usize = 200_000;
@@ -2341,11 +2344,15 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     for statement in [
         "create unique index if not exists channels_dm_unique on channels(dm_agent_id) where kind = 'dm' and dm_agent_id is not null",
         "create unique index if not exists messages_stream_key_unique on messages(stream_key) where stream_key <> ''",
+        "create index if not exists messages_channel_root_created_idx on messages(channel_id, thread_root_id, created_at desc, id desc)",
+        "create index if not exists messages_thread_created_idx on messages(thread_root_id, created_at desc, id desc) where thread_root_id is not null",
+        "create index if not exists messages_root_created_idx on messages(created_at desc, id desc) where thread_root_id is null",
         "create index if not exists message_attachments_message_id_idx on message_attachments(message_id)",
         "create index if not exists saved_messages_created_at_idx on saved_messages(created_at desc)",
         "create index if not exists todo_items_done_created_idx on todo_items(done_at, created_at desc)",
         "create index if not exists artifacts_message_id_idx on artifacts(message_id)",
         "create index if not exists artifacts_channel_id_idx on artifacts(channel_id)",
+        "create index if not exists artifacts_created_idx on artifacts(created_at desc, id desc)",
         "create index if not exists reminders_due_idx on reminders(status, due_at)",
         "create unique index if not exists event_hooks_ingress_token_unique on event_hooks(ingress_token) where ingress_token is not null",
         "create index if not exists event_hook_events_hook_created_idx on event_hook_events(hook_id, created_at)",
@@ -2354,6 +2361,10 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "create index if not exists agent_memory_observations_layer_created_idx on agent_memory_observations(layer, created_at desc)",
         "create index if not exists agent_inbox_items_agent_state_idx on agent_inbox_items(agent_id, state, priority desc, created_at)",
         "create unique index if not exists agent_inbox_items_source_unique on agent_inbox_items(agent_id, source_message_id, kind) where source_message_id is not null",
+        "create index if not exists agent_activities_recent_idx on agent_activities(julianday(created_at) desc, created_at desc)",
+        "create index if not exists agent_activities_run_recent_idx on agent_activities(run_id, julianday(created_at) desc, created_at desc) where run_id is not null",
+        "create index if not exists agent_work_items_status_created_idx on agent_work_items(status, created_at desc, id desc)",
+        "create index if not exists agent_work_items_created_idx on agent_work_items(created_at desc, id desc)",
         "create index if not exists ui_events_created_idx on ui_events(created_at)",
     ] {
         sqlx::query(statement).execute(pool).await?;
@@ -2904,7 +2915,9 @@ async fn fetch_call_history(
     before: DateTime<Utc>,
     limit: Option<i64>,
 ) -> CommandResult<CallHistoryPage> {
-    fetch_call_history_page(&state.pool, before, limit).await
+    let mut page = fetch_call_history_page(&state.pool, before, limit).await?;
+    page.work_items = load_call_work_items_for_dispatches(&state.pool, &page.dispatches).await?;
+    Ok(page)
 }
 
 #[tauri::command]
@@ -7697,6 +7710,15 @@ async fn load_thread_activities(pool: &SqlitePool) -> CommandResult<Vec<ThreadAc
             where m.thread_root_id is not null
               and {visible_message_sql}
         ),
+        ranked_thread_messages as (
+            select
+                m.*,
+                row_number() over (
+                    partition by m.thread_root_id
+                    order by julianday(m.created_at) desc, m.created_at desc, lower(hex(m.id)) desc
+                ) as message_rank
+            from visible_thread_messages m
+        ),
         thread_read_markers as (
             select
                 root.id as thread_root_id,
@@ -7712,41 +7734,55 @@ async fn load_thread_activities(pool: &SqlitePool) -> CommandResult<Vec<ThreadAc
             left join owner_inbox_read_state thread_read_state
               on thread_read_state.item_id = 'thread:' || {thread_item_id_sql}
             where root.thread_root_id is null
+        ),
+        thread_summaries as (
+            select
+                m.thread_root_id,
+                cast(count(m.id) as integer) as reply_count,
+                cast(count(m.id) filter (
+                    where julianday(m.created_at) > julianday(
+                        coalesce(read_marker.read_until, '0001-01-01T00:00:00+00:00')
+                    )
+                      and m.sender_role <> 'owner'
+                ) as integer) as unread_count,
+                max(julianday(m.created_at)) as latest_sort_at,
+                max(m.created_at) as latest_sort_text
+            from visible_thread_messages m
+            left join thread_read_markers read_marker on read_marker.thread_root_id = m.thread_root_id
+            group by m.thread_root_id, read_marker.read_until
         )
         select
-            m.thread_root_id,
-            cast(count(m.id) as integer) as reply_count,
-            cast(count(m.id) filter (
-                where julianday(m.created_at) > julianday(
-                    coalesce(read_marker.read_until, '0001-01-01T00:00:00+00:00')
-                )
-                  and m.sender_role <> 'owner'
-            ) as integer) as unread_count,
-            (
-                select lm.id
-                from visible_thread_messages lm
-                where lm.thread_root_id = m.thread_root_id
-                order by julianday(lm.created_at) desc, lm.created_at desc, lower(hex(lm.id)) desc
-                limit 1
-            ) as latest_visible_message_id,
-            (
-                select lm.created_at
-                from visible_thread_messages lm
-                where lm.thread_root_id = m.thread_root_id
-                order by julianday(lm.created_at) desc, lm.created_at desc, lower(hex(lm.id)) desc
-                limit 1
-            ) as latest_visible_at
-        from visible_thread_messages m
-        left join thread_read_markers read_marker on read_marker.thread_root_id = m.thread_root_id
-        group by m.thread_root_id, read_marker.read_until
-        order by max(julianday(m.created_at)) desc, max(m.created_at) desc
+            s.thread_root_id,
+            s.reply_count,
+            s.unread_count,
+            latest.id as latest_visible_message_id,
+            latest.created_at as latest_visible_at
+        from thread_summaries s
+        join ranked_thread_messages latest
+          on latest.thread_root_id = s.thread_root_id
+         and latest.message_rank = 1
+        order by
+            case when s.unread_count > 0 then 0 else 1 end,
+            s.latest_sort_at desc,
+            s.latest_sort_text desc
+        limit $1
         "#
     ))
+    .bind(BOOTSTRAP_THREAD_ACTIVITY_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(to_string)?;
 
-    let participant_rows = sqlx::query(&format!(
+    let thread_ids: Vec<Uuid> = rows.iter().map(|row| row.get("thread_root_id")).collect();
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..thread_ids.len())
+        .map(|index| format!("${}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let participant_sql = format!(
         r#"
         with ranked_participants as (
             select
@@ -7765,7 +7801,7 @@ async fn load_thread_activities(pool: &SqlitePool) -> CommandResult<Vec<ThreadAc
                     order by julianday(m.created_at) desc, m.created_at desc, lower(hex(m.id)) desc
                 ) as sender_rank
             from messages m
-            where m.thread_root_id is not null
+            where m.thread_root_id in ({placeholders})
               and m.sender_role <> 'system'
               and {visible_message_sql}
         )
@@ -7780,10 +7816,12 @@ async fn load_thread_activities(pool: &SqlitePool) -> CommandResult<Vec<ThreadAc
         where sender_rank = 1
         order by thread_root_id, julianday(created_at) desc, created_at desc, message_hex_id desc
         "#
-    ))
-    .fetch_all(pool)
-    .await
-    .map_err(to_string)?;
+    );
+    let mut participant_query = sqlx::query(&participant_sql);
+    for thread_id in &thread_ids {
+        participant_query = participant_query.bind(*thread_id);
+    }
+    let participant_rows = participant_query.fetch_all(pool).await.map_err(to_string)?;
 
     let mut participants_by_thread: HashMap<Uuid, Vec<ThreadActivityParticipant>> = HashMap::new();
     for row in participant_rows {
@@ -8732,19 +8770,23 @@ async fn load_artifacts(pool: &SqlitePool) -> CommandResult<Vec<Artifact>> {
             ar.kind,
             ar.title,
             ar.summary,
-            ar.content,
+            '' as content,
             ar.metadata,
             ar.created_at,
             ar.updated_at
         from artifacts ar
         left join agents a on a.id = ar.creator_agent_id
-        order by ar.created_at asc
+        order by ar.created_at desc
+        limit $1
         "#,
     )
+    .bind(BOOTSTRAP_ARTIFACT_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(to_string)?;
-    Ok(rows.iter().map(artifact_from_row).collect())
+    let mut artifacts: Vec<Artifact> = rows.iter().map(artifact_from_row).collect();
+    artifacts.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(artifacts)
 }
 
 pub(crate) async fn load_artifact(pool: &SqlitePool, artifact_id: Uuid) -> CommandResult<Artifact> {
@@ -9105,6 +9147,18 @@ async fn load_agent_work_items(pool: &SqlitePool) -> CommandResult<Vec<AgentWork
             where call_session_id is null
             order by created_at desc
             limit 40
+        ),
+        active_work_items as (
+            select id
+            from agent_work_items
+            where status in ('queued', 'running', 'cancelling')
+        ),
+        recent_call_work_items as (
+            select id
+            from agent_work_items
+            where call_session_id is not null
+            order by created_at desc
+            limit $1
         )
         select
             w.id,
@@ -9137,14 +9191,114 @@ async fn load_agent_work_items(pool: &SqlitePool) -> CommandResult<Vec<AgentWork
         join agents a on a.id = w.agent_id
         left join channels c on c.id = w.channel_id
         left join tasks t on t.id = w.task_id
-        where w.call_session_id is not null
+        where w.id in (select id from active_work_items)
+           or w.id in (select id from recent_call_work_items)
            or w.id in (select id from recent_non_call_work_items)
         order by w.created_at desc
         "#,
     )
+    .bind(BOOTSTRAP_RECENT_CALL_WORK_ITEM_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(to_string)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AgentWorkItem {
+            id: row.get("id"),
+            agent_id: row.get("agent_id"),
+            agent_handle: row.get("agent_handle"),
+            channel_id: row.get("channel_id"),
+            channel_name: row.get("channel_name"),
+            thread_root_id: row.get("thread_root_id"),
+            source_message_id: row.get("source_message_id"),
+            inbox_item_id: row.get("inbox_item_id"),
+            task_id: row.get("task_id"),
+            task_number: row.get("task_number"),
+            call_session_id: row.get("call_session_id"),
+            call_utterance_id: row.get("call_utterance_id"),
+            call_dispatch_id: row.get("call_dispatch_id"),
+            source_kind: row.get("source_kind"),
+            title: row.get("title"),
+            context: row.get("context"),
+            result_body: row.get("result_body"),
+            status: row.get("status"),
+            run_id: row.get("run_id"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+            completed_at: row.get("completed_at"),
+        })
+        .collect())
+}
+
+async fn load_call_work_items_for_dispatches(
+    pool: &SqlitePool,
+    dispatches: &[models::CallDispatch],
+) -> CommandResult<Vec<AgentWorkItem>> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for dispatch in dispatches {
+        if let Some(work_item_id) = dispatch.work_item_id {
+            if seen.insert(work_item_id) {
+                ids.push(work_item_id);
+            }
+        }
+        if let Some(work_item_id) = dispatch.compensated_work_item_id {
+            if seen.insert(work_item_id) {
+                ids.push(work_item_id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..ids.len())
+        .map(|index| format!("${}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        select
+            w.id,
+            w.agent_id,
+            a.handle as agent_handle,
+            w.channel_id,
+            c.name as channel_name,
+            w.thread_root_id,
+            w.source_message_id,
+            w.inbox_item_id,
+            w.task_id,
+            t.number as task_number,
+            w.call_session_id,
+            w.call_utterance_id,
+            w.call_dispatch_id,
+            w.source_kind,
+            w.title,
+            case when w.status in ('queued', 'running', 'cancelling') then substr(w.context, 1, 2000) else '' end as context,
+            case
+                when w.status in ('running', 'cancelling') then substr(w.result_body, 1, 2000)
+                when w.call_session_id is not null and w.status = 'done' then substr(w.result_body, 1, 2000)
+                else ''
+            end as result_body,
+            w.status,
+            w.run_id,
+            w.created_at,
+            w.updated_at,
+            w.completed_at
+        from agent_work_items w
+        join agents a on a.id = w.agent_id
+        left join channels c on c.id = w.channel_id
+        left join tasks t on t.id = w.task_id
+        where w.id in ({placeholders})
+        order by w.created_at desc
+        "#
+    );
+    let mut query = sqlx::query(&sql);
+    for id in ids {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(pool).await.map_err(to_string)?;
 
     Ok(rows
         .into_iter()

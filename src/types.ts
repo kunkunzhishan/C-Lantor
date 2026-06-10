@@ -355,6 +355,7 @@ export type CallUtteranceSubmitResult = {
 export type CallHistoryPage = {
   utterances: CallUtterance[];
   dispatches: CallDispatch[];
+  work_items: AgentWorkItem[];
 };
 
 export type AgentActivity = {

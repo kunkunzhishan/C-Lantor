@@ -443,6 +443,7 @@ pub(crate) struct CallUtteranceSubmitResult {
 pub(crate) struct CallHistoryPage {
     pub(crate) utterances: Vec<CallUtterance>,
     pub(crate) dispatches: Vec<CallDispatch>,
+    pub(crate) work_items: Vec<AgentWorkItem>,
 }
 
 #[derive(Debug, Serialize)]

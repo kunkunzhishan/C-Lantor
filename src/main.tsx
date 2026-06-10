@@ -196,8 +196,9 @@ const MAX_SIDEBAR_WIDTH = 460;
 const MIN_CONVERSATION_WIDTH = 480;
 const MOBILE_BREAKPOINT = 760;
 const UI_REFRESH_DEBOUNCE_MS = 80;
-const EPHEMERAL_FLUSH_FALLBACK_MS = 80;
+const EPHEMERAL_FLUSH_BATCH_MS = 180;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const ACTIVITY_FEED_LIMIT_PER_KIND = 120;
 const ACTIVITY_HISTORY_LIMIT_PER_AGENT = 40;
 const RECENT_NON_CALL_WORK_ITEM_LIMIT = 40;
 const RUN_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "stopped", "exited"]);
@@ -340,12 +341,21 @@ function limitActivitiesPerAgent(activities: AgentActivity[]) {
 function retainWorkItemsForUi(workItems: AgentWorkItem[]) {
   const sorted = [...workItems]
     .sort((left, right) => timestampMs(right.created_at) - timestampMs(left.created_at));
-  const callWorkItems = sorted.filter((item) => item.call_session_id);
   const recentNonCallWorkItems = sorted
     .filter((item) => !item.call_session_id)
     .slice(0, RECENT_NON_CALL_WORK_ITEM_LIMIT);
-  return [...callWorkItems, ...recentNonCallWorkItems]
+  return [...sorted.filter((item) => item.call_session_id), ...recentNonCallWorkItems]
     .sort((left, right) => timestampMs(right.created_at) - timestampMs(left.created_at));
+}
+
+function limitActivityFeedItemsPerKind(items: ActivityFeedItem[]) {
+  const counts = new Map<ActivityFeedItem["kind"], number>();
+  return items.filter((item) => {
+    const count = counts.get(item.kind) ?? 0;
+    if (count >= ACTIVITY_FEED_LIMIT_PER_KIND) return false;
+    counts.set(item.kind, count + 1);
+    return true;
+  });
 }
 
 function isTextInput(target: EventTarget | null) {
@@ -878,7 +888,6 @@ function App() {
   const ephemeralActivityBufferRef = useRef<Map<string, EphemeralActivityBufferItem>>(new Map());
   const ephemeralRunBufferRef = useRef<Map<string, EphemeralRunBufferItem>>(new Map());
   const ephemeralFlushScheduledRef = useRef(false);
-  const ephemeralFlushRafRef = useRef<number | null>(null);
   const ephemeralFlushTimerRef = useRef<number | null>(null);
   const appHistoryReadyRef = useRef(false);
   const appHistoryIndexRef = useRef(0);
@@ -1240,6 +1249,13 @@ function App() {
       .sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime());
   }
 
+  function mergeAgentWorkItems(current: AgentWorkItem[], incoming: AgentWorkItem[]) {
+    if (incoming.length === 0) return current;
+    const byId = new Map(current.map((item) => [item.id, item]));
+    for (const item of incoming) byId.set(item.id, item);
+    return retainWorkItemsForUi(Array.from(byId.values()));
+  }
+
   async function fetchCallHistoryOnce(key: string, before: string) {
     if (callHistoryLoadKeysRef.current.has(key) || callHistoryLoadInFlightRef.current.has(key)) return 0;
     callHistoryLoadInFlightRef.current.add(key);
@@ -1249,10 +1265,11 @@ function App() {
         limit: CALL_HISTORY_PAGE_SIZE,
       });
       callHistoryLoadKeysRef.current.add(key);
-      if (page.utterances.length === 0 && page.dispatches.length === 0) return 0;
+      if (page.utterances.length === 0 && page.dispatches.length === 0 && (page.work_items ?? []).length === 0) return 0;
       setData((current) => current
         ? {
             ...current,
+            agent_work_items: mergeAgentWorkItems(current.agent_work_items ?? [], page.work_items ?? []),
             call_utterances: mergeCallUtterances(current.call_utterances ?? [], page.utterances),
             call_dispatches: mergeCallDispatches(current.call_dispatches ?? [], page.dispatches),
           }
@@ -1339,10 +1356,6 @@ function App() {
   }
 
   function cancelEphemeralFlushTimers() {
-    if (ephemeralFlushRafRef.current !== null) {
-      window.cancelAnimationFrame(ephemeralFlushRafRef.current);
-      ephemeralFlushRafRef.current = null;
-    }
     if (ephemeralFlushTimerRef.current !== null) {
       window.clearTimeout(ephemeralFlushTimerRef.current);
       ephemeralFlushTimerRef.current = null;
@@ -1412,13 +1425,9 @@ function App() {
   function scheduleEphemeralFlush() {
     if (ephemeralFlushScheduledRef.current) return;
     ephemeralFlushScheduledRef.current = true;
-    ephemeralFlushRafRef.current = window.requestAnimationFrame(() => {
-      ephemeralFlushRafRef.current = null;
-      flushEphemeralBuffer();
-    });
     ephemeralFlushTimerRef.current = window.setTimeout(() => {
       flushEphemeralBuffer();
-    }, EPHEMERAL_FLUSH_FALLBACK_MS);
+    }, EPHEMERAL_FLUSH_BATCH_MS);
   }
 
   function bufferActivityEphemeral(activity: AgentActivity, reason: string) {
@@ -2736,7 +2745,7 @@ function App() {
   }, [allThreadRootMessages, channelAlertIds, data, threadReplyCounts, threadReplySummaries, threadUnreadCounts, visibleMessages]);
 
   const activityFeedItems = useMemo(() => {
-    return allActivityFeedItems
+    const sortedItems = allActivityFeedItems
       .filter((item) => {
         const dismissedAt = dismissedActivityFeedItems[item.dismissId];
         if (!dismissedAt) return true;
@@ -2752,8 +2761,8 @@ function App() {
       .sort((left, right) => {
         if (left.unread !== right.unread) return left.unread ? -1 : 1;
         return timestampMs(right.timestamp) - timestampMs(left.timestamp);
-      })
-      .slice(0, 120);
+      });
+    return limitActivityFeedItemsPerKind(sortedItems);
   }, [allActivityFeedItems, dismissedActivityFeedItems, readActivityFeedItems]);
 
   const activityFeedUnreadCount = useMemo(() => {
