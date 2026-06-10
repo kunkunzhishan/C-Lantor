@@ -32,7 +32,7 @@ pub(crate) fn memory_event_ingest_task(
     lines.push(String::new());
     lines.push("The realtime segments are the source of truth for this task. They contain agent-written run summaries plus `Sources:` references. `Sources:` is system-written and should contain only `message:<uuid>` or `call_utterance:<uuid>` entries. Agents may include `Provenance:` lines inside the item body as best-effort follow-up hints; provenance is agent-written and should not be treated as guaranteed evidence. Do not fetch raw source messages from the database; use the realtime items as written.".to_owned());
     lines.push(String::new());
-    lines.push("Use `summary.md` as the event index. For each event, merge the new input with the existing summary so the event timeline and context stay coherent. Keep one start time, one end time, and a concise merged event summary.".to_owned());
+    lines.push("Use `summary.md` as the event index. Each compression must compress the existing summary together with the new incoming content. Content for the same event must be merged into one summary, while new events must create new summaries. Keep the event timeline and context coherent. Keep one start time and one end time, and generate a merged event summary.".to_owned());
     lines.push("Use event detail markdown files for the event body. If the input belongs to an existing event, move the matching realtime items into that event's detail file one by one without rewriting or shortening them. If the input describes a new event, create a new event detail markdown file in the event memory directory and add it to `summary.md` as a new event.".to_owned());
     lines.push("Convert from realtime order to event order. One input segment can contribute to multiple events, and multiple input segments can update the same event. Do not move content just because it is recent; merge by matching the same event.".to_owned());
     lines.push("After all event writes succeed, delete the input realtime segment files. If anything is uncertain or fails, leave the inputs in place so a later event_ingest work item can retry.".to_owned());
@@ -50,7 +50,7 @@ pub(crate) fn memory_event_ingest_task(
             .to_owned(),
     );
     lines.push(
-        "Summary: <merged concise event summary, preserving the event timeline and context>"
+        "Summary: <merged concise event summary. Preserve event causality, timeline, and what you think a compressed memory summary should contain>"
             .to_owned(),
     );
     lines.push("```".to_owned());

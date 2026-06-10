@@ -52,6 +52,8 @@ const CALL_SYSTEM_CHANNEL_NAME: &str = "voice-console";
 const CALL_BOOTSTRAP_SESSION_LIMIT: i64 = 20;
 const CALL_BOOTSTRAP_UTTERANCE_LIMIT: i64 = 600;
 const CALL_BOOTSTRAP_DISPATCH_LIMIT: i64 = 160;
+const CALL_BOOTSTRAP_VISIBLE_UTTERANCE_LIMIT: i64 = 600;
+const CALL_BOOTSTRAP_VISIBLE_DISPATCH_LIMIT: i64 = 600;
 const DEFAULT_FETCH_CALL_HISTORY_LIMIT: i64 = 160;
 const MAX_FETCH_CALL_HISTORY_LIMIT: i64 = 300;
 #[derive(Clone, Copy)]
@@ -474,14 +476,39 @@ pub(crate) async fn load_call_utterances(pool: &SqlitePool) -> CommandResult<Vec
             audio_duration_ms, status, created_at, updated_at
         from (
             select *
-            from call_utterances
-            order by created_at desc, sequence desc
-            limit $1
+            from (
+                select *
+                from call_utterances
+                order by created_at desc, sequence desc
+                limit $1
+            )
+            union
+            select *
+            from (
+                select *
+                from call_utterances
+                where not (
+                    status = 'ignored'
+                    and transcript = ''
+                    and (audio_duration_ms is null or audio_duration_ms <= 20000)
+                    and (
+                        lower(transcription_error) like '%no speech%'
+                        or lower(transcription_error) like '%speech was not detected%'
+                        or lower(transcription_error) like '%emptytranscript%'
+                        or lower(transcription_error) like '%wake word required%'
+                        or lower(transcription_error) like '%waiting for the wake word%'
+                        or transcription_error like '%等待唤醒词%'
+                    )
+                )
+                order by created_at desc, sequence desc
+                limit $2
+            )
         ) recent
         order by created_at asc, sequence asc
         "#,
     )
     .bind(CALL_BOOTSTRAP_UTTERANCE_LIMIT)
+    .bind(CALL_BOOTSTRAP_VISIBLE_UTTERANCE_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(to_string)?;
@@ -498,16 +525,43 @@ pub(crate) async fn load_call_dispatches(pool: &SqlitePool) -> CommandResult<Vec
             d.ack_text, d.speech_topic, d.confidence, d.target_agent_id, d.work_item_id,
             d.compensated_work_item_id, d.long_task_id, d.status, d.error, d.created_at, d.updated_at
         from (
-            select *
-            from call_dispatches
-            order by created_at desc, id desc
-            limit $1
-        ) d
+            select id
+            from (
+                select id, created_at
+                from call_dispatches
+                order by created_at desc, id desc
+                limit $1
+            )
+            union
+            select id
+            from (
+                select d.id, d.created_at
+                from call_dispatches d
+                join call_utterances u on u.id = d.utterance_id
+                where not (
+                    u.status = 'ignored'
+                    and u.transcript = ''
+                    and (u.audio_duration_ms is null or u.audio_duration_ms <= 20000)
+                    and (
+                        lower(u.transcription_error) like '%no speech%'
+                        or lower(u.transcription_error) like '%speech was not detected%'
+                        or lower(u.transcription_error) like '%emptytranscript%'
+                        or lower(u.transcription_error) like '%wake word required%'
+                        or lower(u.transcription_error) like '%waiting for the wake word%'
+                        or u.transcription_error like '%等待唤醒词%'
+                    )
+                )
+                order by d.created_at desc, d.id desc
+                limit $2
+            )
+        ) selected
+        join call_dispatches d on d.id = selected.id
         join call_utterances u on u.id = d.utterance_id
         order by d.created_at asc, d.id asc
         "#,
     )
     .bind(CALL_BOOTSTRAP_DISPATCH_LIMIT)
+    .bind(CALL_BOOTSTRAP_VISIBLE_DISPATCH_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(to_string)?;
@@ -7792,8 +7846,8 @@ print(json.dumps({"tool":"dispatch_agent_work","target_agent_handle":"Ada","say"
         assert_eq!(utterances.first().unwrap().transcript, "utterance 1");
         assert_eq!(utterances.last().unwrap().transcript, "utterance 405");
 
-        assert_eq!(dispatches.len(), CALL_BOOTSTRAP_DISPATCH_LIMIT as usize);
-        assert_eq!(dispatches.first().unwrap().ack_text, "ack 246");
+        assert_eq!(dispatches.len(), 405);
+        assert_eq!(dispatches.first().unwrap().ack_text, "ack 1");
         assert_eq!(dispatches.last().unwrap().ack_text, "ack 405");
 
         let page = fetch_call_history_page(
