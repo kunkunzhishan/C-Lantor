@@ -51,18 +51,19 @@ use crate::tts::{self, TtsSynthesisRequest};
 use crate::voice::{self, VoiceTranscriptionError, VoiceTranscriptionRequest};
 use crate::{
     add_agent_to_channel, agent_workspace_list_in_pool, agent_workspace_read_file_in_pool,
-    append_ui_refresh_metrics_log, cancel_agent_work_in_pool, check_runtime_in_env,
-    claim_task_in_pool, complete_reminder_in_pool, complete_todo_item_in_pool,
-    create_agent_in_pool, create_channel_in_pool, create_todo_item_in_pool, delete_agent_in_pool,
-    delete_channel_in_pool, delete_todo_item_in_pool, dismiss_inbox_items_in_pool,
+    append_ui_refresh_metrics_log, cancel_agent_work_in_pool, cancel_reminder_in_pool,
+    check_runtime_in_env, claim_task_in_pool, complete_reminder_in_pool,
+    complete_todo_item_in_pool, create_agent_in_pool, create_channel_in_pool,
+    create_todo_item_in_pool, delete_agent_in_pool, delete_channel_in_pool,
+    delete_event_hook_in_pool, delete_todo_item_in_pool, dismiss_inbox_items_in_pool,
     fetch_messages_in_pool, forward_task_in_pool, load_artifact, load_bootstrap,
     load_ui_backend_event_payload, mark_all_owner_inbox_read_in_pool, mark_channel_read_in_pool,
     mark_inbox_items_read_in_pool, notify_ui_refresh, open_dm_with_agent_in_pool,
     process_hook_ingress_in_pool, reassign_agent_work_in_pool, retry_agent_work_in_pool,
     send_owner_message_in_pool, set_channel_agent_membership_in_pool, set_message_saved_in_pool,
     set_message_todo_in_pool, start_agent_in_pool, to_string, update_agent_in_pool,
-    update_channel_in_pool, update_owner_profile_in_pool, update_task_status_in_pool,
-    update_task_title_in_pool, FetchMessagesRequest,
+    update_agent_schedule_status_in_pool, update_channel_in_pool, update_owner_profile_in_pool,
+    update_task_status_in_pool, update_task_title_in_pool, FetchMessagesRequest,
 };
 
 const WEB_SEND_MESSAGE_BODY_LIMIT: usize = 128 * 1024 * 1024;
@@ -140,6 +141,19 @@ struct SetChannelAgentMembershipRequest {
 #[serde(rename_all = "camelCase")]
 struct ReminderIdRequest {
     reminder_id: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleStatusRequest {
+    schedule_id: Uuid,
+    status: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HookIdRequest {
+    hook_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -510,6 +524,12 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
         .route("/api/mark_all_inbox_read", post(api_mark_all_inbox_read))
         .route("/api/mark_channel_read", post(api_mark_channel_read))
         .route("/api/complete_reminder", post(api_complete_reminder))
+        .route("/api/cancel_reminder", post(api_cancel_reminder))
+        .route(
+            "/api/update_agent_schedule_status",
+            post(api_update_agent_schedule_status),
+        )
+        .route("/api/delete_event_hook", post(api_delete_event_hook))
         .route("/api/update_task_status", post(api_update_task_status))
         .route("/api/update_task_title", post(api_update_task_title))
         .route("/api/claim_task", post(api_claim_task))
@@ -3029,6 +3049,41 @@ async fn api_complete_reminder(
         .await
         .map(|_| Json(json!({ "ok": true })))
         .map_err(api_error)
+}
+
+async fn api_cancel_reminder(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ReminderIdRequest>,
+) -> Result<impl IntoResponse, Response> {
+    cancel_reminder_in_pool(&state.pool, request.reminder_id)
+        .await
+        .map(|_| Json(json!({ "ok": true })))
+        .map_err(api_error)
+}
+
+async fn api_update_agent_schedule_status(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ScheduleStatusRequest>,
+) -> Result<impl IntoResponse, Response> {
+    let should_notify_trigger_worker = request.status.trim() == "active";
+    update_agent_schedule_status_in_pool(&state.pool, request.schedule_id, request.status)
+        .await
+        .map_err(api_error)?;
+    if should_notify_trigger_worker {
+        crate::notify_trigger_worker(&state.trigger_notifier);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn api_delete_event_hook(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<HookIdRequest>,
+) -> Result<impl IntoResponse, Response> {
+    let result = delete_event_hook_in_pool(&state.pool, None, request.hook_id)
+        .await
+        .map_err(api_error)?;
+    let _ = notify_ui_refresh(&state.pool, "event_hook_deleted").await;
+    Ok(Json(json!({ "ok": true, "result": result })))
 }
 
 async fn api_update_task_status(

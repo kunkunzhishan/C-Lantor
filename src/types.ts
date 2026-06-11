@@ -227,6 +227,10 @@ export type EventHook = {
   title: string;
   body_preview: string;
   external_resources: unknown[];
+  ingress_token: string | null;
+  scheduled: boolean;
+  schedule_cadence: string;
+  next_run_at: string | null;
   status: string;
   fired_count: number;
   max_fires: number;
@@ -533,6 +537,8 @@ export type ActivityFeedItem = {
   messageId: string | null;
   taskId: string | null;
   reminderId: string | null;
+  scheduleId: string | null;
+  hookId: string | null;
   replyCount: number;
   newCount: number;
 };

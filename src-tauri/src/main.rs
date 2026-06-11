@@ -204,6 +204,10 @@ struct CreateEventHookInput {
     hook_context: Option<Value>,
     external_resources: Option<Value>,
     fixture_request: Option<Value>,
+    ingress_enabled: Option<bool>,
+    scheduled: Option<bool>,
+    schedule_cadence: Option<String>,
+    next_run_at: Option<String>,
     timeout_ms: Option<i64>,
     max_output_bytes: Option<i64>,
     max_fires: Option<i64>,
@@ -895,13 +899,14 @@ async fn maybe_insert_work_item_system_message(
     Ok(())
 }
 
-fn notify_trigger_worker(notifier: &Notify) {
+pub(crate) fn notify_trigger_worker(notifier: &Notify) {
     notifier.notify_one();
 }
 
 async fn run_trigger_pass(pool: &SqlitePool) -> CommandResult<()> {
     process_due_reminders(pool).await?;
     process_due_agent_schedules(pool).await?;
+    process_due_event_hooks(pool).await?;
     Ok(())
 }
 
@@ -983,6 +988,29 @@ fn normalize_hook_max_output_bytes(value: Option<i64>) -> CommandResult<i64> {
     Ok(max_output_bytes)
 }
 
+fn normalize_hook_schedule_cadence(value: Option<String>) -> CommandResult<String> {
+    let cadence = value.unwrap_or_else(|| "every:5m".to_owned());
+    let cadence = cadence.trim().to_ascii_lowercase();
+    if matches!(cadence.as_str(), "hourly" | "daily" | "weekly") {
+        Ok(cadence)
+    } else if let Some(minutes) = parse_reminder_interval_minutes(&cadence) {
+        Ok(format!("every:{minutes}m"))
+    } else {
+        Err(format!("unsupported hook schedule_cadence: {cadence}"))
+    }
+}
+
+fn next_hook_run_at(cadence: &str, now: DateTime<Utc>) -> CommandResult<DateTime<Utc>> {
+    match cadence.trim() {
+        "hourly" => Ok(now + chrono::Duration::hours(1)),
+        "daily" => Ok(now + chrono::Duration::days(1)),
+        "weekly" => Ok(now + chrono::Duration::weeks(1)),
+        other => parse_reminder_interval_minutes(other)
+            .map(|minutes| now + chrono::Duration::minutes(minutes))
+            .ok_or_else(|| format!("unsupported hook schedule_cadence: {other}")),
+    }
+}
+
 fn new_hook_ingress_token() -> String {
     format!("hk_{}", Uuid::new_v4().simple())
 }
@@ -1037,29 +1065,64 @@ async fn evaluate_hook_code(input: HookEvaluationInput) -> HookEvaluationOutput 
 
     let runner_script = r#"
 const fs = require("fs");
-const vm = require("vm");
+const childProcess = require("child_process");
+
+function runCommand(command, args = [], options = {}) {
+  if (!Array.isArray(args)) {
+    options = args || {};
+    args = [];
+  }
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env ? { ...process.env, ...options.env } : process.env,
+      shell: options.shell === true,
+      windowsHide: true
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+}
+
 (async () => {
   const input = JSON.parse(fs.readFileSync(0, "utf8"));
-  const sandbox = {
-    __hookJson: JSON.stringify(input.hook),
-    __contextJson: JSON.stringify(input.hook && input.hook.context ? input.hook.context : {}),
-    __requestJson: JSON.stringify(input.request || null)
+  const hook = input.hook;
+  const context = input.hook && input.hook.context ? input.hook.context : {};
+  const request = input.request || null;
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const maxOutputBytes = Math.max(0, Number(input.max_output_bytes || 0));
+  let capturedStdout = "";
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, encoding, callback) => {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString(encoding) : String(chunk);
+    if (capturedStdout.length < maxOutputBytes) {
+      capturedStdout += text.slice(0, maxOutputBytes - capturedStdout.length);
+    }
+    if (typeof callback === "function") callback();
+    return true;
   };
-  const wrapped = `"use strict";
-const hook = JSON.parse(__hookJson);
-const context = JSON.parse(__contextJson);
-const request = JSON.parse(__requestJson);
-(async () => {
-${input.code}
-})()`;
-  const result = await vm.runInNewContext(wrapped, sandbox, {
-    timeout: input.timeout_ms,
-    codeGeneration: { strings: false, wasm: false }
-  });
+  const fn = new AsyncFunction(
+    "hook",
+    "context",
+    "request",
+    "runCommand",
+    "require",
+    "process",
+    "fetch",
+    `"use strict";\n${input.code}`
+  );
+  const result = await fn(hook, context, request, runCommand, require, process, globalThis.fetch);
+  process.stdout.write = originalStdoutWrite;
   if (typeof result !== "boolean") {
     throw new Error("hook code must return a boolean");
   }
-  process.stdout.write(JSON.stringify({ triggered: result }));
+  originalStdoutWrite(JSON.stringify({ triggered: result, stdout: capturedStdout }));
 })().catch((err) => {
   process.stderr.write(err && err.stack ? err.stack : String(err));
   process.exit(1);
@@ -1073,6 +1136,7 @@ ${input.code}
             "context": input.hook_context,
         },
         "timeout_ms": input.timeout_ms,
+        "max_output_bytes": input.max_output_bytes,
     })
     .to_string();
     let mut child = match Command::new("node")
@@ -1081,6 +1145,7 @@ ${input.code}
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
     {
         Ok(child) => child,
@@ -1131,27 +1196,33 @@ ${input.code}
             };
         }
     };
-    let stdout = truncate_hook_output(&output.stdout, input.max_output_bytes);
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = truncate_hook_output(&output.stderr, input.max_output_bytes);
     if !output.status.success() {
         return HookEvaluationOutput {
             triggered: false,
             status: "failed".to_owned(),
-            stdout,
+            stdout: raw_stdout,
             stderr,
             duration_ms: started.elapsed().as_millis() as i64,
         };
     }
-    let result = serde_json::from_str::<Value>(&stdout).unwrap_or_else(|_| json!({}));
+    let result = serde_json::from_str::<Value>(&raw_stdout).unwrap_or_else(|_| json!({}));
     let Some(triggered) = result.get("triggered").and_then(Value::as_bool) else {
         return HookEvaluationOutput {
             triggered: false,
             status: "failed".to_owned(),
-            stdout,
+            stdout: raw_stdout,
             stderr: "hook runner returned invalid output".to_owned(),
             duration_ms: started.elapsed().as_millis() as i64,
         };
     };
+    let hook_stdout_raw = result
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let hook_stdout = truncate_hook_output(hook_stdout_raw.as_bytes(), input.max_output_bytes);
     HookEvaluationOutput {
         triggered,
         status: if triggered {
@@ -1160,65 +1231,23 @@ ${input.code}
             "not_triggered"
         }
         .to_owned(),
-        stdout,
+        stdout: hook_stdout,
         stderr,
         duration_ms: started.elapsed().as_millis() as i64,
     }
 }
 
-pub(crate) async fn process_hook_ingress_in_pool(
+async fn evaluate_and_maybe_fire_event_hook(
     pool: &SqlitePool,
-    ingress_token: &str,
-    method: &str,
-    path: &str,
-    query: Value,
-    headers: Value,
-    body: Value,
+    hook_row: &SqliteRow,
+    request: Option<Value>,
+    payload: Value,
+    hook_context: Value,
 ) -> CommandResult<Value> {
-    let token = ingress_token.trim();
-    if token.is_empty() {
-        return Err("hook ingress token is required".to_owned());
-    }
-    let hook_row = sqlx::query(
-        r#"
-        select id, agent_id, channel_id, thread_root_id, title, body_preview,
-               code_language, code_body, hook_context,
-               timeout_ms, max_output_bytes, max_fires, fired_count
-        from event_hooks
-        where ingress_token = $1 and status = 'active'
-        "#,
-    )
-    .bind(token)
-    .fetch_optional(pool)
-    .await
-    .map_err(to_string)?;
-    let Some(hook_row) = hook_row else {
-        return Err("hook ingress not found".to_owned());
-    };
-
     let hook_id: Uuid = hook_row.get("id");
-    let max_fires: i64 = hook_row.get("max_fires");
-    let fired_count: i64 = hook_row.get("fired_count");
-    if fired_count >= max_fires {
-        return Ok(json!({"ok": true, "triggered": false, "status": "completed"}));
-    }
-
-    let request = json!({
-        "method": method,
-        "path": path,
-        "query": query,
-        "headers": headers,
-        "body": body,
-        "received_at": Utc::now().to_rfc3339(),
-    });
-    let payload = json!({ "request": request.clone() });
-
-    let hook_context_json: String = hook_row.get("hook_context");
-    let hook_context =
-        serde_json::from_str::<Value>(&hook_context_json).unwrap_or_else(|_| json!({}));
     let evaluation = evaluate_hook_code(HookEvaluationInput {
         hook_id,
-        request: Some(request),
+        request,
         code_language: hook_row.get("code_language"),
         code_body: hook_row.get("code_body"),
         hook_context: hook_context.clone(),
@@ -1285,6 +1314,58 @@ pub(crate) async fn process_hook_ingress_in_pool(
     }))
 }
 
+pub(crate) async fn process_hook_ingress_in_pool(
+    pool: &SqlitePool,
+    ingress_token: &str,
+    method: &str,
+    path: &str,
+    query: Value,
+    headers: Value,
+    body: Value,
+) -> CommandResult<Value> {
+    let token = ingress_token.trim();
+    if token.is_empty() {
+        return Err("hook ingress token is required".to_owned());
+    }
+    let hook_row = sqlx::query(
+        r#"
+        select id, agent_id, channel_id, thread_root_id, title, body_preview,
+               code_language, code_body, hook_context,
+               timeout_ms, max_output_bytes, max_fires, fired_count
+        from event_hooks
+        where ingress_token = $1 and status = 'active'
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?;
+    let Some(hook_row) = hook_row else {
+        return Err("hook ingress not found".to_owned());
+    };
+
+    let max_fires: i64 = hook_row.get("max_fires");
+    let fired_count: i64 = hook_row.get("fired_count");
+    if fired_count >= max_fires {
+        return Ok(json!({"ok": true, "triggered": false, "status": "completed"}));
+    }
+
+    let request = json!({
+        "method": method,
+        "path": path,
+        "query": query,
+        "headers": headers,
+        "body": body,
+        "received_at": Utc::now().to_rfc3339(),
+    });
+    let payload = json!({ "request": request.clone() });
+
+    let hook_context_json: String = hook_row.get("hook_context");
+    let hook_context =
+        serde_json::from_str::<Value>(&hook_context_json).unwrap_or_else(|_| json!({}));
+    evaluate_and_maybe_fire_event_hook(pool, &hook_row, Some(request), payload, hook_context).await
+}
+
 async fn create_event_hook_in_pool(
     pool: &SqlitePool,
     input: CreateEventHookInput,
@@ -1301,6 +1382,20 @@ async fn create_event_hook_in_pool(
     let timeout_ms = normalize_hook_timeout_ms(input.timeout_ms)?;
     let max_output_bytes = normalize_hook_max_output_bytes(input.max_output_bytes)?;
     let max_fires = input.max_fires.unwrap_or(1);
+    let scheduled = input.scheduled.unwrap_or(false);
+    let ingress_enabled = input.ingress_enabled.unwrap_or(!scheduled);
+    if !scheduled && !ingress_enabled {
+        return Err("hook_create requires ingress_enabled or scheduled".to_owned());
+    }
+    let schedule_cadence = normalize_hook_schedule_cadence(input.schedule_cadence)?;
+    let next_run_at = if scheduled {
+        Some(match input.next_run_at {
+            Some(value) => parse_due_at(&value)?,
+            None => next_hook_run_at(&schedule_cadence, Utc::now())?,
+        })
+    } else {
+        None
+    };
     if !(1..=10_000).contains(&max_fires) {
         return Err("hook max_fires must be between 1 and 10000".to_owned());
     }
@@ -1372,10 +1467,10 @@ async fn create_event_hook_in_pool(
         insert into event_hooks (
             agent_id, channel_id, thread_root_id, title, body_preview,
             source_type, ingress_token, event_type, subject, code_language, code_body, code_hash,
-            hook_context, external_resources, fixture_event, validation_status, timeout_ms,
-            max_output_bytes, max_fires
+            hook_context, external_resources, fixture_event, validation_status, scheduled,
+            schedule_cadence, next_run_at, timeout_ms, max_output_bytes, max_fires
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'valid', $16, $17, $18)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'valid', $16, $17, $18, $19, $20, $21)
         returning id
         "#,
     )
@@ -1385,7 +1480,11 @@ async fn create_event_hook_in_pool(
     .bind(title)
     .bind(body_preview)
     .bind("hook")
-    .bind(Some(new_hook_ingress_token()))
+    .bind(if ingress_enabled {
+        Some(new_hook_ingress_token())
+    } else {
+        None
+    })
     .bind("hook.request")
     .bind(Option::<String>::None)
     .bind(code_language)
@@ -1394,6 +1493,9 @@ async fn create_event_hook_in_pool(
     .bind(hook_context.to_string())
     .bind(external_resources.to_string())
     .bind(json!({}).to_string())
+    .bind(scheduled)
+    .bind(&schedule_cadence)
+    .bind(next_run_at)
     .bind(timeout_ms)
     .bind(max_output_bytes)
     .bind(max_fires)
@@ -1412,7 +1514,10 @@ async fn create_event_hook_in_pool(
         "validation_status": validation.status,
             "validation_stdout": validation.stdout,
             "validation_stderr": validation.stderr,
-            "code_hash": code_hash
+            "code_hash": code_hash,
+            "ingress_enabled": ingress_enabled,
+            "scheduled": scheduled,
+            "schedule_cadence": schedule_cadence
         })
         .to_string(),
     )
@@ -1422,7 +1527,7 @@ async fn create_event_hook_in_pool(
     Ok(hook_id)
 }
 
-async fn delete_event_hook_in_pool(
+pub(crate) async fn delete_event_hook_in_pool(
     pool: &SqlitePool,
     agent_id: Option<Uuid>,
     hook_id: Uuid,
@@ -1489,6 +1594,13 @@ async fn delete_event_hook_in_pool(
         "pending_external_cleanup": external_resources,
         "agent_responsibility": "inspect pending_external_cleanup and remove those provider-side or network resources if they still exist"
     }))
+}
+
+#[tauri::command]
+async fn delete_event_hook(hook_id: Uuid, state: State<'_, AppState>) -> CommandResult<Value> {
+    let result = delete_event_hook_in_pool(&state.pool, None, hook_id).await?;
+    let _ = notify_ui_refresh(&state.pool, "event_hook_deleted").await;
+    Ok(result)
 }
 
 async fn fire_event_hook_to_agent(
@@ -1875,6 +1987,94 @@ async fn process_due_agent_schedules(pool: &SqlitePool) -> CommandResult<()> {
     Ok(())
 }
 
+async fn process_due_event_hooks(pool: &SqlitePool) -> CommandResult<()> {
+    let rows = sqlx::query(
+        r#"
+        select id, agent_id, channel_id, thread_root_id, title, body_preview,
+               code_language, code_body, hook_context, schedule_cadence, next_run_at,
+               timeout_ms, max_output_bytes, max_fires, fired_count
+        from event_hooks
+        where status = 'active'
+          and scheduled = 1
+          and next_run_at is not null
+          and next_run_at <= strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+          and fired_count < max_fires
+        order by next_run_at asc
+        limit 8
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(to_string)?;
+
+    let due_any = !rows.is_empty();
+    for row in rows {
+        let hook_id: Uuid = row.get("id");
+        let schedule_cadence: String = row.get("schedule_cadence");
+        let now = Utc::now();
+        let next_run_at = next_hook_run_at(&schedule_cadence, now)?;
+        let updated = sqlx::query(
+            r#"
+            update event_hooks
+            set next_run_at = $2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+            where id = $1
+              and status = 'active'
+              and scheduled = 1
+              and next_run_at <= strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+            "#,
+        )
+        .bind(hook_id)
+        .bind(next_run_at)
+        .execute(pool)
+        .await
+        .map_err(to_string)?
+        .rows_affected();
+        if updated == 0 {
+            continue;
+        }
+
+        let hook_context_json: String = row.get("hook_context");
+        let hook_context =
+            serde_json::from_str::<Value>(&hook_context_json).unwrap_or_else(|_| json!({}));
+        let payload = json!({
+            "scheduled": {
+                "hook_id": hook_id,
+                "schedule_cadence": schedule_cadence,
+                "fired_at": now.to_rfc3339(),
+                "next_run_at": next_run_at.to_rfc3339()
+            }
+        });
+        let result =
+            evaluate_and_maybe_fire_event_hook(pool, &row, None, payload, hook_context).await?;
+        record_agent_activity(
+            pool,
+            Some(row.get("agent_id")),
+            None,
+            "hook",
+            if result.get("triggered").and_then(Value::as_bool) == Some(true) {
+                "Scheduled hook fired"
+            } else {
+                "Scheduled hook checked"
+            },
+            json!({
+                "hook_id": hook_id,
+                "title": row.get::<String, _>("title"),
+                "status": result.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+                "triggered": result.get("triggered").cloned().unwrap_or_else(|| json!(false)),
+                "schedule_cadence": schedule_cadence,
+                "next_run_at": next_run_at.to_rfc3339()
+            })
+            .to_string(),
+        )
+        .await?;
+    }
+    if due_any {
+        let _ = notify_ui_refresh(pool, "event_hook_due").await;
+    }
+    Ok(())
+}
+
 fn spawn_ui_refresh_listener(app: tauri::AppHandle, pool: SqlitePool) {
     tauri::async_runtime::spawn(async move {
         let mut last_id: i64 = sqlx::query_scalar("select coalesce(max(id), 0) from ui_events")
@@ -2111,6 +2311,9 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             external_resources text not null default '[]',
             fixture_event text not null default '{}',
             validation_status text not null default 'pending',
+            scheduled boolean not null default 0,
+            schedule_cadence text not null default 'every:5m',
+            next_run_at text,
             timeout_ms integer not null default 1000,
             max_output_bytes integer not null default 4096,
             status text not null default 'active',
@@ -2356,6 +2559,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "create index if not exists reminders_due_idx on reminders(status, due_at)",
         "create unique index if not exists event_hooks_ingress_token_unique on event_hooks(ingress_token) where ingress_token is not null",
         "create index if not exists event_hook_events_hook_created_idx on event_hook_events(hook_id, created_at)",
+        "create index if not exists event_hooks_scheduled_due_idx on event_hooks(status, scheduled, next_run_at)",
         "create index if not exists agent_schedules_due_idx on agent_schedules(status, next_run_at)",
         "create index if not exists agent_memory_observations_agent_created_idx on agent_memory_observations(agent_id, created_at desc)",
         "create index if not exists agent_memory_observations_layer_created_idx on agent_memory_observations(layer, created_at desc)",
@@ -2583,6 +2787,26 @@ async fn migrate_event_hooks_schema(pool: &SqlitePool) -> Result<(), sqlx::Error
         .execute(pool)
         .await?;
         columns.insert("max_output_bytes".to_owned());
+    }
+    if !columns.contains("scheduled") {
+        sqlx::query("alter table event_hooks add column scheduled boolean not null default 0")
+            .execute(pool)
+            .await?;
+        columns.insert("scheduled".to_owned());
+    }
+    if !columns.contains("schedule_cadence") {
+        sqlx::query(
+            "alter table event_hooks add column schedule_cadence text not null default 'every:5m'",
+        )
+        .execute(pool)
+        .await?;
+        columns.insert("schedule_cadence".to_owned());
+    }
+    if !columns.contains("next_run_at") {
+        sqlx::query("alter table event_hooks add column next_run_at text")
+            .execute(pool)
+            .await?;
+        columns.insert("next_run_at".to_owned());
     }
     sqlx::query(
         "update event_hooks set source_type = 'hook' where source_type is null or source_type = '' or source_type = 'event'",
@@ -7030,7 +7254,10 @@ async fn create_reminder_in_pool(
     Ok(reminder_id)
 }
 
-async fn cancel_reminder_in_pool(pool: &SqlitePool, reminder_id: Uuid) -> CommandResult<()> {
+pub(crate) async fn cancel_reminder_in_pool(
+    pool: &SqlitePool,
+    reminder_id: Uuid,
+) -> CommandResult<()> {
     let affected = sqlx::query(
         r#"
         update reminders
@@ -7267,6 +7494,19 @@ async fn update_agent_schedule_status(
     status: String,
     state: State<'_, AppState>,
 ) -> CommandResult<()> {
+    let should_notify_trigger_worker = status.trim() == "active";
+    update_agent_schedule_status_in_pool(&state.pool, schedule_id, status).await?;
+    if should_notify_trigger_worker {
+        notify_trigger_worker(&state.trigger_notifier);
+    }
+    Ok(())
+}
+
+pub(crate) async fn update_agent_schedule_status_in_pool(
+    pool: &SqlitePool,
+    schedule_id: Uuid,
+    status: String,
+) -> CommandResult<()> {
     let status = status.trim();
     if !matches!(status, "active" | "paused" | "cancelled") {
         return Err(format!("unsupported schedule status: {status}"));
@@ -7282,7 +7522,7 @@ async fn update_agent_schedule_status(
     )
     .bind(schedule_id)
     .bind(status)
-    .fetch_optional(&state.pool)
+    .fetch_optional(pool)
     .await
     .map_err(to_string)?;
     let Some(row) = row else {
@@ -7290,7 +7530,7 @@ async fn update_agent_schedule_status(
     };
     let agent_id: Uuid = row.get("agent_id");
     record_agent_activity(
-        &state.pool,
+        pool,
         Some(agent_id),
         None,
         "schedule",
@@ -7303,10 +7543,7 @@ async fn update_agent_schedule_status(
         schedule_id.to_string(),
     )
     .await?;
-    let _ = notify_ui_refresh(&state.pool, "agent_schedule_updated").await;
-    if status == "active" {
-        notify_trigger_worker(&state.trigger_notifier);
-    }
+    let _ = notify_ui_refresh(pool, "agent_schedule_updated").await;
     Ok(())
 }
 
@@ -8998,6 +9235,10 @@ async fn load_event_hooks(pool: &SqlitePool) -> CommandResult<Vec<EventHook>> {
             h.title,
             h.body_preview,
             h.external_resources,
+            h.ingress_token,
+            h.scheduled,
+            h.schedule_cadence,
+            h.next_run_at,
             h.status,
             h.fired_count,
             h.max_fires,
@@ -9032,6 +9273,10 @@ async fn load_event_hooks(pool: &SqlitePool) -> CommandResult<Vec<EventHook>> {
                 &row.get::<String, _>("external_resources"),
             )
             .unwrap_or_else(|_| json!([])),
+            ingress_token: row.get("ingress_token"),
+            scheduled: row.get("scheduled"),
+            schedule_cadence: row.get("schedule_cadence"),
+            next_run_at: row.get("next_run_at"),
             status: row.get("status"),
             fired_count: row.get("fired_count"),
             max_fires: row.get("max_fires"),
@@ -10970,6 +11215,10 @@ async fn handle_agent_event(
             hook_context,
             external_resources,
             fixture_request,
+            ingress_enabled,
+            scheduled,
+            schedule_cadence,
+            next_run_at,
             timeout_ms,
             max_output_bytes,
             max_fires,
@@ -10997,6 +11246,10 @@ async fn handle_agent_event(
                     hook_context,
                     external_resources: external_resources.clone(),
                     fixture_request,
+                    ingress_enabled,
+                    scheduled,
+                    schedule_cadence,
+                    next_run_at,
                     timeout_ms,
                     max_output_bytes,
                     max_fires,
@@ -11021,6 +11274,7 @@ async fn handle_agent_event(
                     "channel_id": resolved_channel_id,
                     "thread_root_id": resolved_thread_root_id,
                     "ingress_token": hook_ingress_token.clone(),
+                    "scheduled": scheduled.unwrap_or(false),
                     "external_resources": external_resources.unwrap_or_else(|| json!([]))
                 })
                 .to_string(),
@@ -18878,6 +19132,7 @@ pub fn run() {
             claim_task,
             delete_agent,
             delete_channel,
+            delete_event_hook,
             delete_message,
             dispatch_agent_work,
             fetch_call_history,
@@ -19006,9 +19261,9 @@ mod tests {
         mark_inbox_items_read_in_pool, maybe_hide_silent_streaming_reply, memory_observation_layer,
         migrate, normalize_open_link_target, notify_trigger_worker, notify_ui_work_item_changed,
         open_dm_with_agent_in_pool, parse_activity_metadata, parse_tailscale_ipv4_from_text,
-        prepend_inbox_context, process_due_agent_schedules, process_due_reminders,
-        process_hook_ingress_in_pool, queue_mentions_as_work_items, reassign_agent_work_in_pool,
-        record_agent_activity, record_codex_memory_read_observation,
+        prepend_inbox_context, process_due_agent_schedules, process_due_event_hooks,
+        process_due_reminders, process_hook_ingress_in_pool, queue_mentions_as_work_items,
+        reassign_agent_work_in_pool, record_agent_activity, record_codex_memory_read_observation,
         recover_supervisor_commands_at_startup, sanitize_window_state, send_owner_message_in_pool,
         set_channel_agent_membership_in_pool, should_append_codex_stream_line_to_run_log,
         should_keep_ui_refresh_metric_line, silent_reply_reason,
@@ -30102,6 +30357,10 @@ return request.method === "POST"
                             "repository": {"full_name": "example-org/example-repo"}
                         }
                     })),
+                    ingress_enabled: None,
+                    scheduled: None,
+                    schedule_cadence: None,
+                    next_run_at: None,
                     timeout_ms: Some(1000),
                     max_output_bytes: Some(4096),
                     max_fires: Some(1),
@@ -30178,43 +30437,121 @@ return request.method === "POST"
     }
 
     #[tokio::test]
-    async fn hook_code_cannot_escape_to_node_process() {
+    async fn scheduled_event_hook_runs_code_without_starting_agent_first() {
         let Some((pool, schema)) = test_pool().await else {
             return;
         };
         let result: Result<(), String> = async {
-            let agent_id = insert_test_agent(&pool, "hook-sandbox-agent").await?;
-            let channel_id = insert_test_channel(&pool, "hook-sandbox").await?;
-            let err = create_event_hook_in_pool(
+            let agent_id = insert_test_agent(&pool, "scheduled-hook-agent").await?;
+            let channel_id = insert_test_channel(&pool, "scheduled-hook-events").await?;
+            let hook_id = create_event_hook_in_pool(
                 &pool,
                 CreateEventHookInput {
                     agent_id,
                     channel_id,
                     thread_root_id: None,
-                    title: "Escaping hook".to_owned(),
-                    body_preview: None,
+                    title: "Check local signal".to_owned(),
+                    body_preview: Some("Report scheduled signal".to_owned()),
                     code_language: Some("javascript".to_owned()),
-                    code_body: r#"return request.constructor.constructor("return process")().env !== undefined;"#
-                        .to_owned(),
-                    hook_context: None,
+                    code_body: "return context.ready === true;".to_owned(),
+                    hook_context: Some(json!({"ready": true})),
                     external_resources: None,
-                    fixture_request: Some(json!({
-                        "method": "POST",
-                        "headers": {},
-                        "query": {},
-                        "body": {}
-                    })),
+                    fixture_request: None,
+                    ingress_enabled: Some(false),
+                    scheduled: Some(true),
+                    schedule_cadence: Some("every:5m".to_owned()),
+                    next_run_at: Some("2000-01-01T00:00:00+00:00".to_owned()),
                     timeout_ms: Some(1000),
                     max_output_bytes: Some(4096),
                     max_fires: Some(1),
                 },
             )
+            .await?;
+            let ingress_token: Option<String> =
+                sqlx::query_scalar("select ingress_token from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(ingress_token, None);
+
+            process_due_event_hooks(&pool).await?;
+
+            let inbox_payload: String = sqlx::query_scalar(
+                "select payload from agent_inbox_items where agent_id = $1 and kind = 'event_hook_fired'",
+            )
+            .bind(agent_id)
+            .fetch_one(&pool)
             .await
-            .expect_err("sandbox escape should fail validation");
-            assert!(
-                err.contains("hook validation failed"),
-                "unexpected error: {err}"
-            );
+            .map_err(|err| err.to_string())?;
+            let inbox_payload: Value =
+                serde_json::from_str(&inbox_payload).map_err(|err| err.to_string())?;
+            let payload_hook_id = inbox_payload
+                .pointer("/payload/scheduled/hook_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            assert_eq!(payload_hook_id, hook_id.to_string());
+
+            let hook_status: String =
+                sqlx::query_scalar("select status from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(hook_status, "completed");
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn hook_code_can_use_node_process_and_run_command() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "hook-full-access-agent").await?;
+            let channel_id = insert_test_channel(&pool, "hook-full-access").await?;
+            let hook_id = create_event_hook_in_pool(
+                &pool,
+                CreateEventHookInput {
+                    agent_id,
+                    channel_id,
+                    thread_root_id: None,
+                    title: "Full access hook".to_owned(),
+                    body_preview: None,
+                    code_language: Some("javascript".to_owned()),
+                    code_body: r#"
+const out = await runCommand("node", ["-e", "process.stdout.write(process.platform)"]);
+return process.env !== undefined && out.code === 0 && out.stdout.trim() === process.platform;
+"#
+                    .to_owned(),
+                    hook_context: None,
+                    external_resources: None,
+                    fixture_request: None,
+                    ingress_enabled: Some(false),
+                    scheduled: Some(true),
+                    schedule_cadence: None,
+                    next_run_at: Some("2000-01-01T00:00:00+00:00".to_owned()),
+                    timeout_ms: Some(3000),
+                    max_output_bytes: Some(4096),
+                    max_fires: Some(1),
+                },
+            )
+            .await?;
+            process_due_event_hooks(&pool).await?;
+
+            let triggered_count: i64 = sqlx::query_scalar(
+                "select count(*) from event_hook_runs where hook_id = $1 and triggered = 1",
+            )
+            .bind(hook_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(triggered_count, 1);
             Ok(())
         }
         .await;
@@ -30255,6 +30592,10 @@ return request.method === "POST"
                         "query": {},
                         "body": {"action": "opened"}
                     })),
+                    ingress_enabled: None,
+                    scheduled: None,
+                    schedule_cadence: None,
+                    next_run_at: None,
                     timeout_ms: Some(1000),
                     max_output_bytes: Some(4096),
                     max_fires: Some(10),

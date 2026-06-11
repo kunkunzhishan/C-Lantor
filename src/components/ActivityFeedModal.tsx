@@ -51,6 +51,13 @@ function kindLabel(kind: ActivityFeedKind) {
   return kind === "dm" ? "DM" : kind;
 }
 
+function dismissActionLabel(item: ActivityFeedItem) {
+  if (item.kind === "reminder" || item.kind === "schedule" || item.kind === "hook") {
+    return "Delete";
+  }
+  return "Dismiss";
+}
+
 function actorAvatarAgent(item: ActivityFeedItem, agents: Agent[], ownerProfile: OwnerProfile) {
   if (item.actorAgentId) return agents.find((agent) => agent.id === item.actorAgentId) ?? null;
   if (item.actorRole === "owner") return ownerAsAvatarAgent(ownerProfile);
@@ -301,6 +308,7 @@ export function ActivityFeedModal({
           {visibleItems.map((item) => {
             const Icon = iconFor(item.kind);
             const avatarAgent = actorAvatarAgent(item, agents, ownerProfile);
+            const dismissLabel = dismissActionLabel(item);
             const swipeOffset = swipeState?.itemId === item.id ? swipeState.offsetX : 0;
             const excerpt = item.excerpt.trim() === item.title.trim() ? "" : item.excerpt;
             const rowClassName = [
@@ -320,7 +328,7 @@ export function ActivityFeedModal({
               >
                 <div className="activity-feed-swipe-action" aria-hidden="true">
                   <X size={18} />
-                  <span>Dismiss</span>
+                  <span>{dismissLabel}</span>
                 </div>
                 <article
                   className={rowClassName}
@@ -363,7 +371,7 @@ export function ActivityFeedModal({
                     ) : null}
                     <button
                       className="activity-feed-dismiss"
-                      title="Dismiss"
+                      title={dismissLabel}
                       onClick={(event) => {
                         event.stopPropagation();
                         onDismissItem(item);

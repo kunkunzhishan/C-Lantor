@@ -2613,6 +2613,8 @@ function App() {
         messageId: latest?.id ?? null,
         taskId: null,
         reminderId: null,
+        scheduleId: null,
+        hookId: null,
         replyCount: latest?.thread_root_id ? (threadReplyCounts[latest.thread_root_id] ?? 0) : 0,
         newCount: channel.unread_count,
       });
@@ -2643,6 +2645,8 @@ function App() {
         messageId: currentMessage.id,
         taskId: null,
         reminderId: null,
+        scheduleId: null,
+        hookId: null,
         replyCount: threadReplyCounts[root.id] ?? 0,
         newCount: unreadCount,
       });
@@ -2665,6 +2669,8 @@ function App() {
           messageId: task.message_id,
           taskId: task.id,
           reminderId: null,
+          scheduleId: null,
+          hookId: null,
           replyCount: threadReplyCounts[task.message_id] ?? 0,
           newCount: 0,
         });
@@ -2688,6 +2694,8 @@ function App() {
           messageId: reminder.message_id,
           taskId: null,
           reminderId: reminder.id,
+          scheduleId: null,
+          hookId: null,
           replyCount: reminder.thread_root_id ? (threadReplyCounts[reminder.thread_root_id] ?? 0) : 0,
           newCount: 1,
         });
@@ -2712,6 +2720,8 @@ function App() {
           messageId: null,
           taskId: null,
           reminderId: null,
+          scheduleId: schedule.id,
+          hookId: null,
           replyCount: schedule.thread_root_id ? (threadReplyCounts[schedule.thread_root_id] ?? 0) : 0,
           newCount: 0,
         });
@@ -2736,6 +2746,8 @@ function App() {
           messageId: null,
           taskId: null,
           reminderId: null,
+          scheduleId: null,
+          hookId: hook.id,
           replyCount: hook.thread_root_id ? (threadReplyCounts[hook.thread_root_id] ?? 0) : 0,
           newCount: 0,
         });
@@ -4159,6 +4171,33 @@ function App() {
   }
 
   async function dismissActivityFeedItem(item: ActivityFeedItem) {
+    if (item.kind === "reminder" && item.reminderId) {
+      setDismissedActivityFeedItems((current) => ({
+        ...current,
+        [item.dismissId]: activityFeedItemCutoff(item),
+      }));
+      await apiInvoke("cancel_reminder", { reminderId: item.reminderId });
+      await refresh({ reason: "mutation:activity_feed_reminder_cancel", source: "mutation" });
+      return;
+    }
+    if (item.kind === "schedule" && item.scheduleId) {
+      setDismissedActivityFeedItems((current) => ({
+        ...current,
+        [item.dismissId]: activityFeedItemCutoff(item),
+      }));
+      await apiInvoke("update_agent_schedule_status", { scheduleId: item.scheduleId, status: "cancelled" });
+      await refresh({ reason: "mutation:activity_feed_schedule_cancel", source: "mutation" });
+      return;
+    }
+    if (item.kind === "hook" && item.hookId) {
+      setDismissedActivityFeedItems((current) => ({
+        ...current,
+        [item.dismissId]: activityFeedItemCutoff(item),
+      }));
+      await apiInvoke("delete_event_hook", { hookId: item.hookId });
+      await refresh({ reason: "mutation:activity_feed_hook_delete", source: "mutation" });
+      return;
+    }
     const dismissedUntil = activityFeedItemCutoff(item);
     setDismissedActivityFeedItems((current) => ({ ...current, [item.dismissId]: dismissedUntil }));
     await persistDismissedActivityFeedItems([item], dismissedUntil);
