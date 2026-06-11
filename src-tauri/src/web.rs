@@ -10,7 +10,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
-    http::{header, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderName, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive},
@@ -2631,12 +2631,68 @@ async fn api_record_ui_refresh_metric(
         .map_err(api_error)
 }
 
+fn hook_ingress_response(mut result: Value) -> Response {
+    let Some(response) = result
+        .get_mut("response")
+        .map(Value::take)
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return Json(result).into_response();
+    };
+    let status = response
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    if let Some(headers) = response.get("headers").and_then(Value::as_object) {
+        for (name, value) in headers {
+            let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            let Ok(header_value) = HeaderValue::from_str(value) else {
+                continue;
+            };
+            builder = builder.header(header_name, header_value);
+        }
+    }
+    let body = response.get("body").cloned().unwrap_or(Value::Null);
+    let has_content_type = response
+        .get("headers")
+        .and_then(Value::as_object)
+        .is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-type"))
+        });
+    let body_bytes = match body {
+        Value::Null => Vec::new(),
+        Value::String(value) => value.into_bytes(),
+        other => {
+            if !has_content_type {
+                builder = builder.header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+            }
+            serde_json::to_vec(&other).unwrap_or_default()
+        }
+    };
+    builder
+        .body(Body::from(body_bytes))
+        .unwrap_or_else(|err| api_error(err.to_string()))
+}
+
 async fn api_hook_ingress(
     State(state): State<Arc<WebState>>,
     AxumPath(ingress_token): AxumPath<String>,
     Query(query): Query<HashMap<String, String>>,
     request: Request<Body>,
-) -> Result<impl IntoResponse, Response> {
+) -> Result<Response, Response> {
     let method = request.method().as_str().to_owned();
     let path = request.uri().path().to_owned();
     let headers = request
@@ -2652,6 +2708,7 @@ async fn api_hook_ingress(
     let body_bytes = to_bytes(request.into_body(), WEB_HOOK_INGRESS_BODY_LIMIT)
         .await
         .map_err(|err| api_error(err.to_string()))?;
+    let raw_body = String::from_utf8_lossy(&body_bytes).to_string();
     let body = if body_bytes.is_empty() {
         json!({})
     } else {
@@ -2669,11 +2726,12 @@ async fn api_hook_ingress(
         json!(query),
         json!(headers),
         body,
+        Some(raw_body),
     )
     .await
     .map_err(api_error)?;
     state.trigger_notifier.notify_one();
-    Ok(Json(result))
+    Ok(hook_ingress_response(result))
 }
 
 async fn api_send_message(

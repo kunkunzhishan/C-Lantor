@@ -1035,6 +1035,7 @@ struct HookEvaluationInput {
 #[derive(Debug)]
 struct HookEvaluationOutput {
     triggered: bool,
+    response: Option<Value>,
     status: String,
     stdout: String,
     stderr: String,
@@ -1056,6 +1057,7 @@ async fn evaluate_hook_code(input: HookEvaluationInput) -> HookEvaluationOutput 
     if input.code_language != "javascript" {
         return HookEvaluationOutput {
             triggered: false,
+            response: None,
             status: "failed".to_owned(),
             stdout: String::new(),
             stderr: format!("unsupported hook code language: {}", input.code_language),
@@ -1119,10 +1121,22 @@ function runCommand(command, args = [], options = {}) {
   );
   const result = await fn(hook, context, request, runCommand, require, process, globalThis.fetch);
   process.stdout.write = originalStdoutWrite;
-  if (typeof result !== "boolean") {
-    throw new Error("hook code must return a boolean");
+  let normalized;
+  if (typeof result === "boolean") {
+    normalized = { triggered: result };
+  } else if (result && typeof result === "object" && !Array.isArray(result)) {
+    const triggered = typeof result.trigger === "boolean" ? result.trigger : result.triggered;
+    if (typeof triggered !== "boolean") {
+      throw new Error("hook code object result must include boolean trigger");
+    }
+    normalized = { triggered };
+    if (Object.prototype.hasOwnProperty.call(result, "response")) {
+      normalized.response = result.response;
+    }
+  } else {
+    throw new Error("hook code must return a boolean or an object");
   }
-  originalStdoutWrite(JSON.stringify({ triggered: result, stdout: capturedStdout }));
+  originalStdoutWrite(JSON.stringify({ ...normalized, stdout: capturedStdout }));
 })().catch((err) => {
   process.stderr.write(err && err.stack ? err.stack : String(err));
   process.exit(1);
@@ -1152,6 +1166,7 @@ function runCommand(command, args = [], options = {}) {
         Err(err) => {
             return HookEvaluationOutput {
                 triggered: false,
+                response: None,
                 status: "failed".to_owned(),
                 stdout: String::new(),
                 stderr: err.to_string(),
@@ -1163,6 +1178,7 @@ function runCommand(command, args = [], options = {}) {
         if let Err(err) = stdin.write_all(stdin_payload.as_bytes()).await {
             return HookEvaluationOutput {
                 triggered: false,
+                response: None,
                 status: "failed".to_owned(),
                 stdout: String::new(),
                 stderr: err.to_string(),
@@ -1180,6 +1196,7 @@ function runCommand(command, args = [], options = {}) {
         Ok(Err(err)) => {
             return HookEvaluationOutput {
                 triggered: false,
+                response: None,
                 status: "failed".to_owned(),
                 stdout: String::new(),
                 stderr: err.to_string(),
@@ -1189,6 +1206,7 @@ function runCommand(command, args = [], options = {}) {
         Err(_) => {
             return HookEvaluationOutput {
                 triggered: false,
+                response: None,
                 status: "timeout".to_owned(),
                 stdout: String::new(),
                 stderr: "hook code timed out".to_owned(),
@@ -1201,6 +1219,7 @@ function runCommand(command, args = [], options = {}) {
     if !output.status.success() {
         return HookEvaluationOutput {
             triggered: false,
+            response: None,
             status: "failed".to_owned(),
             stdout: raw_stdout,
             stderr,
@@ -1211,6 +1230,7 @@ function runCommand(command, args = [], options = {}) {
     let Some(triggered) = result.get("triggered").and_then(Value::as_bool) else {
         return HookEvaluationOutput {
             triggered: false,
+            response: None,
             status: "failed".to_owned(),
             stdout: raw_stdout,
             stderr: "hook runner returned invalid output".to_owned(),
@@ -1223,8 +1243,13 @@ function runCommand(command, args = [], options = {}) {
         .unwrap_or_default()
         .to_owned();
     let hook_stdout = truncate_hook_output(hook_stdout_raw.as_bytes(), input.max_output_bytes);
+    let response = result
+        .get("response")
+        .cloned()
+        .filter(|value| !value.is_null());
     HookEvaluationOutput {
         triggered,
+        response,
         status: if triggered {
             "triggered"
         } else {
@@ -1274,12 +1299,17 @@ async fn evaluate_and_maybe_fire_event_hook(
     .await
     .map_err(to_string)?;
 
+    let response = evaluation.response.clone();
     if !evaluation.triggered {
-        return Ok(json!({
+        let mut result = json!({
             "ok": true,
             "triggered": false,
             "status": evaluation.status
-        }));
+        });
+        if let Some(response) = response {
+            result["response"] = response;
+        }
+        return Ok(result);
     }
     fire_event_hook_to_agent(
         pool,
@@ -1307,11 +1337,15 @@ async fn evaluate_and_maybe_fire_event_hook(
     .await
     .map_err(to_string)?;
     let _ = notify_ui_refresh(pool, "event_hook_fired").await;
-    Ok(json!({
+    let mut result = json!({
         "ok": true,
         "triggered": true,
         "status": evaluation.status
-    }))
+    });
+    if let Some(response) = response {
+        result["response"] = response;
+    }
+    Ok(result)
 }
 
 pub(crate) async fn process_hook_ingress_in_pool(
@@ -1322,6 +1356,7 @@ pub(crate) async fn process_hook_ingress_in_pool(
     query: Value,
     headers: Value,
     body: Value,
+    raw_body: Option<String>,
 ) -> CommandResult<Value> {
     let token = ingress_token.trim();
     if token.is_empty() {
@@ -1356,6 +1391,7 @@ pub(crate) async fn process_hook_ingress_in_pool(
         "query": query,
         "headers": headers,
         "body": body,
+        "rawBody": raw_body.unwrap_or_default(),
         "received_at": Utc::now().to_rfc3339(),
     });
     let payload = json!({ "request": request.clone() });
@@ -30386,6 +30422,7 @@ return request.method === "POST"
                     "action": "closed",
                     "repository": {"full_name": "example-org/example-repo"}
                 }),
+                None,
             )
             .await?;
             assert_eq!(unmatched.get("triggered").and_then(Value::as_bool), Some(false));
@@ -30402,6 +30439,7 @@ return request.method === "POST"
                     "repository": {"full_name": "example-org/example-repo"},
                     "issue": {"number": 7, "title": "Bug", "html_url": "https://example.test/7"}
                 }),
+                None,
             )
             .await?;
             assert_eq!(matched.get("triggered").and_then(Value::as_bool), Some(true));
@@ -30429,6 +30467,126 @@ return request.method === "POST"
                     .await
                     .map_err(|err| err.to_string())?;
             assert_eq!(hook_status, "completed");
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn ingress_hook_can_return_custom_response_and_read_raw_body() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "hook-response-agent").await?;
+            let channel_id = insert_test_channel(&pool, "hook-response-events").await?;
+            let hook_id = create_event_hook_in_pool(
+                &pool,
+                CreateEventHookInput {
+                    agent_id,
+                    channel_id,
+                    thread_root_id: None,
+                    title: "Verify external callback".to_owned(),
+                    body_preview: Some("External verification".to_owned()),
+                    code_language: Some("javascript".to_owned()),
+                    code_body: r#"
+if (request.body.type === "url_verification") {
+  return {
+    trigger: false,
+    response: {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+      body: request.body.challenge
+    }
+  };
+}
+return {
+  trigger: request.rawBody === '{"type":"event_callback","ok":true}',
+  response: { status: 202, body: { accepted: true } }
+};
+"#
+                    .to_owned(),
+                    hook_context: None,
+                    external_resources: None,
+                    fixture_request: Some(json!({
+                        "method": "POST",
+                        "path": "/api/hooks/test/ingress",
+                        "query": {},
+                        "headers": {},
+                        "body": {"type": "url_verification", "challenge": "fixture-challenge"},
+                        "rawBody": "{\"type\":\"url_verification\",\"challenge\":\"fixture-challenge\"}"
+                    })),
+                    ingress_enabled: None,
+                    scheduled: None,
+                    schedule_cadence: None,
+                    next_run_at: None,
+                    timeout_ms: Some(1000),
+                    max_output_bytes: Some(4096),
+                    max_fires: Some(1),
+                },
+            )
+            .await?;
+            let ingress_token: String =
+                sqlx::query_scalar("select ingress_token from event_hooks where id = $1")
+                    .bind(hook_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+
+            let verification = process_hook_ingress_in_pool(
+                &pool,
+                &ingress_token,
+                "POST",
+                "/api/hooks/test/ingress",
+                json!({}),
+                json!({}),
+                json!({"type": "url_verification", "challenge": "challenge-123"}),
+                Some(r#"{"type":"url_verification","challenge":"challenge-123"}"#.to_owned()),
+            )
+            .await?;
+            assert_eq!(
+                verification.get("triggered").and_then(Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                verification
+                    .pointer("/response/body")
+                    .and_then(Value::as_str),
+                Some("challenge-123")
+            );
+
+            let event = process_hook_ingress_in_pool(
+                &pool,
+                &ingress_token,
+                "POST",
+                "/api/hooks/test/ingress",
+                json!({}),
+                json!({}),
+                json!({"type": "event_callback", "ok": true}),
+                Some(r#"{"type":"event_callback","ok":true}"#.to_owned()),
+            )
+            .await?;
+            assert_eq!(event.get("triggered").and_then(Value::as_bool), Some(true));
+            assert_eq!(
+                event.pointer("/response/status").and_then(Value::as_i64),
+                Some(202)
+            );
+            assert_eq!(
+                event.pointer("/response/body/accepted")
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+
+            let inbox_count: i64 = sqlx::query_scalar(
+                "select count(*) from agent_inbox_items where agent_id = $1 and kind = 'event_hook_fired'",
+            )
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(inbox_count, 1);
             Ok(())
         }
         .await;
@@ -30616,6 +30774,7 @@ return process.env !== undefined && out.code === 0 && out.stdout.trim() === proc
                 json!({}),
                 json!({}),
                 json!({"action": "opened"}),
+                None,
             )
             .await?;
 
