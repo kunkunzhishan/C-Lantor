@@ -224,3 +224,157 @@
 2. 再同步 P0 的 5-8：progress-only 未读、DM 附件解析、移动端 streaming、thread unread/latest activity。
 3. 再处理 P1 的 thread/activity/feed/滚动/搜索/移动端附件体验。
 4. 最后按需要做 P2 的 diagnostics、ephemeral update batching、字号设置。
+
+## 2026-06-17 每日上游检查
+
+- 检查范围：`c6955075859ee22a44fb21afd54b0452799a30aa..upstream/main`
+- fetch 后 upstream HEAD：`c6955075859ee22a44fb21afd54b0452799a30aa` (`Add --surface-recessed and migrate modal/avatar tokens (#119)`)
+- 新增 commit：0
+- 新增 feature 候选：无
+- 同步动作：不创建 `USYNC-0016`；cursor 仍保持 `c6955075859ee22a44fb21afd54b0452799a30aa`。
+- 备注：提醒中的旧 `/Users/xxhx/new_sort/lantor-long-task-voice` 目录已不存在；本次记录写入现存 `/Users/xxhx/new_sort/lantor-long-task/docs/`。
+
+## 2026-06-18 每日上游检查
+
+- 检查范围：`c6955075859ee22a44fb21afd54b0452799a30aa..upstream/main`
+- fetch 后 upstream HEAD：`c6955075859ee22a44fb21afd54b0452799a30aa` (`Add --surface-recessed and migrate modal/avatar tokens (#119)`)
+- 新增 commit：0
+- 新增 feature 候选：无
+- 同步动作：不创建 `USYNC-0016`；cursor 仍保持 `c6955075859ee22a44fb21afd54b0452799a30aa`。
+- 备注：提醒中的旧 `/Users/xxhx/new_sort/lantor-long-task-voice` 目录已不存在；本次记录写入现存 `/Users/xxhx/new_sort/lantor-long-task/docs/`。
+
+## USYNC-0016（2026-06-19）
+
+- 检查范围：`c6955075859ee22a44fb21afd54b0452799a30aa..03a15b22983e4eeafb635d9028972b24809ed621`
+- 新增 commit：6 个非 merge commit
+- upstream HEAD：`03a15b22983e4eeafb635d9028972b24809ed621` (`Add web-only dev mode (#125)`)
+
+### USYNC-0016-F01：Markdown 表格渲染与横向滚动稳定化
+
+- 上游来源：`def95db` (`Polish markdown table rendering (#120)`)
+- 上游做了什么：为 Markdown 表格增加专门的 scroll wrapper、边框/聚焦样式、单元格换行策略，并用 `scrollKey` 保存表格横向滚动位置，避免父组件重渲染后表格横向滚动被重置。
+- 当前 fork 状态：未同步。当前 `MessageMarkdown.tsx` 没有 `markdown-table-scroll` / `tableScrollPositions` / `scrollKey` 机制，Conversation/ThreadPanel 调用也未传表格滚动 key。
+- 价值：agent 输出宽表格、评估矩阵、价格表或日志表时，移动端/窄屏阅读更稳；重渲染不会把用户正在横向查看的表格拉回开头。
+- 同步建议：P1 UI 可读性。和 markdown/link 相关改动冲突面中等，需注意本 fork 已有 `agentMentionLabels`、`onLocalLink` 等本地扩展。
+
+### USYNC-0016-F02：composer 高度变化时减少底部跟随抖动
+
+- 上游来源：`7c6d93f` (`Fix follow-bottom jitter on composer growth (#121)`)
+- 上游做了什么：Conversation/ThreadPanel 区分内容 resize 与 viewport-only resize；当 composer 增高只改变可视区高度、scrollHeight 不变时，只更新 metrics，不强制 scroll-to-bottom。
+- 当前 fork 状态：未同步。当前 `Conversation.tsx` / `ThreadPanel.tsx` 的 `ResizeObserver` 仍直接调用 `keepBottomVisible()`，没有 `isMessageListViewportOnlyResize` / `isThreadViewportOnlyResize` 判断。
+- 价值：输入框换行、附件/语音控件展开时，聊天列表底部不再反复跳动；长回复阅读时不容易被 composer 布局变化打断。
+- 同步建议：P1。可单独 port，风险较低，但要回归 channel/thread 自动跟随和“回到底部”按钮。
+
+### USYNC-0016-F03：侧边栏、频道标题和品牌区域视觉整理
+
+- 上游来源：`007140b` (`Polish sidebar navigation layout (#122)`)、`f31eb9f` (`Enlarge channel header hash icon (#123)`)、`ad2cda6` (`Align sidebar brand label (#124)`)
+- 上游做了什么：简化侧边栏 scroll/layout 和 quick actions 样式，移除 sidebar section resize handle / raw color baseline 旧项，调整 channel/dm 行高与圆角；频道标题 hash icon 变大，品牌 label 对齐微调。
+- 当前 fork 状态：未同步完整版本。当前 fork 侧边栏结构和样式已有本地改动，仍保留旧 quick action/card 化样式、section resize 逻辑和较小 header icon。
+- 价值：降低侧边栏视觉噪音和布局复杂度，让导航更像稳定产品 UI。
+- 同步建议：P2 UI polish。建议先截图对比本 fork 当前移动/桌面状态，再选择性 port，避免覆盖本地 voice/tool-browser 相关布局。
+
+### USYNC-0016-F04：Web-only dev mode / 无桌面窗口后端模式
+
+- 上游来源：`03a15b2` (`Add web-only dev mode (#125)`)
+- 上游做了什么：新增 `--web-only` 入口，把 DB 初始化、supervisor、web server、reminder worker、ui event pruner 抽成共享 backend；新增 `npm run web:backend` 和 `npm run web:dev`；Vite dev server 代理 `/api` 到本地 web backend；README 补浏览器开发流程。
+- 当前 fork 状态：未同步。当前 `package.json` 没有 `web:backend` / `web:dev`，`vite.config.ts` 没有 `/api` proxy，`src-tauri/src/main.rs` 没有 `--web-only` 分支。
+- 价值：可以只跑浏览器 UI + 本地后端，不打开 Tauri 桌面窗口；适合移动 Web、远程访问、Chrome/browser surface 和前端热更新调试。
+- 同步建议：P0/P1 之间。它和我们正在讨论的 Browser Surface / View Tools / Chrome 插件路线高度相关，建议优先评估移植，但要确认不要和当前 Lantor 运行实例抢同一个 SQLite/supervisor owner。
+
+## USYNC-0017（2026-06-22）
+
+- 检查范围：`03a15b22983e4eeafb635d9028972b24809ed621..8251c349021df86fc1b8e7e1d29d3cf07a0530d2`
+- 新增 commit：10 个非 merge commit
+- upstream HEAD：`8251c349021df86fc1b8e7e1d29d3cf07a0530d2` (`Fix local mention link boundaries (#134)`)
+
+### USYNC-0017-F01：图片附件缩略图显示设置与附件卡片整理
+
+- 上游来源：`817bf0a` (`Add image thumbnail display setting (#126)`)、`1ff2f47` (`Add lightbox image zoom (#130)`)、`2626120` (`Polish attachment tile layout (#129)`)
+- 上游做了什么：Settings 增加图片缩略图显示开关；图片附件可在缩略图和紧凑文件卡之间切换；lightbox 支持更完整的图片预览/缩放体验；附件 tile 样式统一化。
+- 当前 fork 状态：部分已有。当前 `MessageAttachments.tsx` 已有基础图片 lightbox，但没有 `showImageThumbnails` 设置、紧凑图片卡模式，也没有上游这一轮的 tile polish/zoom 完整样式。
+- 价值：图片多的 thread 不会被大缩略图撑开；同时需要看图时仍能打开大图预览。对移动端和截图/附件密集工作流比较有用。
+- 同步建议：P1。建议和现有 `DraftAttachmentsPreview` lightbox 测试一起评估，避免破坏本 fork 已有的附件预览行为。
+
+### USYNC-0017-F02：设置项 label 间距微调
+
+- 上游来源：`76afdf7` (`Add spacing below settings field labels`)
+- 上游做了什么：给 Settings 表单 label 增加更清楚的下间距。
+- 当前 fork 状态：未单独同步。
+- 价值：低风险 UI polish，改善 Settings 可读性。
+- 同步建议：P3，可并入下一次设置页/视觉整理，不建议单独排期。
+
+### USYNC-0017-F03：关闭 composer 输入建议
+
+- 上游来源：`cdc354a` (`Disable composer writing suggestions (#128)`)
+- 上游做了什么：在 Conversation 和 ThreadPanel composer 输入框上关闭浏览器写作建议/自动修正类行为。
+- 当前 fork 状态：未同步。当前只在部分表单输入如 Create Channel 里有 `autoCorrect="off"` / `spellCheck={false}`，主 composer 仍缺对应处理。
+- 价值：减少浏览器/系统输入建议对 agent prompt、代码片段、路径和命令的干扰。
+- 同步建议：P1，改动小且风险低，可优先同步。
+
+### USYNC-0017-F04：thread mention / inbox wake 上下文恢复加强
+
+- 上游来源：`641a417` (`Clarify thread mention history prompt (#131)`)、`ad84ba6` (`Fix inbox wake thread context recovery`)
+- 上游做了什么：明确 agent 第一次被拉进已有 thread 时必须读 thread history；修复 inbox wake 恢复 thread context 时的上下文注入边界，并补测试覆盖。
+- 当前 fork 状态：部分已有提示语。本 fork prompt 已有“current injected thread context and memory”要求，但 `agent_inbox_wake.rs` 仍未见上游这轮针对 first mention/thread recovery 的完整逻辑和测试。
+- 价值：减少 agent 在长 thread 里只看最新 mention 就误判上下文的问题；也能降低 warm runtime 跨 surface 旧上下文污染。
+- 同步建议：P0/P1。和 Lantor 当前多 thread 调度可靠性直接相关，建议优先审计并按本 fork 的 prompt/policy 拆分结构适配。
+
+### USYNC-0017-F05：Markdown 数学公式渲染与本地 mention 边界修复
+
+- 上游来源：`b9bd2f5` (`Add markdown math rendering`)、`8251c34` (`Fix local mention link boundaries (#134)`)
+- 上游做了什么：引入 `remark-math` / `rehype-katex` / `katex`，支持 Markdown 数学公式渲染，禁用单美元内联数学；同时修复折叠预览渲染、fenced block 检测和本地 `@agent`/`#channel` mention linkify 边界。
+- 当前 fork 状态：未同步数学公式依赖。当前 `MessageMarkdown.tsx` 只有 `remark-gfm`；已有本地 linkify 和 inline/fence 分段逻辑，但还没有上游这轮的边界修复。
+- 价值：agent 输出公式、模型推导、量化/统计分析时可读性更好；mention 边界修复能避免代码/路径/标点附近误链接或漏链接。
+- 同步建议：P1。数学公式是新增依赖，需评估 bundle 体积和样式；mention 边界修复可优先单独 port。
+
+### USYNC-0017-F06：Modal 可通过背景/Escape 关闭
+
+- 上游来源：`b97355e` (`Make modals dismissible (#133)`)
+- 上游做了什么：移除多个 Modal 的 `closeOnBackdrop={false}` / `closeOnEscape={false}`，并给 SearchModal 补关闭按钮，让 modal 行为更符合常规桌面/Web 预期。
+- 当前 fork 状态：未同步。当前 `AgentFormModal`、`ChannelSettingsModal`、`CreateChannelModal`、`OwnerProfileModal`、`ReminderModal` 等仍显式禁用 backdrop/Escape 关闭。
+- 价值：提升日常操作效率，尤其移动/窄屏下更容易退出弹窗。
+- 同步建议：P2。需要先确认未保存表单是否有丢失风险；对创建 agent/channel、提醒编辑这类表单，可能需要 dirty-state 确认而不是直接照搬。
+
+## USYNC-0018（2026-06-23）
+
+- 检查范围：`8251c349021df86fc1b8e7e1d29d3cf07a0530d2..4363d861d5878dbe31a009c85be9ce56cbc723c4`
+- 新增 commit：1 个非 merge commit
+- upstream HEAD：`4363d861d5878dbe31a009c85be9ce56cbc723c4` (`Add thread expand and fold controls (#135)`)
+
+### USYNC-0018-F01：Thread 面板一键展开/折叠长消息
+
+- 上游来源：`4363d86` (`Add thread expand and fold controls (#135)`)
+- 上游做了什么：在 `ThreadPanel` 顶部工具区新增 expand all / fold all 按钮，复用长消息折叠判断，批量展开或折叠当前 thread 中所有非 streaming 且超过预览阈值的长消息；按钮用 `Maximize2` / `Minimize2` 图标和 tooltip 展示状态，并在无可折叠消息或已经全展开/全折叠时变为弱化不可操作状态。
+- 当前 fork 状态：未同步。当前本 fork 有 per-message 的长消息展开/折叠和 `expandedThreadMessageIds` 状态，但 thread header 只有 locate root / close 等按钮，没有批量展开/折叠入口。
+- 价值：长 thread 中包含多个长 agent 回复、日志或分析报告时，可以一次性展开阅读全文，也可以快速折叠回扫描模式，减少逐条点击。
+- 同步建议：P1。改动集中在 `ThreadPanel.tsx` 和 thread header tooltip CSS，风险较低；同步时要注意本 fork 已有 thread header/resizer/移动端返回按钮样式，避免按钮在窄屏溢出。
+
+## USYNC-0019（2026-06-24）
+
+- 检查范围：`4363d861d5878dbe31a009c85be9ce56cbc723c4..4e44ddaa6cdacd0543715cbd8326ae421f316cff`
+- 新增 commit：3 个非 merge commit
+- upstream HEAD：`4e44ddaa6cdacd0543715cbd8326ae421f316cff` (`fix(dev): pin vite dev server port`)
+
+### USYNC-0019-F01：Thread SVG 导出与附件下载能力
+
+- 上游来源：`b9db941` (`Add thread SVG export and attachment downloads (#136)`)
+- 上游做了什么：新增 `thread-svg-export.ts`，在 Thread 面板提供 SVG 导出入口；桌面端新增 `download_attachment` Tauri command，把本地 attachment 文件复制到 Downloads，并对文件名做安全清理和重名避让；前端 `MessageAttachments` 为图片/文件卡和 lightbox 增加下载按钮。
+- 当前 fork 状态：未同步。当前 fork 没有 `src/thread-svg-export.ts`，`ThreadPanel` 未见 SVG 导出入口，`apiClient.ts` 没有 `downloadAttachment`，`src-tauri/src/main.rs` 仍只有 attachment asset serving，没有桌面下载命令；`MessageAttachments.tsx` 也只有打开/预览附件，没有下载按钮。
+- 价值：可以把长 thread 离线归档成 SVG，也能把 agent/owner 附件从应用存储明确下载到本机 Downloads，适合审阅、转发、留证和长期保存。
+- 同步建议：P1。附件下载改动有明确用户价值且范围可控；SVG 导出涉及消息渲染快照和样式一致性，建议先单独 port 下载，再评估 SVG 导出的渲染质量和中文/长文本/附件展示。
+
+### USYNC-0019-F02：桌面附件下载反馈 Toast
+
+- 上游来源：`86f9d06` (`Add desktop attachment download feedback (#138)`)
+- 上游做了什么：在 attachment 下载成功后显示 `Saved to Downloads: ...`，失败时显示错误 toast；toast 会自动消失，也可手动 dismiss；同时把 lightbox 下载按钮和 attachment 下载 hover 样式改为语义 token。
+- 当前 fork 状态：未同步。当前 `MessageAttachments.tsx` 没有 `DownloadNotice`/toast 状态，`styles.css` 没有 `attachment-download-toast` 相关样式。
+- 价值：桌面下载不再是静默动作，用户能知道文件是否真的落盘以及保存后的文件名；失败时也能直接看到原因。
+- 同步建议：P1，建议和 `USYNC-0019-F01` 的下载命令一起同步；如果只做浏览器端下载，toast 仍可复用，但桌面成功路径需要 Tauri command 返回目标路径。
+
+### USYNC-0019-F03：固定 Vite dev server 地址和端口
+
+- 上游来源：`4e44dda` (`fix(dev): pin vite dev server port`)
+- 上游做了什么：在 `vite.config.ts` 里设置 `server.host = "127.0.0.1"`、`port = 5173`、`strictPort = true`，避免 dev server 随机换端口或监听范围不明确。
+- 当前 fork 状态：已具备。本地 `vite.config.ts` 当前已经包含这三个配置。
+- 价值：Web-only/dev proxy、本地浏览器和工具浏览器调试时 URL 稳定，不会因为端口漂移导致后端代理或自动化脚本失效。
+- 同步建议：已满足；只记录为本轮 upstream 维护项，不需要再单独 port。

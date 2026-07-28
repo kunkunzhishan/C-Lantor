@@ -4427,6 +4427,35 @@ function App() {
     await mutate("set_message_saved", { messageId: message.id, saved });
   }
 
+  function deleteMessage(message: Message) {
+    const replyCount = data?.messages.filter((item) => item.thread_root_id === message.id).length ?? 0;
+    const body = replyCount > 0
+      ? `This will delete this message and ${replyCount} thread ${replyCount === 1 ? "reply" : "replies"}. This cannot be undone.`
+      : "This will delete this message. This cannot be undone.";
+    setConfirmRequest({
+      title: "Delete message?",
+      body,
+      confirmLabel: "Delete message",
+      onConfirm: async () => {
+        const deletedMessageIds = new Set([
+          message.id,
+          ...(data?.messages
+            .filter((item) => item.thread_root_id === message.id)
+            .map((item) => item.id) ?? []),
+        ]);
+        setData((current) => current ? {
+          ...current,
+          messages: current.messages.filter((item) => !deletedMessageIds.has(item.id)),
+        } : current);
+        await mutate("delete_message", { messageId: message.id });
+        if (activeThreadId === message.id) {
+          setShowThread(false);
+          setActiveThreadId(null);
+        }
+      },
+    });
+  }
+
   async function setMessageTodo(message: Message, todo: boolean) {
     const now = new Date().toISOString();
     const channelName = data?.channels.find((item) => item.id === message.channel_id)?.name ?? "";
@@ -4825,6 +4854,7 @@ function App() {
           focusedMessageId={focusedMessageId}
           onToggleMessageSaved={setMessageSaved}
           onToggleMessageTodo={setMessageTodo}
+          onDeleteMessage={deleteMessage}
         />
       </div>
 
@@ -4895,6 +4925,7 @@ function App() {
           focusedMessageId={focusedMessageId}
           onToggleMessageSaved={setMessageSaved}
           onToggleMessageTodo={setMessageTodo}
+          onDeleteMessage={deleteMessage}
           onLocateRoot={locateThreadRoot}
           onResizeStart={startThreadResize}
         />

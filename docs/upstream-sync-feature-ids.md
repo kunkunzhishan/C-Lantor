@@ -16,13 +16,13 @@
 | --- | --- |
 | 当前 upstream 仓库 | `https://github.com/chenzl25/lantor` |
 | 当前 fork 仓库 | `xxhZs/lantor-long-task` |
-| 当前同步窗口编号 | `USYNC-0002` |
-| 本窗口开始点 | `c79e648` `clippy` |
-| 本窗口结束点 / 下次起点 | `7fe2c45` `Guard revise resolution for side-effect-only interrupted actions (#98)` |
-| upstream cursor 完整 SHA | `7fe2c454274cc356c16f87df305a6aea2b7d09b5` |
-| 本窗口 upstream commit 数 | `13` 个 upstream-only commit，`12` 个非 merge commit |
+| 当前同步窗口编号 | `USYNC-0019` |
+| 本窗口开始点 | `4363d86` `Add thread expand and fold controls (#135)` |
+| 本窗口结束点 / 下次起点 | `4e44dda` `fix(dev): pin vite dev server port` |
+| upstream cursor 完整 SHA | `4e44ddaa6cdacd0543715cbd8326ae421f316cff` |
+| 本窗口 upstream commit 数 | `3` 个 upstream-only commit，`3` 个非 merge commit |
 | 本窗口处理方式 | 不 merge upstream；只筛选必要 feature，在 fork 架构内做等价实现 |
-| 下次同步起点 | 从 `7fe2c45` 之后的新 upstream commit 开始 |
+| 下次同步起点 | 从 `4e44dda` 之后的新 upstream commit 开始 |
 
 ## 下次同步怎么开始
 
@@ -35,20 +35,20 @@ git fetch https://github.com/chenzl25/lantor.git refs/heads/main:refs/remotes/up
 然后只看当前 cursor 之后的新提交：
 
 ```bash
-git log --oneline --decorate 7fe2c454274cc356c16f87df305a6aea2b7d09b5..upstream/main
+git log --oneline --decorate 4e44ddaa6cdacd0543715cbd8326ae421f316cff..upstream/main
 git rev-list --left-right --count HEAD...upstream/main
 ```
 
-如果 `upstream/main` 仍然等于 `7fe2c454274cc356c16f87df305a6aea2b7d09b5`，说明没有新的 upstream 同步窗口，不需要重新从旧窗口开始看。
+如果 `upstream/main` 仍然等于 `4e44ddaa6cdacd0543715cbd8326ae421f316cff`，说明没有新的 upstream 同步窗口，不需要重新从旧窗口开始看。
 
 如果 upstream 有新提交，创建下一个窗口：
 
 | 新窗口字段 | 填法 |
 | --- | --- |
-| 窗口编号 | `USYNC-0003` |
-| 开始点 | 本文件当前 `upstream cursor`，也就是 `7fe2c454274cc356c16f87df305a6aea2b7d09b5` |
+| 窗口编号 | `USYNC-0020` |
+| 开始点 | 本文件当前 `upstream cursor`，也就是 `4e44ddaa6cdacd0543715cbd8326ae421f316cff` |
 | 结束点 | 新 fetch 到的 `upstream/main` HEAD |
-| 评估范围 | `7fe2c454274cc356c16f87df305a6aea2b7d09b5..upstream/main` |
+| 评估范围 | `4e44ddaa6cdacd0543715cbd8326ae421f316cff..upstream/main` |
 | 输出 | 新增一段窗口记录，并只评估这个范围里的新增 feature/优化 |
 
 ## 窗口编号规则
@@ -80,6 +80,52 @@ git rev-list --left-right --count HEAD...upstream/main
 | 已完成重点 | mobile create channel / create agent / home return、thread 折叠滚动、activity/run upsert、publish gate、interrupted action、visible side-effect buffer |
 | 剩余实现 | 无；当前 cursor 已推进到 `7fe2c45` |
 | 注意事项 | 下次 upstream diff 应从 `7fe2c45` 之后开始；不要重复评估 `c79e648..7fe2c45`。 |
+
+## 2026-06-17 每日检查记录
+
+- 本次按最近已确认的上游同步点 `c6955075859ee22a44fb21afd54b0452799a30aa` 检查。
+- `git fetch https://github.com/chenzl25/lantor.git refs/heads/main:refs/remotes/upstream/main` 后，`upstream/main` 仍为 `c6955075859ee22a44fb21afd54b0452799a30aa`。
+- 范围 `c6955075859ee22a44fb21afd54b0452799a30aa..upstream/main` 为 0 个 commit；今天不创建新的 `USYNC-0016` feature 窗口。
+- 当前工作树实际同步文档位于 `/Users/xxhx/new_sort/lantor-long-task/docs/`；提醒中的旧 `lantor-long-task-voice` 目录本机已不存在。
+
+## 2026-06-18 每日检查记录
+
+- 本次继续按最近已确认的上游同步点 `c6955075859ee22a44fb21afd54b0452799a30aa` 检查。
+- `git fetch https://github.com/chenzl25/lantor.git refs/heads/main:refs/remotes/upstream/main` 后，`upstream/main` 仍为 `c6955075859ee22a44fb21afd54b0452799a30aa`。
+- 范围 `c6955075859ee22a44fb21afd54b0452799a30aa..upstream/main` 为 0 个 commit；今天不创建新的 `USYNC-0016` feature 窗口。
+- 当前工作树实际同步文档位于 `/Users/xxhx/new_sort/lantor-long-task/docs/`；提醒中的旧 `lantor-long-task-voice` 目录本机已不存在。
+
+## 2026-06-19 每日检查记录
+
+- 本次从 `c6955075859ee22a44fb21afd54b0452799a30aa` 检查到 `03a15b22983e4eeafb635d9028972b24809ed621`。
+- 新增 6 个 upstream-only 非 merge commit：`def95db`、`7c6d93f`、`007140b`、`f31eb9f`、`ad2cda6`、`03a15b2`。
+- 新增 feature 候选记录在 `docs/upstream-sync-candidates.md` 的 `USYNC-0016-F01` 到 `USYNC-0016-F04`。
+- 当前 upstream cursor 已推进到 `03a15b22983e4eeafb635d9028972b24809ed621`，下次从 `03a15b2` 之后开始检查。
+- 当前工作树实际同步文档位于 `/Users/xxhx/new_sort/lantor-long-task/docs/`；提醒中的旧 `lantor-long-task-voice` 目录本机已不存在。
+
+## 2026-06-22 每日检查记录
+
+- 本次从 `03a15b22983e4eeafb635d9028972b24809ed621` 检查到 `8251c349021df86fc1b8e7e1d29d3cf07a0530d2`。
+- 新增 10 个 upstream-only 非 merge commit：`817bf0a`、`76afdf7`、`1ff2f47`、`2626120`、`cdc354a`、`641a417`、`ad84ba6`、`b9bd2f5`、`b97355e`、`8251c34`。
+- 新增 feature 候选记录在 `docs/upstream-sync-candidates.md` 的 `USYNC-0017-F01` 到 `USYNC-0017-F06`。
+- 当前 upstream cursor 已推进到 `8251c349021df86fc1b8e7e1d29d3cf07a0530d2`，下次从 `8251c34` 之后开始检查。
+- 当前工作树实际同步文档位于 `/Users/xxhx/new_sort/lantor-long-task/docs/`；提醒中的旧 `lantor-long-task-voice` 目录本机已不存在。
+
+## 2026-06-23 每日检查记录
+
+- 本次从 `8251c349021df86fc1b8e7e1d29d3cf07a0530d2` 检查到 `4363d861d5878dbe31a009c85be9ce56cbc723c4`。
+- 新增 1 个 upstream-only 非 merge commit：`4363d86`。
+- 新增 feature 候选记录在 `docs/upstream-sync-candidates.md` 的 `USYNC-0018-F01`。
+- 当前 upstream cursor 已推进到 `4363d861d5878dbe31a009c85be9ce56cbc723c4`，下次从 `4363d86` 之后开始检查。
+- 当前工作树实际同步文档位于 `/Users/xxhx/new_sort/lantor-long-task/docs/`；提醒中的旧 `lantor-long-task-voice` 目录本机已不存在。
+
+## 2026-06-24 每日检查记录
+
+- 本次从 `4363d861d5878dbe31a009c85be9ce56cbc723c4` 检查到 `4e44ddaa6cdacd0543715cbd8326ae421f316cff`。
+- 新增 3 个 upstream-only 非 merge commit：`b9db941`、`86f9d06`、`4e44dda`。
+- 新增 feature/维护候选记录在 `docs/upstream-sync-candidates.md` 的 `USYNC-0019-F01` 到 `USYNC-0019-F03`。
+- 当前 upstream cursor 已推进到 `4e44ddaa6cdacd0543715cbd8326ae421f316cff`，下次从 `4e44dda` 之后开始检查。
+- 当前工作树实际同步文档位于 `/Users/xxhx/new_sort/lantor-long-task/docs/`；提醒中的旧 `lantor-long-task-voice` 目录本机已不存在。
 
 ## USYNC-0001 摘要
 

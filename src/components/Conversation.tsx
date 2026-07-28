@@ -114,6 +114,7 @@ type ConversationProps = {
   focusedMessageId: string | null;
   onToggleMessageSaved: (message: Message, saved: boolean) => void;
   onToggleMessageTodo: (message: Message, todo: boolean) => void;
+  onDeleteMessage: (message: Message) => void | Promise<void>;
 };
 
 type MessageMenuState = {
@@ -417,6 +418,7 @@ export function Conversation({
   focusedMessageId,
   onToggleMessageSaved,
   onToggleMessageTodo,
+  onDeleteMessage,
 }: ConversationProps) {
   const [sendAsTask, setSendAsTask] = useState(false);
   const [isComposerDragOver, setIsComposerDragOver] = useState(false);
@@ -886,6 +888,11 @@ export function Conversation({
   async function copyMessageLink(message: Message) {
     await copyText(messageShareLink(message, shareBaseUrl));
     setMessageMenu(null);
+  }
+
+  async function deleteSelectedMessage(message: Message) {
+    setMessageMenu(null);
+    await onDeleteMessage(message);
   }
 
   function toggleChannelMessageExpanded(messageId: string) {
@@ -1473,6 +1480,7 @@ export function Conversation({
                 onToggleMessageTodo(messageMenu.message, !todoMessageIds.has(messageMenu.message.id));
                 setMessageMenu(null);
               }}
+              onDelete={() => deleteSelectedMessage(messageMenu.message)}
               onClose={() => setMessageMenu(null)}
             />
           )}

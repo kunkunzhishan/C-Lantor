@@ -6653,6 +6653,7 @@ async fn delete_message(message_id: Uuid, state: State<'_, AppState>) -> Command
     if result.rows_affected() == 0 {
         return Err("message does not exist".to_owned());
     }
+    let _ = notify_ui_message_delete(&state.pool, message_id, "message_deleted").await;
     Ok(())
 }
 
@@ -10294,6 +10295,24 @@ fn is_retryable_codex_stderr_error(line: &str) -> bool {
             && cleaned.contains("https://chatgpt.com/backend-api/wham/apps"))
 }
 
+fn is_retryable_structured_codex_stderr_error(
+    level: &str,
+    target: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    if !level.eq_ignore_ascii_case("ERROR") {
+        return false;
+    }
+    let target = target.unwrap_or_default().to_ascii_lowercase();
+    let message = message.unwrap_or_default().to_ascii_lowercase();
+    (target == "codex_api::endpoint::responses_websocket"
+        && message.contains("failed to connect to websocket"))
+        || (target == "codex_models_manager::manager"
+            && message.contains("failed to refresh available models"))
+        || (target == "rmcp::transport::worker"
+            && message.contains("https://chatgpt.com/backend-api/wham/apps"))
+}
+
 fn classify_structured_stderr_log(
     line: &str,
 ) -> Option<Option<(&'static str, &'static str, String)>> {
@@ -10321,6 +10340,9 @@ fn classify_structured_stderr_log(
     }
 
     let detail = structured_log_detail(&value, level, target, message);
+    if is_retryable_structured_codex_stderr_error(level, target, message) {
+        return Some(Some(("run", "Runtime warning", detail)));
+    }
     match level.to_ascii_uppercase().as_str() {
         "ERROR" => Some(Some(("error", "Runtime error", detail))),
         "WARN" | "WARNING" => Some(Some(("run", "Runtime warning", detail))),
@@ -22201,6 +22223,20 @@ inline `@kunk` and after @longbaby
         ] {
             let activity = classify_agent_output_activity("stderr", line)
                 .expect("retryable stderr should remain visible");
+            assert_eq!(activity.0, "run");
+            assert_eq!(activity.1, "Runtime warning");
+            assert_eq!(activity_status(activity.0, activity.1), "warning");
+        }
+    }
+
+    #[test]
+    fn downgrades_structured_retryable_codex_infra_stderr_to_warning() {
+        for line in [
+            r#"{"timestamp":"2026-06-24T13:33:16.601265Z","level":"ERROR","fields":{"message":"failed to refresh available models: timeout waiting for child process to exit"},"target":"codex_models_manager::manager"}"#,
+            r#"{"timestamp":"2026-06-24T08:14:01.000000Z","level":"ERROR","fields":{"message":"worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest(\"http/request failed: error sending request for url (https://chatgpt.com/backend-api/wham/apps)\")))"},"target":"rmcp::transport::worker"}"#,
+        ] {
+            let activity = classify_agent_output_activity("stderr", line)
+                .expect("structured retryable stderr should remain visible");
             assert_eq!(activity.0, "run");
             assert_eq!(activity.1, "Runtime warning");
             assert_eq!(activity_status(activity.0, activity.1), "warning");

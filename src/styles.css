@@ -2756,6 +2756,15 @@ button,
   color: var(--accent);
 }
 
+.message-action-menu button.danger {
+  color: var(--danger);
+}
+
+.message-action-menu button.danger:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
 .system-message {
   margin: 2px 22px;
   padding: 0;
