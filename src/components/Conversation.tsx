@@ -51,7 +51,8 @@ import { AgentAvatar, AgentAvatarWithProfile } from "./AgentAvatar";
 import { DraftAttachmentsPreview } from "./DraftAttachmentsPreview";
 import { MessageActionMenu } from "./MessageActionMenu";
 import { MessageAttachments } from "./MessageAttachments";
-import { MessageArtifacts } from "./MessageArtifacts";
+import { MessageArtifacts, isAutoLongMessageArtifact } from "./MessageArtifacts";
+import { LongMessageFallback } from "./LongMessageFallback";
 import { MessageMarkdown, type LocalEntityLinkTarget } from "./MessageMarkdown";
 import { TaskAssigneePicker } from "./TaskAssigneePicker";
 import { LongTaskPanel } from "./LongTaskPanel";
@@ -1220,12 +1221,10 @@ export function Conversation({
             const isTodo = todoMessageIds.has(message.id);
             const isCompact = isCompactFollowupMessage(message, rootMessages[index - 1]);
             const showDateDivider = index === 0 || !isSameCalendarDay(message.created_at, rootMessages[index - 1]?.created_at ?? "");
-            const isLongChannelMessage = shouldCollapseChannelMessage(message.body);
             const isChannelMessageExpanded = expandedChannelMessageIds.has(message.id);
-            const visibleMessageBody = isLongChannelMessage && !isChannelMessageExpanded
-              ? channelMessagePreview(message.body)
-              : message.body;
-            const showMessageBody = message.delivery_state !== "streaming" || visibleMessageBody.trim().length > 0;
+            const hasAutoLongMessage = message.artifacts?.some(isAutoLongMessageArtifact) ?? false;
+            const showMessageBody = !hasAutoLongMessage
+              && (message.delivery_state !== "streaming" || message.body.trim().length > 0);
             if (message.sender_role === "system") {
               return (
                 <Fragment key={message.id}>
@@ -1384,25 +1383,21 @@ export function Conversation({
                       </button>
                     </div>
                     {showMessageBody && (
-                      <>
-                        <div className={isLongChannelMessage && !isChannelMessageExpanded ? "message-long-preview collapsed" : "message-long-preview"}>
-                          <MessageMarkdown body={visibleMessageBody} agentMentionLabels={agentMentionLabels} onLocalAgentLink={openLinkedAgentDetail} onLocalLink={openLocalLink} />
-                        </div>
-                        {isLongChannelMessage && (
-                          <button
-                            type="button"
-                            className="message-expand-button"
-                            aria-expanded={isChannelMessageExpanded}
-                            onPointerDown={(event) => event.stopPropagation()}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              toggleChannelMessageExpanded(message.id);
-                            }}
-                          >
-                            {isChannelMessageExpanded ? "Show less" : "Show more"}
-                          </button>
+                      <LongMessageFallback
+                        body={message.body}
+                        expanded={isChannelMessageExpanded}
+                        onToggle={() => toggleChannelMessageExpanded(message.id)}
+                        messageId={message.id}
+                        channelId={message.channel_id}
+                        threadRootId={message.thread_root_id}
+                        creatorAgentId={message.sender_agent_id}
+                        createdAt={message.created_at}
+                        updatedAt={message.updated_at}
+                        onOpenArtifact={openArtifact}
+                        renderBody={(body) => (
+                          <MessageMarkdown body={body} agentMentionLabels={agentMentionLabels} onLocalAgentLink={openLinkedAgentDetail} onLocalLink={openLocalLink} />
                         )}
-                      </>
+                      />
                     )}
                     <MessageAttachments attachments={message.attachments} />
                     <MessageArtifacts artifacts={message.artifacts} onOpenArtifact={openArtifact} />

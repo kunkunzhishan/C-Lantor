@@ -15,7 +15,8 @@ import { AgentAvatar, AgentAvatarWithProfile } from "./AgentAvatar";
 import { DraftAttachmentsPreview } from "./DraftAttachmentsPreview";
 import { MessageActionMenu } from "./MessageActionMenu";
 import { MessageAttachments } from "./MessageAttachments";
-import { MessageArtifacts } from "./MessageArtifacts";
+import { MessageArtifacts, isAutoLongMessageArtifact } from "./MessageArtifacts";
+import { LongMessageFallback } from "./LongMessageFallback";
 import { MessageMarkdown, type LocalEntityLinkTarget } from "./MessageMarkdown";
 import { TaskAssigneePicker } from "./TaskAssigneePicker";
 
@@ -201,7 +202,8 @@ export function ThreadPanel({
   const rootSaved = activeRoot ? savedMessageIds.has(activeRoot.id) : false;
   const rootTodo = activeRoot ? todoMessageIds.has(activeRoot.id) : false;
   const showRootBody = activeRoot
-    ? activeRoot.delivery_state !== "streaming" || activeRoot.body.trim().length > 0
+    ? !(activeRoot.artifacts?.some(isAutoLongMessageArtifact) ?? false)
+      && (activeRoot.delivery_state !== "streaming" || activeRoot.body.trim().length > 0)
     : false;
   const surfaceLabel = channel
     ? isDm
@@ -794,31 +796,23 @@ export function ThreadPanel({
                         </button>
                       </div>
                       {showRootBody && (() => {
-                        const isLongThreadMessage = shouldCollapseThreadMessage(activeRoot.body);
                         const isThreadMessageExpanded = expandedThreadMessageIds.has(activeRoot.id);
-                        const visibleBody = isLongThreadMessage && !isThreadMessageExpanded
-                          ? threadMessagePreview(activeRoot.body)
-                          : activeRoot.body;
                         return (
-                          <>
-                            <div className={isLongThreadMessage && !isThreadMessageExpanded ? "message-long-preview collapsed" : "message-long-preview"}>
-                              <MessageMarkdown body={visibleBody} agentMentionLabels={agentMentionLabels} onLocalAgentLink={openLinkedAgentDetail} onLocalLink={openLocalLink} />
-                            </div>
-                            {isLongThreadMessage && (
-                              <button
-                                type="button"
-                                className="message-expand-button"
-                                aria-expanded={isThreadMessageExpanded}
-                                onPointerDown={(event) => event.stopPropagation()}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  toggleThreadMessageExpanded(activeRoot.id);
-                                }}
-                              >
-                                {isThreadMessageExpanded ? "Show less" : "Show more"}
-                              </button>
+                          <LongMessageFallback
+                            body={activeRoot.body}
+                            expanded={isThreadMessageExpanded}
+                            onToggle={() => toggleThreadMessageExpanded(activeRoot.id)}
+                            messageId={activeRoot.id}
+                            channelId={activeRoot.channel_id}
+                            threadRootId={activeRoot.thread_root_id}
+                            creatorAgentId={activeRoot.sender_agent_id}
+                            createdAt={activeRoot.created_at}
+                            updatedAt={activeRoot.updated_at}
+                            onOpenArtifact={openArtifact}
+                            renderBody={(body) => (
+                              <MessageMarkdown body={body} agentMentionLabels={agentMentionLabels} onLocalAgentLink={openLinkedAgentDetail} onLocalLink={openLocalLink} />
                             )}
-                          </>
+                          />
                         );
                       })()}
                       <MessageAttachments attachments={activeRoot.attachments} />
@@ -969,7 +963,8 @@ export function ThreadPanel({
               const replyTodo = todoMessageIds.has(reply.id);
               const isCompact = isCompactFollowupMessage(reply, replies[index - 1]);
               const showDateDivider = index === 0 || !isSameCalendarDay(reply.created_at, replies[index - 1]?.created_at ?? "");
-              const showReplyBody = reply.delivery_state !== "streaming" || reply.body.trim().length > 0;
+              const showReplyBody = !(reply.artifacts?.some(isAutoLongMessageArtifact) ?? false)
+                && (reply.delivery_state !== "streaming" || reply.body.trim().length > 0);
               if (reply.sender_role === "system") {
                 return (
                   <Fragment key={reply.id}>
@@ -1113,31 +1108,23 @@ export function ThreadPanel({
                           </button>
                         </div>
                       {showReplyBody && (() => {
-                        const isLongThreadMessage = shouldCollapseThreadMessage(reply.body);
                         const isThreadMessageExpanded = expandedThreadMessageIds.has(reply.id);
-                        const visibleBody = isLongThreadMessage && !isThreadMessageExpanded
-                          ? threadMessagePreview(reply.body)
-                          : reply.body;
                         return (
-                          <>
-                            <div className={isLongThreadMessage && !isThreadMessageExpanded ? "message-long-preview collapsed" : "message-long-preview"}>
-                              <MessageMarkdown body={visibleBody} agentMentionLabels={agentMentionLabels} onLocalAgentLink={openLinkedAgentDetail} onLocalLink={openLocalLink} />
-                            </div>
-                            {isLongThreadMessage && (
-                              <button
-                                type="button"
-                                className="message-expand-button"
-                                aria-expanded={isThreadMessageExpanded}
-                                onPointerDown={(event) => event.stopPropagation()}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  toggleThreadMessageExpanded(reply.id);
-                                }}
-                              >
-                                {isThreadMessageExpanded ? "Show less" : "Show more"}
-                              </button>
+                          <LongMessageFallback
+                            body={reply.body}
+                            expanded={isThreadMessageExpanded}
+                            onToggle={() => toggleThreadMessageExpanded(reply.id)}
+                            messageId={reply.id}
+                            channelId={reply.channel_id}
+                            threadRootId={reply.thread_root_id}
+                            creatorAgentId={reply.sender_agent_id}
+                            createdAt={reply.created_at}
+                            updatedAt={reply.updated_at}
+                            onOpenArtifact={openArtifact}
+                            renderBody={(body) => (
+                              <MessageMarkdown body={body} agentMentionLabels={agentMentionLabels} onLocalAgentLink={openLinkedAgentDetail} onLocalLink={openLocalLink} />
                             )}
-                          </>
+                          />
                         );
                       })()}
                       <MessageAttachments attachments={reply.attachments} />

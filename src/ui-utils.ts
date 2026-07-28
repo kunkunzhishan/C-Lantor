@@ -4,6 +4,7 @@ import {
   Message,
   OwnerProfile,
   RUNTIME_PRESETS,
+  isCodexLikeRuntime,
 } from "./types";
 
 const TIMESTAMP_CACHE_LIMIT = 5000;
@@ -184,7 +185,7 @@ export function buildPresetCommand(form: AgentForm) {
   const prompt = shellQuote(presetPrompt(form));
   const quotedModel = shellQuote(model);
 
-  if (form.runtime === "codex") {
+  if (isCodexLikeRuntime(form.runtime)) {
     const configArgs = [
       form.reasoningEffort.trim()
         ? `model_reasoning_effort="${form.reasoningEffort.trim()}"`

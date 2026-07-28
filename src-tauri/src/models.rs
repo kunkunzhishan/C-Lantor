@@ -15,6 +15,25 @@ pub(crate) struct RuntimeCheck {
     pub(crate) detail: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct RuntimeModelOption {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct RuntimeModelCatalog {
+    pub(crate) runtime: String,
+    pub(crate) command: String,
+    pub(crate) default_model: String,
+    pub(crate) models: Vec<RuntimeModelOption>,
+    pub(crate) source: String,
+    pub(crate) error: Option<String>,
+    pub(crate) fetched_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct Agent {
     pub(crate) id: Uuid,

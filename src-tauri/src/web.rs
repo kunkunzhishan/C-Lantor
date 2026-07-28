@@ -60,10 +60,11 @@ use crate::{
     load_ui_backend_event_payload, mark_all_owner_inbox_read_in_pool, mark_channel_read_in_pool,
     mark_inbox_items_read_in_pool, notify_ui_refresh, open_dm_with_agent_in_pool,
     process_hook_ingress_in_pool, reassign_agent_work_in_pool, retry_agent_work_in_pool,
-    send_owner_message_in_pool, set_channel_agent_membership_in_pool, set_message_saved_in_pool,
-    set_message_todo_in_pool, start_agent_in_pool, to_string, update_agent_in_pool,
-    update_agent_schedule_status_in_pool, update_channel_in_pool, update_owner_profile_in_pool,
-    update_task_status_in_pool, update_task_title_in_pool, FetchMessagesRequest,
+    runtime_model_catalog_in_env, send_owner_message_in_pool, set_channel_agent_membership_in_pool,
+    set_message_saved_in_pool, set_message_todo_in_pool, start_agent_in_pool, to_string,
+    update_agent_in_pool, update_agent_schedule_status_in_pool, update_channel_in_pool,
+    update_owner_profile_in_pool, update_task_status_in_pool, update_task_title_in_pool,
+    FetchMessagesRequest,
 };
 
 const WEB_SEND_MESSAGE_BODY_LIMIT: usize = 128 * 1024 * 1024;
@@ -464,6 +465,10 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
         .route("/api/fetch_messages", post(api_fetch_messages))
         .route("/api/fetch_call_history", post(api_fetch_call_history))
         .route("/api/check_runtime", post(api_check_runtime))
+        .route(
+            "/api/runtime_model_catalog",
+            post(api_runtime_model_catalog),
+        )
         .route(
             "/api/record_ui_refresh_metric",
             post(api_record_ui_refresh_metric),
@@ -2617,6 +2622,15 @@ async fn api_check_runtime(
     Json(request): Json<RuntimeCheckRequest>,
 ) -> Result<impl IntoResponse, Response> {
     check_runtime_in_env(request.runtime)
+        .await
+        .map(Json)
+        .map_err(api_error)
+}
+
+async fn api_runtime_model_catalog(
+    Json(request): Json<RuntimeCheckRequest>,
+) -> Result<impl IntoResponse, Response> {
+    runtime_model_catalog_in_env(request.runtime)
         .await
         .map(Json)
         .map_err(api_error)

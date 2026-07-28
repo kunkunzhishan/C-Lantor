@@ -17,6 +17,7 @@ import { APP_DISPLAY_NAME } from "./branding";
 import { AgentDetailDrawer } from "./components/AgentDetailDrawer";
 import type { AgentPerformance } from "./components/AgentDetailDrawer";
 import { AgentFormModal } from "./components/AgentFormModal";
+import { ArtifactReaderModal } from "./components/ArtifactReaderModal";
 import { randomDylanAvatarSpec } from "./avatar-utils";
 import { ChannelAgentsModal } from "./components/ChannelAgentsModal";
 import { ChannelSettingsModal } from "./components/ChannelSettingsModal";
@@ -68,6 +69,7 @@ import {
   MessageAttachment,
   RUNTIME_PRESETS,
   RuntimeCheck,
+  RuntimeModelCatalog,
   SavedMessage,
   SearchResult,
   SearchScope,
@@ -76,7 +78,10 @@ import {
   ThreadActivity,
   ThreadReplySummary,
   TodoItem,
+  isCodexLikeRuntime,
   normalizedReasoningEffortForRuntime,
+  runtimeCatalogFor,
+  runtimeModelIds,
 } from "./types";
 import { agentRequestSourceLabel, buildPresetCommand, displayNameForSender, firstLines, formatTime, timestampMs, visibleChannelDescription } from "./ui-utils";
 import "./styles.css";
@@ -792,8 +797,10 @@ function App() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [focusedMessageId, setFocusedMessageId] = useState<string | null>(null);
   const [appError, setAppError] = useState<string | null>(null);
+  const [readerArtifact, setReaderArtifact] = useState<Artifact | null>(null);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [runtimeChecks, setRuntimeChecks] = useState<Record<string, RuntimeCheck>>({});
+  const [runtimeModelCatalogs, setRuntimeModelCatalogs] = useState<RuntimeModelCatalog[]>([]);
   const [longTaskRefreshNonce, setLongTaskRefreshNonce] = useState(0);
   const [threadPanelWidth, setThreadPanelWidth] = useState(() => {
     const value = getStoredNumber(
@@ -993,17 +1000,24 @@ function App() {
   }
 
   async function refreshRuntimeChecks() {
-    if (!isTauriRuntime()) {
-      setRuntimeChecks({});
-      return;
-    }
-    const entries = await Promise.all(
-      Object.keys(RUNTIME_PRESETS).map(async (runtime) => {
-        const check = await apiInvoke<RuntimeCheck>("check_runtime", { runtime });
-        return [runtime, check] as const;
-      }),
-    );
+    const [entries, catalogs] = await Promise.all([
+      Promise.all(
+        Object.keys(RUNTIME_PRESETS).map(async (runtime) => {
+          const check = await apiInvoke<RuntimeCheck>("check_runtime", { runtime });
+          return [runtime, check] as const;
+        }),
+      ),
+      Promise.all(
+        Object.keys(RUNTIME_PRESETS).map((runtime) => (
+          apiInvoke<RuntimeModelCatalog>("runtime_model_catalog", { runtime })
+        )),
+      ).catch((err) => {
+          console.warn("Failed to load runtime model catalogs", err);
+          return [] as RuntimeModelCatalog[];
+        }),
+    ]);
     setRuntimeChecks(Object.fromEntries(entries));
+    setRuntimeModelCatalogs(catalogs);
   }
 
   function normalizeBootstrap(next: Bootstrap): Bootstrap {
@@ -1675,12 +1689,13 @@ function App() {
   }
 
   async function openArtifact(artifact: Artifact) {
+    if (artifact.metadata?.source === "long_message_fallback" && artifact.content) {
+      setReaderArtifact(artifact);
+      return;
+    }
     try {
       const fullArtifact = await apiInvoke<Artifact>("artifact_read", { artifactId: artifact.id });
-      const blob = new Blob([fullArtifact.content], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      window.open(url, "_blank", "noopener,noreferrer");
-      window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      setReaderArtifact(fullArtifact);
     } catch (err) {
       setAppError(errorMessage(err, "Failed to open artifact"));
     }
@@ -1800,6 +1815,12 @@ function App() {
       setAppError(errorMessage(err, "Failed to check local runtimes"));
       console.error(err);
     });
+    const runtimeCatalogTimer = window.setInterval(() => {
+      refreshRuntimeChecks().catch((err) => {
+        console.warn("Failed to refresh local runtime catalogs", err);
+      });
+    }, 30 * 60 * 1000);
+    return () => window.clearInterval(runtimeCatalogTimer);
   }, []);
 
   useEffect(() => {
@@ -3654,36 +3675,42 @@ function App() {
   function updateDraftRuntime(runtime: string) {
     const preset = RUNTIME_PRESETS[runtime];
     const currentPreset = RUNTIME_PRESETS[agentDraft.runtime];
+    const catalog = runtimeCatalogFor(runtimeModelCatalogs, runtime);
+    const currentModelOptions = runtimeModelIds(agentDraft.runtime, runtimeModelCatalogs);
+    const nextModelOptions = runtimeModelIds(runtime, runtimeModelCatalogs);
     const shouldReplaceModel =
       !agentDraft.model.trim() ||
-      !preset?.models.includes(agentDraft.model) ||
+      (currentModelOptions.includes(agentDraft.model) && !nextModelOptions.includes(agentDraft.model)) ||
       (currentPreset && agentDraft.model === currentPreset.defaultModel);
     setAgentDraft({
       ...agentDraft,
       runtime,
-      model: preset && shouldReplaceModel ? preset.defaultModel : agentDraft.model,
-      reasoningEffort: runtime === "codex" || runtime === "claude"
+      model: preset && shouldReplaceModel ? (catalog?.default_model || preset.defaultModel) : agentDraft.model,
+      reasoningEffort: isCodexLikeRuntime(runtime) || runtime === "claude"
         ? normalizedReasoningEffortForRuntime(runtime, agentDraft.reasoningEffort)
         : agentDraft.reasoningEffort,
-      serviceTier: runtime === "codex" ? agentDraft.serviceTier : "",
+      serviceTier: isCodexLikeRuntime(runtime) ? agentDraft.serviceTier : "",
     });
   }
 
   function updateEditRuntime(runtime: string) {
     const preset = RUNTIME_PRESETS[runtime];
     const currentPreset = RUNTIME_PRESETS[agentEdit.runtime];
+    const catalog = runtimeCatalogFor(runtimeModelCatalogs, runtime);
+    const currentModelOptions = runtimeModelIds(agentEdit.runtime, runtimeModelCatalogs);
+    const nextModelOptions = runtimeModelIds(runtime, runtimeModelCatalogs);
     const shouldReplaceModel =
       !agentEdit.model.trim() ||
-      !preset?.models.includes(agentEdit.model) ||
+      (currentModelOptions.includes(agentEdit.model) && !nextModelOptions.includes(agentEdit.model)) ||
       (currentPreset && agentEdit.model === currentPreset.defaultModel);
     setAgentEdit({
       ...agentEdit,
       runtime,
-      model: preset && shouldReplaceModel ? preset.defaultModel : agentEdit.model,
-      reasoningEffort: runtime === "codex" || runtime === "claude"
+      model: preset && shouldReplaceModel ? (catalog?.default_model || preset.defaultModel) : agentEdit.model,
+      reasoningEffort: isCodexLikeRuntime(runtime) || runtime === "claude"
         ? normalizedReasoningEffortForRuntime(runtime, agentEdit.reasoningEffort)
         : agentEdit.reasoningEffort,
-      serviceTier: runtime === "codex" ? agentEdit.serviceTier : "",
+      serviceTier: isCodexLikeRuntime(runtime) ? agentEdit.serviceTier : "",
     });
   }
 
@@ -5077,6 +5104,7 @@ function App() {
         title="Add Agent"
         form={agentDraft}
         runtimeChecks={runtimeChecks}
+        runtimeModelCatalogs={runtimeModelCatalogs}
         submitLabel="Add agent"
         createMode
         onChange={setAgentDraft}
@@ -5099,12 +5127,18 @@ function App() {
         title="Edit Agent"
         form={agentEdit}
         runtimeChecks={runtimeChecks}
+        runtimeModelCatalogs={runtimeModelCatalogs}
         submitLabel="Save"
         showNotes
         onChange={setAgentEdit}
         onRuntimeChange={updateEditRuntime}
         onCancel={cancelEditAgent}
         onSubmit={saveAgent}
+      />
+
+      <ArtifactReaderModal
+        artifact={readerArtifact}
+        onClose={() => setReaderArtifact(null)}
       />
 
     </main>

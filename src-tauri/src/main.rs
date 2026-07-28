@@ -30,7 +30,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -97,8 +97,8 @@ use models::{
     AgentWorkItemPatch, AgentWorkspaceEntry, AgentWorkspaceFile, AgentWorkspaceListing, Artifact,
     AttachmentUpload, Bootstrap, CallHistoryPage, CallSession, CallUtteranceSubmitResult, Channel,
     ChannelMember, EventHook, LaunchAgentStatus, Message, MessageAttachment, OwnerProfile,
-    Reminder, RuntimeCheck, SavedMessage, SupervisorCommand, SupervisorStatus, ThreadActivity,
-    ThreadActivityParticipant, TodoItem,
+    Reminder, RuntimeCheck, RuntimeModelCatalog, RuntimeModelOption, SavedMessage,
+    SupervisorCommand, SupervisorStatus, ThreadActivity, ThreadActivityParticipant, TodoItem,
 };
 #[cfg(test)]
 use prompts::WORK_ITEM_FINISH_PROMPT;
@@ -134,6 +134,9 @@ const BOOTSTRAP_RECENT_CALL_WORK_ITEM_LIMIT: i64 = 120;
 const UI_REFRESH_EVENT: &str = "lantor://refresh";
 const LANTOR_CONTEXT_TOOL_ENV: &str = "LANTOR_CONTEXT_TOOL";
 const STREAMING_MESSAGE_BODY_LIMIT: usize = 200_000;
+const AUTO_LONG_MESSAGE_CHAR_THRESHOLD: usize = 2_000;
+const AUTO_LONG_MESSAGE_LINE_THRESHOLD: usize = 24;
+const AUTO_LONG_MESSAGE_SOURCE: &str = "auto_long_message";
 const CLAUDE_MAX_RETRIES_ENV: &str = "ANTHROPIC_MAX_RETRIES";
 const DEFAULT_CLAUDE_MAX_RETRIES: &str = "5";
 const STREAMING_TRUNCATION_MARKER: &str = "\n\n[stream truncated by Lantor]";
@@ -171,6 +174,73 @@ const MAIN_WINDOW_STATE_FILE: &str = "main-window-state.json";
 const MAIN_WINDOW_MIN_WIDTH: u32 = 1180;
 const MAIN_WINDOW_MIN_HEIGHT: u32 = 760;
 const TRIGGER_WORKER_INTERVAL: Duration = Duration::from_secs(15);
+const RUNTIME_MODEL_CACHE_TTL: chrono::Duration = chrono::Duration::hours(6);
+const CODEX_BINARY_ENV: &str = "LANTOR_CODEX_BIN";
+const TRAEX_BINARY_ENV: &str = "LANTOR_TRAEX_BIN";
+
+static RUNTIME_MODEL_CACHE: OnceLock<AsyncMutex<HashMap<String, RuntimeModelCatalog>>> =
+    OnceLock::new();
+
+fn is_codex_like_runtime(runtime: &str) -> bool {
+    matches!(
+        runtime.trim().to_ascii_lowercase().as_str(),
+        "codex" | "traex"
+    )
+}
+
+fn codex_like_runtime_command(runtime: &str) -> Option<&'static str> {
+    match runtime.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex"),
+        "traex" => Some("traex"),
+        _ => None,
+    }
+}
+
+fn runtime_command(runtime: &str) -> Option<&'static str> {
+    codex_like_runtime_command(runtime).or_else(|| {
+        runtime
+            .trim()
+            .eq_ignore_ascii_case("claude")
+            .then_some("claude")
+    })
+}
+
+fn runtime_executable(runtime: &str) -> Option<String> {
+    let command = runtime_command(runtime)?;
+    let override_env = match command {
+        "codex" => Some(CODEX_BINARY_ENV),
+        "traex" => Some(TRAEX_BINARY_ENV),
+        _ => None,
+    };
+    if let Some(value) = override_env
+        .and_then(|name| env::var(name).ok())
+        .map(|value| expand_home_path(&value))
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(value);
+    }
+    if command == "codex" {
+        let mut candidates = vec![PathBuf::from(
+            "/Applications/Codex.app/Contents/Resources/codex",
+        )];
+        if let Ok(home) = env::var("HOME") {
+            candidates
+                .push(PathBuf::from(home).join("Applications/Codex.app/Contents/Resources/codex"));
+        }
+        if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    Some(command.to_owned())
+}
+
+fn default_model_for_runtime(runtime: &str) -> &'static str {
+    match runtime.trim().to_ascii_lowercase().as_str() {
+        "claude" => "sonnet",
+        _ => "gpt-5.5",
+    }
+}
+
 fn expand_home_path(value: &str) -> String {
     let value = value.trim();
     if value == "~" {
@@ -281,6 +351,7 @@ pub(crate) struct AgentWorkDispatchResult {
 struct WarmCodexRuntime {
     stdin: AsyncMutex<tokio::process::ChildStdin>,
     state: AsyncMutex<WarmCodexState>,
+    runtime: String,
     thread_id: String,
     pid: Option<i32>,
 }
@@ -3586,9 +3657,8 @@ async fn check_runtime(runtime: String) -> CommandResult<RuntimeCheck> {
 
 pub(crate) async fn check_runtime_in_env(runtime: String) -> CommandResult<RuntimeCheck> {
     let runtime = runtime.trim().to_owned();
-    let command = match runtime.as_str() {
-        "codex" => "codex",
-        "claude" => "claude",
+    let command = match runtime_command(&runtime) {
+        Some(command) => command,
         _ => {
             return Ok(RuntimeCheck {
                 runtime,
@@ -3598,17 +3668,23 @@ pub(crate) async fn check_runtime_in_env(runtime: String) -> CommandResult<Runti
             });
         }
     };
-
-    let script = format!(
-        "if command -v {command} >/dev/null 2>&1; then {command} --version 2>&1 | head -n 1; else echo '{command} not found in PATH' >&2; exit 127; fi"
-    );
-    let output = StdCommand::new("/bin/zsh")
-        .arg("-lc")
-        .arg(script)
+    let executable = runtime_executable(&runtime).unwrap_or_else(|| command.to_owned());
+    let output = match StdCommand::new(&executable)
+        .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(to_string)?;
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return Ok(RuntimeCheck {
+                runtime,
+                command: command.to_owned(),
+                available: false,
+                detail: format!("{executable}: {err}"),
+            });
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -3628,6 +3704,274 @@ pub(crate) async fn check_runtime_in_env(runtime: String) -> CommandResult<Runti
         available: output.status.success(),
         detail,
     })
+}
+
+fn model_label(id: &str) -> &str {
+    match id {
+        "gpt-5.6-sol" => "GPT-5.6 Sol",
+        "gpt-5.6-terra" => "GPT-5.6 Terra",
+        "gpt-5.6-luna" => "GPT-5.6 Luna",
+        "gpt-5.5" => "GPT-5.5",
+        "gpt-5.4" => "GPT-5.4",
+        "gpt-5.4-mini" => "GPT-5.4 Mini",
+        "gpt-5.3-codex" => "GPT-5.3 Codex",
+        "gpt-5.3-codex-spark" => "GPT-5.3 Codex Spark",
+        "sonnet" => "Sonnet",
+        "opus" => "Opus",
+        "haiku" => "Haiku",
+        _ => id,
+    }
+}
+
+fn static_runtime_models(runtime: &str) -> Vec<RuntimeModelOption> {
+    let ids: &[&str] = match runtime {
+        "claude" => &["sonnet", "opus", "haiku"],
+        _ => &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+        ],
+    };
+    ids.iter()
+        .map(|id| RuntimeModelOption {
+            id: (*id).to_owned(),
+            label: model_label(id).to_owned(),
+            description: String::new(),
+        })
+        .collect()
+}
+
+fn runtime_model_from_json(value: &Value) -> Option<RuntimeModelOption> {
+    let id = value
+        .get("slug")
+        .or_else(|| value.get("id"))
+        .or_else(|| value.get("model"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)?
+        .trim();
+    if id.is_empty() {
+        return None;
+    }
+    let label = value
+        .get("real_name")
+        .or_else(|| value.get("realName"))
+        .or_else(|| value.get("display_name"))
+        .or_else(|| value.get("displayName"))
+        .or_else(|| value.get("label"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| model_label(id));
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    Some(RuntimeModelOption {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        description,
+    })
+}
+
+fn dedupe_runtime_models(models: Vec<RuntimeModelOption>) -> Vec<RuntimeModelOption> {
+    let mut seen = HashSet::new();
+    models
+        .into_iter()
+        .filter(|model| seen.insert(model.id.clone()))
+        .collect()
+}
+
+fn parse_runtime_models(stdout: &str) -> Vec<RuntimeModelOption> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        let models: Vec<_> = if let Some(items) = value.as_array() {
+            items.iter().filter_map(runtime_model_from_json).collect()
+        } else if let Some(items) = value.get("models").and_then(Value::as_array) {
+            items.iter().filter_map(runtime_model_from_json).collect()
+        } else {
+            Vec::new()
+        };
+        if !models.is_empty() {
+            return dedupe_runtime_models(models);
+        }
+    }
+    dedupe_runtime_models(
+        trimmed
+            .lines()
+            .filter_map(|line| {
+                let id = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_matches(['-', '*', '"', '\'']);
+                if id.is_empty()
+                    || id.eq_ignore_ascii_case("slug")
+                    || id.eq_ignore_ascii_case("model")
+                {
+                    return None;
+                }
+                Some(RuntimeModelOption {
+                    id: id.to_owned(),
+                    label: model_label(id).to_owned(),
+                    description: String::new(),
+                })
+            })
+            .collect(),
+    )
+}
+
+async fn discover_runtime_model_catalog(runtime: &str) -> RuntimeModelCatalog {
+    let runtime = runtime.trim().to_ascii_lowercase();
+    let command = runtime_command(&runtime).unwrap_or_default().to_owned();
+    let fetched_at = Utc::now();
+    let expires_at = fetched_at + RUNTIME_MODEL_CACHE_TTL;
+    let default_model = default_model_for_runtime(&runtime).to_owned();
+    let fallback = static_runtime_models(&runtime);
+    if command.is_empty() || runtime == "claude" {
+        let error = if command.is_empty() {
+            Some("Unknown runtime".to_owned())
+        } else {
+            None
+        };
+        return RuntimeModelCatalog {
+            runtime,
+            command,
+            default_model,
+            models: fallback,
+            source: "static".to_owned(),
+            error,
+            fetched_at,
+            expires_at,
+        };
+    }
+
+    let executable = runtime_executable(&runtime).unwrap_or_else(|| command.clone());
+    let args: &[&str] = match runtime.as_str() {
+        "codex" => &["debug", "models"],
+        "traex" => &["models", "--json"],
+        _ => &[],
+    };
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(&executable)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await;
+    match output {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let models = parse_runtime_models(&stdout);
+            if models.is_empty() {
+                RuntimeModelCatalog {
+                    runtime,
+                    command,
+                    default_model,
+                    models: fallback,
+                    source: "static".to_owned(),
+                    error: Some("model command returned no parseable models".to_owned()),
+                    fetched_at,
+                    expires_at,
+                }
+            } else {
+                RuntimeModelCatalog {
+                    runtime,
+                    command,
+                    default_model,
+                    models,
+                    source: "runtime".to_owned(),
+                    error: None,
+                    fetched_at,
+                    expires_at,
+                }
+            }
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            RuntimeModelCatalog {
+                runtime,
+                command,
+                default_model,
+                models: fallback,
+                source: "static".to_owned(),
+                error: Some(if stderr.is_empty() {
+                    "model command failed".to_owned()
+                } else {
+                    stderr
+                }),
+                fetched_at,
+                expires_at,
+            }
+        }
+        Ok(Err(err)) => RuntimeModelCatalog {
+            runtime,
+            command,
+            default_model,
+            models: fallback,
+            source: "static".to_owned(),
+            error: Some(err.to_string()),
+            fetched_at,
+            expires_at,
+        },
+        Err(_) => RuntimeModelCatalog {
+            runtime,
+            command,
+            default_model,
+            models: fallback,
+            source: "static".to_owned(),
+            error: Some("model command timed out".to_owned()),
+            fetched_at,
+            expires_at,
+        },
+    }
+}
+
+pub(crate) async fn runtime_model_catalog_in_env(
+    runtime: String,
+) -> CommandResult<RuntimeModelCatalog> {
+    let runtime = runtime.trim().to_ascii_lowercase();
+    if runtime_command(&runtime).is_none() {
+        return Ok(discover_runtime_model_catalog(&runtime).await);
+    }
+    let cache = RUNTIME_MODEL_CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()));
+    {
+        let catalogs = cache.lock().await;
+        if let Some(catalog) = catalogs.get(&runtime) {
+            if catalog.expires_at > Utc::now() {
+                return Ok(catalog.clone());
+            }
+        }
+    }
+    let catalog = discover_runtime_model_catalog(&runtime).await;
+    cache.lock().await.insert(runtime, catalog.clone());
+    Ok(catalog)
+}
+
+#[tauri::command]
+async fn runtime_model_catalog(runtime: String) -> CommandResult<RuntimeModelCatalog> {
+    runtime_model_catalog_in_env(runtime).await
+}
+
+#[tauri::command]
+async fn list_runtime_model_catalogs() -> CommandResult<Vec<RuntimeModelCatalog>> {
+    let mut catalogs = Vec::new();
+    for runtime in ["codex", "traex", "claude"] {
+        catalogs.push(runtime_model_catalog_in_env(runtime.to_owned()).await?);
+    }
+    Ok(catalogs)
 }
 
 #[tauri::command]
@@ -4050,7 +4394,10 @@ pub(crate) async fn open_dm_with_agent_in_pool(
 }
 
 fn normalize_reasoning_effort(runtime: &str, value: Option<&str>) -> CommandResult<String> {
-    if !runtime.eq_ignore_ascii_case("codex") && !runtime.eq_ignore_ascii_case("claude") {
+    if !runtime.eq_ignore_ascii_case("codex")
+        && !runtime.eq_ignore_ascii_case("traex")
+        && !runtime.eq_ignore_ascii_case("claude")
+    {
         return Ok(String::new());
     }
     let effort = value
@@ -4071,7 +4418,7 @@ fn normalize_reasoning_effort(runtime: &str, value: Option<&str>) -> CommandResu
 }
 
 fn normalize_service_tier(runtime: &str, value: Option<&str>) -> CommandResult<String> {
-    if !runtime.eq_ignore_ascii_case("codex") {
+    if !runtime.eq_ignore_ascii_case("codex") && !runtime.eq_ignore_ascii_case("traex") {
         return Ok(String::new());
     }
     let tier = value
@@ -4083,7 +4430,7 @@ fn normalize_service_tier(runtime: &str, value: Option<&str>) -> CommandResult<S
         "" | "default" => Ok(String::new()),
         "standard" => Ok(String::new()),
         "fast" => Ok(tier),
-        _ => Err(format!("invalid Codex speed tier: {tier}")),
+        _ => Err(format!("invalid {runtime} speed tier: {tier}")),
     }
 }
 
@@ -4173,6 +4520,12 @@ pub(crate) async fn create_agent_in_pool(
     ensure_agent_workspace(&working_directory, normalized_handle)?;
     let runtime = runtime.trim();
     let model = model.trim();
+    if runtime_command(runtime).is_none() {
+        return Err(format!("unsupported agent runtime: {runtime}"));
+    }
+    if model.is_empty() {
+        return Err("agent model is empty".to_owned());
+    }
     let reasoning_effort = normalize_reasoning_effort(runtime, reasoning_effort.as_deref())?;
     let service_tier = normalize_service_tier(runtime, service_tier.as_deref())?;
 
@@ -4313,6 +4666,12 @@ pub(crate) async fn update_agent_in_pool(
     ensure_agent_workspace(&working_directory, normalized_handle)?;
     let runtime = runtime.trim();
     let model = model.trim();
+    if runtime_command(runtime).is_none() {
+        return Err(format!("unsupported agent runtime: {runtime}"));
+    }
+    if model.is_empty() {
+        return Err("agent model is empty".to_owned());
+    }
     let reasoning_effort = normalize_reasoning_effort(runtime, reasoning_effort.as_deref())?;
     let service_tier = normalize_service_tier(runtime, service_tier.as_deref())?;
 
@@ -5709,11 +6068,9 @@ async fn enqueue_agent_work_if_available(
         return Ok(false);
     }
     let runtime = agent_runtime(pool, agent_id).await?;
-    let is_codex = runtime
-        .as_deref()
-        .is_some_and(|runtime| runtime.eq_ignore_ascii_case("codex"));
+    let is_codex_like = runtime.as_deref().is_some_and(is_codex_like_runtime);
     let has_active_run = agent_has_active_run(pool, agent_id).await?;
-    if !is_codex && agent_has_active_or_pending_start(pool, agent_id).await? {
+    if !is_codex_like && agent_has_active_or_pending_start(pool, agent_id).await? {
         return Ok(false);
     }
 
@@ -5754,7 +6111,7 @@ async fn enqueue_agent_work_if_available(
         .await
         .map_err(to_string)?;
     notify_ui_agent_changed(pool, agent_id, "agent_queued").await;
-    if is_codex && has_active_run {
+    if is_codex_like && has_active_run {
         sqlx::query("update agents set status = 'running' where id = $1")
             .bind(agent_id)
             .execute(pool)
@@ -6277,9 +6634,27 @@ async fn queue_mentions_as_work_items(
 }
 
 async fn queue_agent_message_mentions(pool: &SqlitePool, message_id: Uuid) -> CommandResult<()> {
+    let body = if let Some(content) = auto_long_message_content(pool, message_id).await? {
+        content
+    } else {
+        sqlx::query_scalar("select body from messages where id = $1")
+            .bind(message_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?
+            .unwrap_or_default()
+    };
+    queue_agent_message_mentions_from_body(pool, message_id, &body).await
+}
+
+async fn queue_agent_message_mentions_from_body(
+    pool: &SqlitePool,
+    message_id: Uuid,
+    body: &str,
+) -> CommandResult<()> {
     let Some(row) = sqlx::query(
         r#"
-        select channel_id, thread_root_id, sender_agent_id, body, is_task
+        select channel_id, thread_root_id, sender_agent_id, is_task
         from messages
         where id = $1
         "#,
@@ -6302,7 +6677,6 @@ async fn queue_agent_message_mentions(pool: &SqlitePool, message_id: Uuid) -> Co
 
     let channel_id: Uuid = row.get("channel_id");
     let thread_root_id: Option<Uuid> = row.get("thread_root_id");
-    let body: String = row.get("body");
     queue_mentions_as_work_items(
         pool,
         channel_id,
@@ -12246,6 +12620,21 @@ async fn insert_agent_message_with_options(
         .map_err(to_string)?;
     }
 
+    let promoted_artifact_id = if !as_task && should_promote_long_message(body) {
+        Some(
+            upsert_auto_long_message_in_tx(
+                &mut tx,
+                msg_id,
+                channel_id,
+                thread_root_id,
+                agent_id,
+                body,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     tx.commit().await.map_err(to_string)?;
     bump_thread_version(pool, channel_id, thread_root_id).await?;
     let conversation_thread_root_id = thread_root_id.unwrap_or(msg_id);
@@ -12264,6 +12653,11 @@ async fn insert_agent_message_with_options(
     .await?;
     if !as_task && dispatch_mentions {
         queue_agent_message_mentions(pool, msg_id).await?;
+    }
+    if let Some(artifact_id) = promoted_artifact_id {
+        if let Ok(artifact) = load_artifact(pool, artifact_id).await {
+            let _ = notify_ui_artifact_upsert(pool, &artifact, "auto_long_message").await;
+        }
     }
     if let Ok(message) = load_message(pool, msg_id).await {
         let _ = notify_ui_message_upsert(pool, &message, "message").await;
@@ -12523,6 +12917,280 @@ fn capped_stream_delta(delta: &str, current_len: usize) -> (String, bool) {
     (capped, true)
 }
 
+struct AutoLongMessagePresentation {
+    title: String,
+    preview: String,
+    message_body: String,
+    metadata: Value,
+}
+
+fn truncate_chars_end(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_owned();
+    }
+    let keep = limit.saturating_sub(1);
+    format!("{}…", value.chars().take(keep).collect::<String>())
+}
+
+fn should_promote_long_message(body: &str) -> bool {
+    body.chars().count() > AUTO_LONG_MESSAGE_CHAR_THRESHOLD
+        || body.lines().count() > AUTO_LONG_MESSAGE_LINE_THRESHOLD
+}
+
+fn auto_long_message_title(body: &str) -> String {
+    let title = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Long response")
+        .trim_start_matches(|ch: char| matches!(ch, '#' | '-' | '*' | '>' | ' '))
+        .trim()
+        .trim_end_matches([':', '：'])
+        .trim();
+    truncate_chars_end(
+        if title.is_empty() {
+            "Long response"
+        } else {
+            title
+        },
+        90,
+    )
+}
+
+fn auto_long_message_preview(body: &str) -> String {
+    let first_nonempty = body.lines().position(|line| !line.trim().is_empty());
+    let mut paragraphs = Vec::new();
+    let mut paragraph = Vec::new();
+    for (index, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        let skip = Some(index) == first_nonempty
+            || trimmed.starts_with("```")
+            || (trimmed.starts_with('|') && trimmed.ends_with('|'));
+        if trimmed.is_empty() || skip {
+            if !paragraph.is_empty() {
+                paragraphs.push(paragraph.join(" "));
+                paragraph.clear();
+            }
+            if paragraphs.len() >= 4 {
+                break;
+            }
+            continue;
+        }
+        paragraph.push(trimmed.to_owned());
+    }
+    if paragraphs.len() < 4 && !paragraph.is_empty() {
+        paragraphs.push(paragraph.join(" "));
+    }
+    let preview = paragraphs
+        .into_iter()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    truncate_chars_end(preview.trim(), 420)
+}
+
+fn auto_long_message_code_block_count(body: &str) -> usize {
+    let mut inside = false;
+    let mut count = 0;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            if !inside {
+                count += 1;
+            }
+            inside = !inside;
+        }
+    }
+    count
+}
+
+fn auto_long_message_presentation(body: &str) -> AutoLongMessagePresentation {
+    let title = auto_long_message_title(body);
+    let preview = auto_long_message_preview(body);
+    let message_body = if preview.is_empty() {
+        title.clone()
+    } else {
+        format!("{title}\n\nPreview:\n{preview}")
+    };
+    AutoLongMessagePresentation {
+        title,
+        preview,
+        message_body,
+        metadata: json!({
+            "source": AUTO_LONG_MESSAGE_SOURCE,
+            "preview_kind": "extractive",
+            "line_count": body.lines().count(),
+            "char_count": body.chars().count(),
+            "code_block_count": auto_long_message_code_block_count(body),
+        }),
+    }
+}
+
+async fn upsert_auto_long_message_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: Uuid,
+    channel_id: Uuid,
+    thread_root_id: Option<Uuid>,
+    creator_agent_id: Uuid,
+    full_body: &str,
+) -> CommandResult<Uuid> {
+    let presentation = auto_long_message_presentation(full_body);
+    sqlx::query(
+        "update messages set body = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') where id = $1",
+    )
+    .bind(message_id)
+    .bind(&presentation.message_body)
+    .execute(&mut **tx)
+    .await
+    .map_err(to_string)?;
+    let existing_id: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        select id
+        from artifacts
+        where message_id = $1
+          and json_extract(metadata, '$.source') = $2
+        limit 1
+        "#,
+    )
+    .bind(message_id)
+    .bind(AUTO_LONG_MESSAGE_SOURCE)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(to_string)?;
+    if let Some(artifact_id) = existing_id {
+        sqlx::query(
+            r#"
+            update artifacts
+            set title = $2,
+                summary = $3,
+                content = $4,
+                metadata = $5,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+            where id = $1
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(&presentation.title)
+        .bind(&presentation.preview)
+        .bind(full_body)
+        .bind(&presentation.metadata)
+        .execute(&mut **tx)
+        .await
+        .map_err(to_string)?;
+        return Ok(artifact_id);
+    }
+    sqlx::query_scalar(
+        r#"
+        insert into artifacts (
+            message_id, channel_id, thread_root_id, creator_agent_id,
+            kind, title, summary, content, metadata
+        )
+        values ($1, $2, $3, $4, 'markdown', $5, $6, $7, $8)
+        returning id
+        "#,
+    )
+    .bind(message_id)
+    .bind(channel_id)
+    .bind(thread_root_id)
+    .bind(creator_agent_id)
+    .bind(&presentation.title)
+    .bind(&presentation.preview)
+    .bind(full_body)
+    .bind(&presentation.metadata)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(to_string)
+}
+
+async fn auto_long_message_content(
+    pool: &SqlitePool,
+    message_id: Uuid,
+) -> CommandResult<Option<String>> {
+    sqlx::query_scalar(
+        r#"
+        select content
+        from artifacts
+        where message_id = $1
+          and json_extract(metadata, '$.source') = $2
+        limit 1
+        "#,
+    )
+    .bind(message_id)
+    .bind(AUTO_LONG_MESSAGE_SOURCE)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)
+}
+
+async fn maybe_promote_long_agent_message(
+    pool: &SqlitePool,
+    message_id: Uuid,
+    source_body: Option<&str>,
+    delivery_state: Option<&str>,
+) -> CommandResult<Option<Uuid>> {
+    let Some(row) = sqlx::query(
+        r#"
+        select channel_id, thread_root_id, sender_agent_id, body, is_task
+        from messages
+        where id = $1
+        "#,
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(to_string)?
+    else {
+        return Ok(None);
+    };
+    let Some(creator_agent_id) = row.get::<Option<Uuid>, _>("sender_agent_id") else {
+        return Ok(None);
+    };
+    if row.get::<bool, _>("is_task") {
+        return Ok(None);
+    }
+    let existing_content = auto_long_message_content(pool, message_id).await?;
+    let stored_body: String = row.get("body");
+    let full_body = source_body
+        .map(str::to_owned)
+        .or(existing_content.clone())
+        .unwrap_or(stored_body);
+    if existing_content.is_none() && !should_promote_long_message(&full_body) {
+        return Ok(None);
+    }
+    let channel_id: Uuid = row.get("channel_id");
+    let thread_root_id: Option<Uuid> = row.get("thread_root_id");
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(to_string)?;
+    if let Some(delivery_state) = delivery_state {
+        sqlx::query("update messages set delivery_state = $2 where id = $1")
+            .bind(message_id)
+            .bind(delivery_state)
+            .execute(&mut *tx)
+            .await
+            .map_err(to_string)?;
+    }
+    let artifact_id = upsert_auto_long_message_in_tx(
+        &mut tx,
+        message_id,
+        channel_id,
+        thread_root_id,
+        creator_agent_id,
+        &full_body,
+    )
+    .await?;
+    tx.commit().await.map_err(to_string)?;
+    if let Ok(artifact) = load_artifact(pool, artifact_id).await {
+        let _ = notify_ui_artifact_upsert(pool, &artifact, "auto_long_message").await;
+    }
+    if let Ok(message) = load_message(pool, message_id).await {
+        let _ = notify_ui_message_upsert(pool, &message, "auto_long_message").await;
+    } else {
+        let _ = notify_ui_refresh(pool, "auto_long_message").await;
+    }
+    Ok(Some(artifact_id))
+}
+
 async fn append_streaming_agent_message(
     pool: &SqlitePool,
     agent_id: Uuid,
@@ -12608,22 +13276,23 @@ async fn append_streaming_agent_message_inner(
         .await;
     }
 
-    if let Some(row) = sqlx::query(
-        "select id, body, delivery_state, length(body) as body_len from messages where stream_key = $1",
-    )
-    .bind(stream_key)
-    .fetch_optional(pool)
-    .await
-    .map_err(to_string)?
+    if let Some(row) =
+        sqlx::query("select id, body, delivery_state from messages where stream_key = $1")
+            .bind(stream_key)
+            .fetch_optional(pool)
+            .await
+            .map_err(to_string)?
     {
         let message_id: Uuid = row.get("id");
-        let body: String = row.get("body");
+        let stored_body: String = row.get("body");
+        let body = auto_long_message_content(pool, message_id)
+            .await?
+            .unwrap_or(stored_body);
         let delivery_state: String = row.get("delivery_state");
         if delivery_state != "streaming" {
             return Ok(message_id);
         }
-        let body_len: i32 = row.get("body_len");
-        let (append_delta, truncated) = capped_stream_delta(delta, body_len.max(0) as usize);
+        let (append_delta, truncated) = capped_stream_delta(delta, body.chars().count());
         if append_delta.is_empty() && truncated {
             if complete_on_truncation {
                 finish_streaming_agent_message(pool, stream_key, "complete").await?;
@@ -12639,7 +13308,8 @@ async fn append_streaming_agent_message_inner(
             load_streaming_control_context(pool, stream_key).await?
         {
             let next_body = format!("{body}{append_delta}");
-            let (visible_body, event_jsons) = split_complete_streaming_agent_event_lines(&next_body);
+            let (visible_body, event_jsons) =
+                split_complete_streaming_agent_event_lines(&next_body);
             if !event_jsons.is_empty() {
                 for json in &event_jsons {
                     handle_streaming_agent_event_json(pool, control_agent_id, run_id, json).await?;
@@ -12650,23 +13320,34 @@ async fn append_streaming_agent_message_inner(
                         .execute(pool)
                         .await
                         .map_err(to_string)?;
-                    let _ = notify_ui_message_delete(pool, message_id, "stream_event_consumed")
-                        .await;
+                    let _ =
+                        notify_ui_message_delete(pool, message_id, "stream_event_consumed").await;
                     return Ok(message_id);
                 }
-                sqlx::query(
-                    "update messages set body = $2, delivery_state = $3, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') where id = $1",
+                let promoted = maybe_promote_long_agent_message(
+                    pool,
+                    message_id,
+                    Some(&visible_body),
+                    Some(delivery_state),
                 )
-                .bind(message_id)
-                .bind(&visible_body)
-                .bind(delivery_state)
-                .execute(pool)
-                .await
-                .map_err(to_string)?;
-                if let Ok(message) = load_message(pool, message_id).await {
-                    let _ = notify_ui_message_upsert(pool, &message, "stream_event_consumed").await;
-                } else {
-                    let _ = notify_ui_refresh(pool, "stream_event_consumed").await;
+                .await?
+                .is_some();
+                if !promoted {
+                    sqlx::query(
+                        "update messages set body = $2, delivery_state = $3, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') where id = $1",
+                    )
+                    .bind(message_id)
+                    .bind(&visible_body)
+                    .bind(delivery_state)
+                    .execute(pool)
+                    .await
+                    .map_err(to_string)?;
+                    if let Ok(message) = load_message(pool, message_id).await {
+                        let _ =
+                            notify_ui_message_upsert(pool, &message, "stream_event_consumed").await;
+                    } else {
+                        let _ = notify_ui_refresh(pool, "stream_event_consumed").await;
+                    }
                 }
                 if truncated && complete_on_truncation {
                     bump_thread_version(pool, channel_id, thread_root_id).await?;
@@ -12675,23 +13356,34 @@ async fn append_streaming_agent_message_inner(
                 return Ok(message_id);
             }
         }
-        sqlx::query(
-            "update messages set body = body || $2, delivery_state = $3, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') where id = $1",
-        )
-            .bind(message_id)
-            .bind(&append_delta)
-            .bind(delivery_state)
-            .execute(pool)
-            .await
-            .map_err(to_string)?;
-        let _ = notify_ui_message_delta(
+        let next_body = format!("{body}{append_delta}");
+        let promoted = maybe_promote_long_agent_message(
             pool,
             message_id,
-            &append_delta,
-            delivery_state,
-            "stream_delta",
+            Some(&next_body),
+            Some(delivery_state),
         )
-        .await;
+        .await?
+        .is_some();
+        if !promoted {
+            sqlx::query(
+                "update messages set body = $2, delivery_state = $3, updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00','now') where id = $1",
+            )
+                .bind(message_id)
+                .bind(&next_body)
+                .bind(delivery_state)
+                .execute(pool)
+                .await
+                .map_err(to_string)?;
+            let _ = notify_ui_message_delta(
+                pool,
+                message_id,
+                &append_delta,
+                delivery_state,
+                "stream_delta",
+            )
+            .await;
+        }
         if let Some((control_agent_id, run_id, _)) =
             load_streaming_control_context(pool, stream_key).await?
         {
@@ -12811,6 +13503,13 @@ async fn append_streaming_agent_message_inner(
         }
     }
 
+    let _ = maybe_promote_long_agent_message(
+        pool,
+        message_id,
+        Some(&insert_body),
+        Some(delivery_state),
+    )
+    .await?;
     if insert_body.is_empty() {
         let _ = notify_ui_refresh(pool, "stream_start").await;
     } else if let Ok(message) = load_message(pool, message_id).await {
@@ -13191,6 +13890,8 @@ async fn finish_streaming_agent_message_inner(
                 .await
                 .map_err(to_string)?;
         if let Some(message_id) = message_id {
+            let _ = maybe_promote_long_agent_message(pool, message_id, None, Some(delivery_state))
+                .await?;
             if let Ok(message) = load_message(pool, message_id).await {
                 if delivery_state == "complete" {
                     bump_thread_version(pool, message.channel_id, message.thread_root_id).await?;
@@ -15125,6 +15826,7 @@ async fn get_or_spawn_warm_codex_runtime(
     pool: &SqlitePool,
     registry: &WarmCodexRegistry,
     agent_id: Uuid,
+    runtime_name: &str,
     handle: &str,
     model: &str,
     reasoning_effort: &str,
@@ -15132,6 +15834,10 @@ async fn get_or_spawn_warm_codex_runtime(
     working_directory: &str,
     memory_context: Option<&str>,
 ) -> CommandResult<Arc<WarmCodexRuntime>> {
+    let runtime_name = runtime_name.trim().to_ascii_lowercase();
+    if !is_codex_like_runtime(&runtime_name) {
+        return Err(format!("unsupported Codex-like runtime: {runtime_name}"));
+    }
     let context_rotate_threshold = codex_context_rotate_input_tokens();
     let rotation_candidate =
         codex_context_rotation_candidate(pool, agent_id, context_rotate_threshold).await?;
@@ -15140,7 +15846,15 @@ async fn get_or_spawn_warm_codex_runtime(
         runtimes.get(&agent_id).cloned()
     } {
         let mut state = runtime.state.lock().await;
-        if state.alive && rotation_candidate.is_some() && state.active.is_none() {
+        if runtime.runtime != runtime_name && state.active.is_some() {
+            return Err(format!(
+                "cannot switch warm runtime from {} to {runtime_name} while a turn is active",
+                runtime.runtime
+            ));
+        }
+        if runtime.runtime != runtime_name
+            || (state.alive && rotation_candidate.is_some() && state.active.is_none())
+        {
             state.alive = false;
             drop(state);
             if let Some(pid) = runtime.pid {
@@ -15160,6 +15874,7 @@ async fn get_or_spawn_warm_codex_runtime(
         pool,
         registry.clone(),
         agent_id,
+        &runtime_name,
         handle,
         model,
         reasoning_effort,
@@ -15181,6 +15896,7 @@ async fn spawn_warm_codex_runtime(
     pool: &SqlitePool,
     registry: WarmCodexRegistry,
     agent_id: Uuid,
+    runtime_name: &str,
     handle: &str,
     model: &str,
     reasoning_effort: &str,
@@ -15189,11 +15905,21 @@ async fn spawn_warm_codex_runtime(
     memory_context: Option<&str>,
     context_rotate_threshold: i64,
 ) -> CommandResult<Arc<WarmCodexRuntime>> {
+    let runtime_command = codex_like_runtime_command(runtime_name)
+        .ok_or_else(|| format!("unsupported Codex-like runtime: {runtime_name}"))?;
+    let runtime_executable = runtime_executable(runtime_name)
+        .ok_or_else(|| format!("unsupported Codex-like runtime: {runtime_name}"))?;
+    let runtime_label = if runtime_name.eq_ignore_ascii_case("traex") {
+        "Traex"
+    } else {
+        "Codex"
+    };
     let cwd = effective_codex_cwd(working_directory)?;
-    let mut command = Command::new("/bin/zsh");
-    command
-        .arg("-lc")
-        .arg("exec codex app-server --listen stdio:// -c 'notify=[]'");
+    let mut command = Command::new(&runtime_executable);
+    command.arg("app-server").arg("--listen").arg("stdio://");
+    if runtime_name.eq_ignore_ascii_case("codex") {
+        command.arg("-c").arg("notify=[]");
+    }
     configure_agent_identity_env(&mut command, agent_id, handle);
     configure_agent_context_tool_env(&mut command);
     #[cfg(unix)]
@@ -15218,7 +15944,7 @@ async fn spawn_warm_codex_runtime(
                 Some(agent_id),
                 None,
                 "run_error",
-                "Codex warm app-server failed to start",
+                &format!("{runtime_label} warm app-server failed to start"),
                 err.to_string(),
             )
             .await?;
@@ -15228,10 +15954,10 @@ async fn spawn_warm_codex_runtime(
 
     let pid = child.id().map(|id| id as i32);
     let Some(mut stdin) = child.stdin.take() else {
-        return Err("codex app-server stdin unavailable".to_owned());
+        return Err(format!("{runtime_command} app-server stdin unavailable"));
     };
     let Some(stdout) = child.stdout.take() else {
-        return Err("codex app-server stdout unavailable".to_owned());
+        return Err(format!("{runtime_command} app-server stdout unavailable"));
     };
     let stderr = child.stderr.take();
     let mut reader = BufReader::new(stdout);
@@ -15268,7 +15994,7 @@ async fn spawn_warm_codex_runtime(
     let existing_thread_id = if rotation_candidate.is_some() {
         None
     } else {
-        load_runtime_thread_id(pool, agent_id, "codex").await?
+        load_runtime_thread_id(pool, agent_id, runtime_name).await?
     };
     let mut dynamic_tools_registered = false;
     let mut attempted_resume = existing_thread_id.is_some();
@@ -15278,7 +16004,7 @@ async fn spawn_warm_codex_runtime(
             Some(agent_id),
             None,
             "run",
-            "Codex context rotated",
+            &format!("{runtime_label} context rotated"),
             json!({
                 "previous_run_id": run_id,
                 "input_tokens": input_tokens,
@@ -15371,13 +16097,13 @@ async fn spawn_warm_codex_runtime(
                         Some(agent_id),
                         None,
                         "run",
-                        "Codex thread resume failed; starting new thread",
+                        &format!("{runtime_label} thread resume failed; starting new thread"),
                         error,
                     )
                     .await?;
                     continue;
                 }
-                return Err(format!("codex thread request failed: {error}"));
+                return Err(format!("{runtime_command} thread request failed: {error}"));
             }
             let Some(thread_id) = codex_thread_id_from_response(&value) else {
                 return Err("codex thread response missing thread id".to_owned());
@@ -15386,13 +16112,13 @@ async fn spawn_warm_codex_runtime(
         }
     };
 
-    upsert_runtime_thread_id(pool, agent_id, "codex", &thread_id, "idle").await?;
+    upsert_runtime_thread_id(pool, agent_id, runtime_name, &thread_id, "idle").await?;
     record_agent_activity(
         pool,
         Some(agent_id),
         None,
         "run",
-        "Codex warm app-server ready",
+        &format!("{runtime_label} warm app-server ready"),
         pid.map(|pid| format!("pid={pid}, thread_id={thread_id}"))
             .unwrap_or_else(|| format!("thread_id={thread_id}")),
     )
@@ -15417,6 +16143,7 @@ async fn spawn_warm_codex_runtime(
             next_request_id,
             last_activity: Instant::now(),
         }),
+        runtime: runtime_name.to_owned(),
         thread_id,
         pid,
     });
@@ -15621,10 +16348,7 @@ async fn should_schedule_queued_work_item(
     thread_root_id: Option<Uuid>,
 ) -> CommandResult<bool> {
     let runtime = agent_runtime(pool, agent_id).await?;
-    if !runtime
-        .as_deref()
-        .is_some_and(|runtime| runtime.eq_ignore_ascii_case("codex"))
-    {
+    if !runtime.as_deref().is_some_and(is_codex_like_runtime) {
         return Ok(!agent_has_active_or_pending_start(pool, agent_id).await?);
     }
 
@@ -16247,6 +16971,7 @@ async fn supervisor_start_codex_streaming_agent(
     codex_registry: &WarmCodexRegistry,
     agent_id: Uuid,
     work_item_id: Option<Uuid>,
+    runtime_name: String,
     handle: String,
     model: String,
     reasoning_effort: String,
@@ -16255,12 +16980,15 @@ async fn supervisor_start_codex_streaming_agent(
     work_item_prompt: String,
     memory_context: Option<String>,
 ) -> CommandResult<()> {
-    let command_text = "codex app-server --listen stdio://".to_owned();
+    let runtime_command = codex_like_runtime_command(&runtime_name)
+        .ok_or_else(|| format!("unsupported Codex-like runtime: {runtime_name}"))?;
+    let command_text = format!("{runtime_command} app-server --listen stdio://");
     let codex_prompt = build_codex_streaming_prompt(&work_item_prompt);
     let runtime = get_or_spawn_warm_codex_runtime(
         pool,
         codex_registry,
         agent_id,
+        &runtime_name,
         &handle,
         &model,
         &reasoning_effort,
@@ -17084,7 +17812,7 @@ async fn supervisor_start_agent(
     let working_directory: String = row.get::<String, _>("working_directory").trim().to_owned();
     let avatar: Option<String> = row.get("avatar");
     let is_warm_streaming_runtime =
-        runtime.eq_ignore_ascii_case("codex") || runtime.eq_ignore_ascii_case("claude");
+        is_codex_like_runtime(&runtime) || runtime.eq_ignore_ascii_case("claude");
     let memory_context_text = md_memory::runtime_context(pool, agent_id, 16 * 1024)
         .await
         .ok()
@@ -17166,12 +17894,13 @@ async fn supervisor_start_agent(
         }
         None => String::new(),
     };
-    if runtime.eq_ignore_ascii_case("codex") {
+    if is_codex_like_runtime(&runtime) {
         return supervisor_start_codex_streaming_agent(
             pool,
             codex_registry,
             agent_id,
             work_item_id,
+            runtime,
             handle,
             model,
             reasoning_effort,
@@ -18997,7 +19726,7 @@ async fn finish_warm_codex_active_turn(
     upsert_runtime_thread_id(
         pool,
         agent_id,
-        "codex",
+        &runtime.runtime,
         &runtime.thread_id,
         if success || was_cancelled {
             "idle"
@@ -19087,7 +19816,7 @@ async fn supervisor_stop_run(
         notify_ui_work_item_changed(pool, work_item_id, "work_item_cancelling").await;
     }
 
-    if runtime.eq_ignore_ascii_case("codex") {
+    if is_codex_like_runtime(&runtime) {
         let warm_runtime = {
             let runtimes = codex_registry.runtimes.lock().await;
             runtimes.get(&agent_id).cloned()
@@ -19100,7 +19829,7 @@ async fn supervisor_stop_run(
                     Some(run_id),
                     "run",
                     "Stop requested",
-                    "Codex accepted stop request",
+                    &format!("{} accepted stop request", runtime.runtime),
                 )
                 .await?;
                 return Ok(());
@@ -19197,6 +19926,8 @@ pub fn run() {
             fetch_messages,
             forward_task,
             install_supervisor_service,
+            list_runtime_model_catalogs,
+            runtime_model_catalog,
             long_task_approval,
             long_task_approve,
             long_task_create,
@@ -19285,7 +20016,8 @@ mod tests {
     use super::{
         activity_status, adopt_streaming_agent_message_key, agent_accepts_new_work,
         append_streaming_agent_message, append_streaming_agent_message_deferred_completion,
-        append_thread_context, append_ui_refresh_metrics_log, backfill_agent_memory_observations,
+        append_thread_context, append_ui_refresh_metrics_log, auto_long_message_content,
+        auto_long_message_presentation, backfill_agent_memory_observations,
         build_codex_streaming_prompt, build_steer_followup_prompt,
         build_streaming_work_item_prompt, build_work_item_prompt, capped_stream_delta,
         claim_agent_event, claim_next_supervisor_command, classify_agent_output_activity,
@@ -19294,9 +20026,9 @@ mod tests {
         claude_text_delta, cleanup_failed_warm_codex_start, cleanup_stale_starting_agent_runs,
         codex_active_turn_reap_reason, codex_active_turn_schedule_state,
         codex_context_rotate_input_tokens_from_env, codex_error_notification_detail,
-        codex_inbound_message, codex_item_started_activity, codex_memory_read_observation_detail,
-        codex_pending_stream_key, codex_turn_id_from_value, compact_chars_middle,
-        consume_streaming_agent_control_lines,
+        codex_inbound_message, codex_item_started_activity, codex_like_runtime_command,
+        codex_memory_read_observation_detail, codex_pending_stream_key, codex_turn_id_from_value,
+        compact_chars_middle, consume_streaming_agent_control_lines,
         context_tool::{
             agent_context_agent_inspect, agent_context_artifact_read_in_pool,
             agent_context_attachment_info, agent_context_history_read, agent_context_inbox_archive,
@@ -19313,20 +20045,21 @@ mod tests {
         finish_streaming_agent_message, finish_streaming_agent_message_deferred_mentions,
         forward_task_in_pool, handle_agent_event, handle_codex_warm_stdout_line,
         handle_streaming_agent_event_json, inbox_wake_context, insert_agent_message,
-        load_agent_activities, load_channel_agent_roster, load_channels, load_messages,
-        load_reminders, load_runtime_thread_id, load_thread_activities,
+        is_codex_like_runtime, load_agent_activities, load_channel_agent_roster, load_channels,
+        load_messages, load_reminders, load_runtime_thread_id, load_thread_activities,
         load_unread_inbox_wake_batch, mark_all_owner_inbox_read_in_pool,
         mark_inbox_items_read_in_pool, maybe_hide_silent_streaming_reply, memory_observation_layer,
         migrate, normalize_open_link_target, notify_trigger_worker, notify_ui_work_item_changed,
-        open_dm_with_agent_in_pool, parse_activity_metadata, parse_tailscale_ipv4_from_text,
-        prepend_inbox_context, process_due_agent_schedules, process_due_event_hooks,
-        process_due_reminders, process_hook_ingress_in_pool, queue_mentions_as_work_items,
-        reassign_agent_work_in_pool, record_agent_activity, record_codex_memory_read_observation,
-        recover_supervisor_commands_at_startup, sanitize_window_state, send_owner_message_in_pool,
-        set_channel_agent_membership_in_pool, should_append_codex_stream_line_to_run_log,
-        should_keep_ui_refresh_metric_line, silent_reply_reason,
-        spawn_trigger_worker_with_interval, split_complete_streaming_agent_event_lines,
-        split_streaming_agent_event_lines, split_terminal_streaming_agent_event_lines,
+        open_dm_with_agent_in_pool, parse_activity_metadata, parse_runtime_models,
+        parse_tailscale_ipv4_from_text, prepend_inbox_context, process_due_agent_schedules,
+        process_due_event_hooks, process_due_reminders, process_hook_ingress_in_pool,
+        queue_mentions_as_work_items, reassign_agent_work_in_pool, record_agent_activity,
+        record_codex_memory_read_observation, recover_supervisor_commands_at_startup,
+        sanitize_window_state, send_owner_message_in_pool, set_channel_agent_membership_in_pool,
+        should_append_codex_stream_line_to_run_log, should_keep_ui_refresh_metric_line,
+        silent_reply_reason, spawn_trigger_worker_with_interval,
+        split_complete_streaming_agent_event_lines, split_streaming_agent_event_lines,
+        split_terminal_streaming_agent_event_lines, static_runtime_models,
         streaming_message_body_is_empty, supervisor_start_codex_streaming_agent,
         tools::ToolHost,
         trim_ui_refresh_metric_lines_to_size, try_claim_unassigned_task, update_channel_in_pool,
@@ -19652,6 +20385,86 @@ inline `@kunk` and after @longbaby
 "#,
         );
         assert_eq!(mentions, vec!["reviewer"]);
+    }
+
+    #[test]
+    fn parses_json_runtime_model_catalogs() {
+        let models = parse_runtime_models(
+            r#"{"models":[{"slug":"gpt-5.5","display_name":"GPT-5.5","description":"flagship"},{"id":"gpt-5.4-mini","label":"GPT-5.4 Mini"}]}"#,
+        );
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.5");
+        assert_eq!(models[0].label, "GPT-5.5");
+        assert_eq!(models[0].description, "flagship");
+        assert_eq!(models[1].id, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn recognizes_codex_like_runtime_commands() {
+        assert!(is_codex_like_runtime("codex"));
+        assert!(is_codex_like_runtime("Traex"));
+        assert!(!is_codex_like_runtime("claude"));
+        assert_eq!(codex_like_runtime_command("codex"), Some("codex"));
+        assert_eq!(codex_like_runtime_command("traex"), Some("traex"));
+        assert_eq!(codex_like_runtime_command("claude"), None);
+    }
+
+    #[test]
+    fn parses_traex_runtime_model_catalog_labels() {
+        let models = parse_runtime_models(
+            r#"[{"name":"gpt-5.5","real_name":"GPT-5.5 Traex","description":"primary"},{"name":"gpt-5.4","display_name":"GPT-5.4"}]"#,
+        );
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.5");
+        assert_eq!(models[0].label, "GPT-5.5 Traex");
+        assert_eq!(models[0].description, "primary");
+        assert_eq!(models[1].label, "GPT-5.4");
+    }
+
+    #[test]
+    fn extracts_auto_long_message_title_preview_and_stats() {
+        let body = format!(
+            "# Detailed report:\n\nFirst useful paragraph.\n\n| col | value |\n| --- | --- |\n\n```rust\nfn main() {{}}\n```\n\nSecond useful paragraph.\n{}",
+            "More detail.\n".repeat(24)
+        );
+        let presentation = auto_long_message_presentation(&body);
+
+        assert_eq!(presentation.title, "Detailed report");
+        assert!(presentation.preview.contains("First useful paragraph."));
+        assert!(!presentation.preview.contains("| col |"));
+        assert!(!presentation.preview.contains("```"));
+        assert!(presentation
+            .message_body
+            .starts_with("Detailed report\n\nPreview:\n"));
+        assert_eq!(presentation.metadata["source"], "auto_long_message");
+        assert_eq!(presentation.metadata["preview_kind"], "extractive");
+        assert_eq!(presentation.metadata["code_block_count"], 1);
+    }
+
+    #[test]
+    fn static_runtime_model_catalogs_include_new_codex_models() {
+        let codex_models = static_runtime_models("codex");
+        let traex_models = static_runtime_models("traex");
+
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(codex_models.iter().any(|option| option.id == model));
+            assert!(traex_models.iter().any(|option| option.id == model));
+        }
+    }
+
+    #[test]
+    fn parses_text_runtime_model_catalogs() {
+        let models = parse_runtime_models("model\n-gpt-5.5 available\n gpt-5.4-mini\n");
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.5", "gpt-5.4-mini"]
+        );
     }
 
     #[test]
@@ -23103,6 +23916,7 @@ inline `@kunk` and after @longbaby
                 next_request_id: 42,
                 last_activity: Instant::now(),
             }),
+            runtime: "codex".to_owned(),
             thread_id: "test-thread".to_owned(),
             pid: child.id().map(|id| id as i32),
         });
@@ -24714,8 +25528,12 @@ inline `@kunk` and after @longbaby
                 .map_err(|err| err.to_string())?;
             let body: String = row.get("body");
             assert_eq!(row.get::<String, _>("delivery_state"), "streaming");
-            assert!(body.ends_with(STREAMING_TRUNCATION_MARKER));
-            assert!(body.chars().count() <= STREAMING_MESSAGE_BODY_LIMIT);
+            assert!(body.contains("Preview:"));
+            let full_body = auto_long_message_content(&pool, message_id)
+                .await?
+                .ok_or_else(|| "truncated long reply should have an artifact".to_owned())?;
+            assert!(full_body.ends_with(STREAMING_TRUNCATION_MARKER));
+            assert!(full_body.chars().count() <= STREAMING_MESSAGE_BODY_LIMIT);
 
             delete_intermediate_run_messages(&pool, agent_id, channel_id, None, run_id).await?;
 
@@ -24725,6 +25543,13 @@ inline `@kunk` and after @longbaby
                 .await
                 .map_err(|err| err.to_string())?;
             assert_eq!(remaining, 0);
+            let remaining_artifacts: i64 =
+                sqlx::query_scalar("select count(*) from artifacts where message_id = $1")
+                    .bind(message_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(remaining_artifacts, 0);
             Ok(())
         }
         .await;
@@ -24763,6 +25588,7 @@ inline `@kunk` and after @longbaby
                 next_request_id: 42,
                 last_activity: Instant::now(),
             }),
+            runtime: "codex".to_owned(),
             thread_id: "test-thread".to_owned(),
             pid: child.id().map(|id| id as i32),
         });
@@ -25037,6 +25863,7 @@ inline `@kunk` and after @longbaby
                 next_request_id: 42,
                 last_activity: Instant::now(),
             }),
+            runtime: "codex".to_owned(),
             thread_id: "test-thread".to_owned(),
             pid: child.id().map(|id| id as i32),
         });
@@ -25165,6 +25992,7 @@ inline `@kunk` and after @longbaby
                 next_request_id: 42,
                 last_activity: Instant::now(),
             }),
+            runtime: "codex".to_owned(),
             thread_id: "test-thread".to_owned(),
             pid: child.id().map(|id| id as i32),
         });
@@ -25386,6 +26214,127 @@ inline `@kunk` and after @longbaby
         .await;
         drop_test_schema(pool, schema).await;
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_agent_long_message_is_promoted_transactionally() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "long-direct-agent").await?;
+            let target_agent_id = insert_test_agent(&pool, "long-target").await?;
+            let channel_id = insert_test_channel(&pool, "long-direct-channel").await?;
+            sqlx::query(
+                "insert into channel_members (channel_id, agent_id) values ($1, $2)",
+            )
+            .bind(channel_id)
+            .bind(target_agent_id)
+            .execute(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let body = format!(
+                "# Long report\n\n{}\n@long-target please review the complete report.",
+                "Complete report paragraph.\n".repeat(30)
+            );
+
+            let message_id =
+                insert_agent_message(&pool, agent_id, channel_id, None, &body, false).await?;
+            let message_body: String =
+                sqlx::query_scalar("select body from messages where id = $1")
+                    .bind(message_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            let artifact_row =
+                sqlx::query("select content, metadata from artifacts where message_id = $1")
+                    .bind(message_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            let artifact_content: String = artifact_row.get("content");
+            let metadata: Value = artifact_row.get("metadata");
+
+            assert!(message_body.starts_with("Long report\n\nPreview:\n"));
+            assert!(!message_body.contains("Created artifact"));
+            assert_eq!(artifact_content, body);
+            assert_eq!(metadata["source"], "auto_long_message");
+            assert_eq!(metadata["line_count"], body.lines().count());
+            let mention_work_count: i64 = sqlx::query_scalar(
+                "select count(*) from agent_work_items where agent_id = $1 and source_message_id = $2",
+            )
+            .bind(target_agent_id)
+            .bind(message_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            assert_eq!(mention_work_count, 1);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn streaming_long_message_promotes_early_and_keeps_appending_full_content() {
+        let Some((pool, schema)) = test_pool().await else {
+            return;
+        };
+        let result: Result<(), String> = async {
+            let agent_id = insert_test_agent(&pool, "long-stream-agent").await?;
+            let channel_id = insert_test_channel(&pool, "long-stream-channel").await?;
+            let stream_key = format!("{}:long-stream", Uuid::new_v4());
+            let first = format!("# Streaming report\n\n{}", "a".repeat(1_900));
+            let second = "b".repeat(250);
+            let third = "\n\nFinal paragraph after promotion.";
+            let expected = format!("{first}{second}{third}");
+
+            let message_id = append_streaming_agent_message(
+                &pool,
+                agent_id,
+                channel_id,
+                None,
+                &stream_key,
+                &first,
+            )
+            .await?;
+            assert!(auto_long_message_content(&pool, message_id)
+                .await?
+                .is_none());
+            append_streaming_agent_message(&pool, agent_id, channel_id, None, &stream_key, &second)
+                .await?;
+            assert_eq!(
+                auto_long_message_content(&pool, message_id).await?,
+                Some(format!("{first}{second}"))
+            );
+            append_streaming_agent_message(&pool, agent_id, channel_id, None, &stream_key, third)
+                .await?;
+            finish_streaming_agent_message(&pool, &stream_key, "complete").await?;
+
+            assert_eq!(
+                auto_long_message_content(&pool, message_id).await?,
+                Some(expected)
+            );
+            let row = sqlx::query("select body, delivery_state from messages where id = $1")
+                .bind(message_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            assert!(row.get::<String, _>("body").contains("Preview:"));
+            assert_eq!(row.get::<String, _>("delivery_state"), "complete");
+            let artifact_count: i64 =
+                sqlx::query_scalar("select count(*) from artifacts where message_id = $1")
+                    .bind(message_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            assert_eq!(artifact_count, 1);
+            Ok(())
+        }
+        .await;
+        drop_test_schema(pool, schema).await;
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[tokio::test]
@@ -29313,6 +30262,7 @@ inline `@kunk` and after @longbaby
                 &registry,
                 agent_id,
                 Some(work_item_id),
+                "codex".to_owned(),
                 "wired-failed-start-agent".to_owned(),
                 "gpt-5.5".to_owned(),
                 String::new(),
