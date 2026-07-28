@@ -1,4 +1,4 @@
-import { Bookmark, Copy, Link, ListTodo } from "lucide-react";
+import { Bookmark, Copy, Link, ListTodo, Trash2 } from "lucide-react";
 import { useEffect, useRef } from "react";
 
 type MessageActionMenuProps = {
@@ -10,6 +10,7 @@ type MessageActionMenuProps = {
   onCopyMarkdown: () => void;
   onToggleSaved: () => void;
   onToggleTodo: () => void;
+  onDelete: () => void;
   onClose: () => void;
 };
 
@@ -22,6 +23,7 @@ export function MessageActionMenu({
   onCopyMarkdown,
   onToggleSaved,
   onToggleTodo,
+  onDelete,
   onClose,
 }: MessageActionMenuProps) {
   const openedAtRef = useRef(Date.now());
@@ -71,6 +73,10 @@ export function MessageActionMenu({
       <button type="button" onClick={onToggleTodo}>
         <ListTodo size={18} />
         <span>{isTodo ? "Remove todo" : "Add todo"}</span>
+      </button>
+      <button type="button" className="danger" onClick={onDelete}>
+        <Trash2 size={18} />
+        <span>Delete message</span>
       </button>
     </div>
   );

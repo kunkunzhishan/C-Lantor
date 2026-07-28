@@ -117,6 +117,14 @@ pub(crate) struct ThreadActivity {
     pub(crate) unread_count: i32,
     pub(crate) latest_visible_message_id: Option<Uuid>,
     pub(crate) latest_visible_at: Option<DateTime<Utc>>,
+    pub(crate) participants: Vec<ThreadActivityParticipant>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct ThreadActivityParticipant {
+    pub(crate) sender_agent_id: Option<Uuid>,
+    pub(crate) sender_name: String,
+    pub(crate) sender_role: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +244,28 @@ pub(crate) struct AgentSchedule {
     pub(crate) next_run_at: DateTime<Utc>,
     pub(crate) last_run_at: Option<DateTime<Utc>>,
     pub(crate) last_work_item_id: Option<Uuid>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct EventHook {
+    pub(crate) id: Uuid,
+    pub(crate) agent_id: Uuid,
+    pub(crate) agent_handle: String,
+    pub(crate) channel_id: Uuid,
+    pub(crate) channel_name: String,
+    pub(crate) thread_root_id: Option<Uuid>,
+    pub(crate) title: String,
+    pub(crate) body_preview: String,
+    pub(crate) external_resources: Value,
+    pub(crate) ingress_token: Option<String>,
+    pub(crate) scheduled: bool,
+    pub(crate) schedule_cadence: String,
+    pub(crate) next_run_at: Option<DateTime<Utc>>,
+    pub(crate) status: String,
+    pub(crate) fired_count: i64,
+    pub(crate) max_fires: i64,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
@@ -417,6 +447,7 @@ pub(crate) struct CallUtteranceSubmitResult {
 pub(crate) struct CallHistoryPage {
     pub(crate) utterances: Vec<CallUtterance>,
     pub(crate) dispatches: Vec<CallDispatch>,
+    pub(crate) work_items: Vec<AgentWorkItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -462,6 +493,7 @@ pub(crate) struct Bootstrap {
     pub(crate) long_tasks: Vec<LongTask>,
     pub(crate) reminders: Vec<Reminder>,
     pub(crate) agent_schedules: Vec<AgentSchedule>,
+    pub(crate) event_hooks: Vec<EventHook>,
     pub(crate) agent_runs: Vec<AgentRun>,
     pub(crate) agent_work_items: Vec<AgentWorkItem>,
     pub(crate) call_sessions: Vec<CallSession>,

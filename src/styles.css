@@ -2756,6 +2756,15 @@ button,
   color: var(--accent);
 }
 
+.message-action-menu button.danger {
+  color: var(--danger);
+}
+
+.message-action-menu button.danger:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
 .system-message {
   margin: 2px 22px;
   padding: 0;
@@ -9932,12 +9941,27 @@ body.resizing-tool-browser .tool-browser-panel {
   font-size: 13px;
   font-weight: 700;
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .activity-feed-filters button.active {
   border-color: rgba(20, 23, 31, 0.16);
   background: #eef0f4;
   color: #20242b;
+}
+
+.activity-feed-filters button span {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(20, 23, 31, 0.08);
+  color: #4b5563;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
 }
 
 .saved-tabs {

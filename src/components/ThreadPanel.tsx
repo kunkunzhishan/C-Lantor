@@ -117,6 +117,7 @@ type ThreadPanelProps = {
   focusedMessageId: string | null;
   onToggleMessageSaved: (message: Message, saved: boolean) => void;
   onToggleMessageTodo: (message: Message, todo: boolean) => void;
+  onDeleteMessage: (message: Message) => void | Promise<void>;
   onLocateRoot: (message: Message) => void;
   onResizeStart: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 };
@@ -163,6 +164,7 @@ export function ThreadPanel({
   focusedMessageId,
   onToggleMessageSaved,
   onToggleMessageTodo,
+  onDeleteMessage,
   onLocateRoot,
   onResizeStart,
 }: ThreadPanelProps) {
@@ -563,6 +565,11 @@ export function ThreadPanel({
   async function copyMessageLink(message: Message) {
     await copyText(messageShareLink(message, shareBaseUrl));
     setMessageMenu(null);
+  }
+
+  async function deleteSelectedMessage(message: Message) {
+    setMessageMenu(null);
+    await onDeleteMessage(message);
   }
 
   const activeTaskAssignee = activeTask
@@ -1164,6 +1171,7 @@ export function ThreadPanel({
                 onToggleMessageTodo(messageMenu.message, !todoMessageIds.has(messageMenu.message.id));
                 setMessageMenu(null);
               }}
+              onDelete={() => deleteSelectedMessage(messageMenu.message)}
               onClose={() => setMessageMenu(null)}
             />
           )}

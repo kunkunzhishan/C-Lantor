@@ -8,9 +8,9 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
-    http::{header, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderName, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive},
@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 use tokio::{
     net::TcpListener,
+    sync::Notify,
     time::{sleep, Duration},
 };
 use tower_http::{
@@ -50,28 +51,31 @@ use crate::tts::{self, TtsSynthesisRequest};
 use crate::voice::{self, VoiceTranscriptionError, VoiceTranscriptionRequest};
 use crate::{
     add_agent_to_channel, agent_workspace_list_in_pool, agent_workspace_read_file_in_pool,
-    append_ui_refresh_metrics_log, cancel_agent_work_in_pool, check_runtime_in_env,
-    claim_task_in_pool, complete_reminder_in_pool, complete_todo_item_in_pool,
-    create_agent_in_pool, create_channel_in_pool, create_todo_item_in_pool, delete_agent_in_pool,
-    delete_channel_in_pool, delete_todo_item_in_pool, dismiss_inbox_items_in_pool,
+    append_ui_refresh_metrics_log, cancel_agent_work_in_pool, cancel_reminder_in_pool,
+    check_runtime_in_env, claim_task_in_pool, complete_reminder_in_pool,
+    complete_todo_item_in_pool, create_agent_in_pool, create_channel_in_pool,
+    create_todo_item_in_pool, delete_agent_in_pool, delete_channel_in_pool,
+    delete_event_hook_in_pool, delete_todo_item_in_pool, dismiss_inbox_items_in_pool,
     fetch_messages_in_pool, forward_task_in_pool, load_artifact, load_bootstrap,
     load_ui_backend_event_payload, mark_all_owner_inbox_read_in_pool, mark_channel_read_in_pool,
     mark_inbox_items_read_in_pool, notify_ui_refresh, open_dm_with_agent_in_pool,
-    reassign_agent_work_in_pool, retry_agent_work_in_pool, send_owner_message_in_pool,
-    set_channel_agent_membership_in_pool, set_message_saved_in_pool, set_message_todo_in_pool,
-    start_agent_in_pool, to_string, update_agent_in_pool, update_channel_in_pool,
-    update_owner_profile_in_pool, update_task_status_in_pool, update_task_title_in_pool,
-    FetchMessagesRequest,
+    process_hook_ingress_in_pool, reassign_agent_work_in_pool, retry_agent_work_in_pool,
+    send_owner_message_in_pool, set_channel_agent_membership_in_pool, set_message_saved_in_pool,
+    set_message_todo_in_pool, start_agent_in_pool, to_string, update_agent_in_pool,
+    update_agent_schedule_status_in_pool, update_channel_in_pool, update_owner_profile_in_pool,
+    update_task_status_in_pool, update_task_title_in_pool, FetchMessagesRequest,
 };
 
 const WEB_SEND_MESSAGE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 const WEB_TRANSCRIBE_VOICE_AUDIO_BODY_LIMIT: usize = 128 * 1024 * 1024;
+const WEB_HOOK_INGRESS_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 struct WebState {
     pool: SqlitePool,
     db_url: String,
     web_token: Option<String>,
+    trigger_notifier: Arc<Notify>,
 }
 
 #[derive(Serialize)]
@@ -137,6 +141,19 @@ struct SetChannelAgentMembershipRequest {
 #[serde(rename_all = "camelCase")]
 struct ReminderIdRequest {
     reminder_id: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleStatusRequest {
+    schedule_id: Uuid,
+    status: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HookIdRequest {
+    hook_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -398,7 +415,11 @@ pub(crate) fn resolve_web_bind() -> Option<String> {
     }
 }
 
-pub(crate) fn spawn_web_server_if_configured(pool: SqlitePool, db_url: String) {
+pub(crate) fn spawn_web_server_if_configured(
+    pool: SqlitePool,
+    db_url: String,
+    trigger_notifier: Arc<Notify>,
+) {
     let Some(bind) = resolve_web_bind() else {
         return;
     };
@@ -413,6 +434,7 @@ pub(crate) fn spawn_web_server_if_configured(pool: SqlitePool, db_url: String) {
             pool,
             db_url,
             web_token: web_token(),
+            trigger_notifier,
         });
         let app = web_router(state, dist_dir);
         match TcpListener::bind(addr).await {
@@ -502,6 +524,12 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
         .route("/api/mark_all_inbox_read", post(api_mark_all_inbox_read))
         .route("/api/mark_channel_read", post(api_mark_channel_read))
         .route("/api/complete_reminder", post(api_complete_reminder))
+        .route("/api/cancel_reminder", post(api_cancel_reminder))
+        .route(
+            "/api/update_agent_schedule_status",
+            post(api_update_agent_schedule_status),
+        )
+        .route("/api/delete_event_hook", post(api_delete_event_hook))
         .route("/api/update_task_status", post(api_update_task_status))
         .route("/api/update_task_title", post(api_update_task_title))
         .route("/api/claim_task", post(api_claim_task))
@@ -538,6 +566,10 @@ fn web_router(state: Arc<WebState>, dist_dir: PathBuf) -> Router {
             state.clone(),
             require_web_auth,
         ))
+        .route(
+            "/api/hooks/{ingress_token}/ingress",
+            post(api_hook_ingress).layer(DefaultBodyLimit::max(WEB_HOOK_INGRESS_BODY_LIMIT)),
+        )
         .with_state(state);
 
     let router = if index.is_file() {
@@ -2599,6 +2631,109 @@ async fn api_record_ui_refresh_metric(
         .map_err(api_error)
 }
 
+fn hook_ingress_response(mut result: Value) -> Response {
+    let Some(response) = result
+        .get_mut("response")
+        .map(Value::take)
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return Json(result).into_response();
+    };
+    let status = response
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    if let Some(headers) = response.get("headers").and_then(Value::as_object) {
+        for (name, value) in headers {
+            let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            let Ok(header_value) = HeaderValue::from_str(value) else {
+                continue;
+            };
+            builder = builder.header(header_name, header_value);
+        }
+    }
+    let body = response.get("body").cloned().unwrap_or(Value::Null);
+    let has_content_type = response
+        .get("headers")
+        .and_then(Value::as_object)
+        .is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-type"))
+        });
+    let body_bytes = match body {
+        Value::Null => Vec::new(),
+        Value::String(value) => value.into_bytes(),
+        other => {
+            if !has_content_type {
+                builder = builder.header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+            }
+            serde_json::to_vec(&other).unwrap_or_default()
+        }
+    };
+    builder
+        .body(Body::from(body_bytes))
+        .unwrap_or_else(|err| api_error(err.to_string()))
+}
+
+async fn api_hook_ingress(
+    State(state): State<Arc<WebState>>,
+    AxumPath(ingress_token): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    request: Request<Body>,
+) -> Result<Response, Response> {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let headers = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let body_bytes = to_bytes(request.into_body(), WEB_HOOK_INGRESS_BODY_LIMIT)
+        .await
+        .map_err(|err| api_error(err.to_string()))?;
+    let raw_body = String::from_utf8_lossy(&body_bytes).to_string();
+    let body = if body_bytes.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice::<Value>(&body_bytes).unwrap_or_else(|_| {
+            json!({
+                "text": String::from_utf8_lossy(&body_bytes).to_string()
+            })
+        })
+    };
+    let result = process_hook_ingress_in_pool(
+        &state.pool,
+        &ingress_token,
+        &method,
+        &path,
+        json!(query),
+        json!(headers),
+        body,
+        Some(raw_body),
+    )
+    .await
+    .map_err(api_error)?;
+    state.trigger_notifier.notify_one();
+    Ok(hook_ingress_response(result))
+}
+
 async fn api_send_message(
     State(state): State<Arc<WebState>>,
     Json(request): Json<SendMessageRequest>,
@@ -2972,6 +3107,41 @@ async fn api_complete_reminder(
         .await
         .map(|_| Json(json!({ "ok": true })))
         .map_err(api_error)
+}
+
+async fn api_cancel_reminder(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ReminderIdRequest>,
+) -> Result<impl IntoResponse, Response> {
+    cancel_reminder_in_pool(&state.pool, request.reminder_id)
+        .await
+        .map(|_| Json(json!({ "ok": true })))
+        .map_err(api_error)
+}
+
+async fn api_update_agent_schedule_status(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ScheduleStatusRequest>,
+) -> Result<impl IntoResponse, Response> {
+    let should_notify_trigger_worker = request.status.trim() == "active";
+    update_agent_schedule_status_in_pool(&state.pool, request.schedule_id, request.status)
+        .await
+        .map_err(api_error)?;
+    if should_notify_trigger_worker {
+        crate::notify_trigger_worker(&state.trigger_notifier);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn api_delete_event_hook(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<HookIdRequest>,
+) -> Result<impl IntoResponse, Response> {
+    let result = delete_event_hook_in_pool(&state.pool, None, request.hook_id)
+        .await
+        .map_err(api_error)?;
+    let _ = notify_ui_refresh(&state.pool, "event_hook_deleted").await;
+    Ok(Json(json!({ "ok": true, "result": result })))
 }
 
 async fn api_update_task_status(

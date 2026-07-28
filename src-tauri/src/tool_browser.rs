@@ -214,7 +214,7 @@ pub(crate) async fn set_embedded_tool_browser_bounds(
 #[tauri::command]
 pub(crate) async fn close_embedded_tool_browser(app: AppHandle) -> Result<(), String> {
     if let Some(webview) = app.get_webview(EMBEDDED_TOOL_BROWSER_LABEL) {
-        let _ = webview.hide();
+        webview.close().map_err(to_tool_browser_error)?;
     }
     Ok(())
 }

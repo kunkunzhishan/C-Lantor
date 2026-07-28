@@ -44,7 +44,7 @@ import { apiInvoke } from "../apiClient";
 import { callModeStatusText } from "../callModeTimeline";
 import { buildCallTurns } from "../callModeTurns";
 import { buildCallWorkBoardItems, callWorkBoardStatusLabel } from "../callModeWorkBoard";
-import { Agent, AgentActivity, AgentRun, AgentWorkItem, Artifact, CallDispatch, CallSession, CallUtterance, CallUtteranceSubmitResult, Channel, DraftAttachment, LongTaskListItem, Message, OwnerProfile, TASK_STATUSES, Task, ThreadReplySummary } from "../types";
+import { Agent, AgentActivity, AgentRun, AgentWorkItem, Artifact, CallDispatch, CallSession, CallUtterance, CallUtteranceSubmitResult, Channel, DraftAttachment, LongTaskListItem, Message, OwnerProfile, TASK_STATUSES, Task, ThreadParticipant, ThreadReplySummary } from "../types";
 import { agentForMessageSender, deletedAgentForMessageSender, displayNameForSender, formatClockTime, formatDateDivider, formatTime, isSameCalendarDay, ownerAsAvatarAgent, visibleAgentDescription, visibleChannelDescription } from "../ui-utils";
 import { ActivityProgressDock, activeProgressByAgent } from "./ActivityProgressDock";
 import { AgentAvatar, AgentAvatarWithProfile } from "./AgentAvatar";
@@ -114,6 +114,7 @@ type ConversationProps = {
   focusedMessageId: string | null;
   onToggleMessageSaved: (message: Message, saved: boolean) => void;
   onToggleMessageTodo: (message: Message, todo: boolean) => void;
+  onDeleteMessage: (message: Message) => void | Promise<void>;
 };
 
 type MessageMenuState = {
@@ -417,6 +418,7 @@ export function Conversation({
   focusedMessageId,
   onToggleMessageSaved,
   onToggleMessageTodo,
+  onDeleteMessage,
 }: ConversationProps) {
   const [sendAsTask, setSendAsTask] = useState(false);
   const [isComposerDragOver, setIsComposerDragOver] = useState(false);
@@ -790,10 +792,22 @@ export function Conversation({
     focusComposer();
   }
 
-  function renderReplyParticipantAvatar(message: Message) {
-    const agent = agentForMessageSender(message, agents);
+  function renderReplyParticipantAvatar(message: ThreadParticipant) {
+    const agent = message.sender_role === "owner" || message.sender_role === "system" || !message.sender_agent_id
+      ? null
+      : agents.find((candidate) => candidate.id === message.sender_agent_id) ?? null;
     if (agent) return <AgentAvatar agent={agent} size="sm" title={`@${agent.handle}`} showStatus={false} />;
-    const deletedAgent = deletedAgentForMessageSender(message);
+    const deletedAgent = message.sender_role === "owner" || message.sender_role === "system" || message.sender_agent_id
+      ? null
+      : {
+          id: `deleted-agent:${message.sender_role}:${message.sender_name}`,
+          handle: message.sender_name.replace(/^@/, "").trim() || "deleted-agent",
+          display_name: message.sender_name || "Deleted agent",
+          role: "Deleted agent",
+          status: "deleted",
+          avatar: "",
+          description: "This agent has been deleted.",
+        };
     if (deletedAgent) return <AgentAvatar agent={deletedAgent} size="sm" title={`@${deletedAgent.handle} has been deleted`} showStatus={false} />;
     if (message.sender_role === "owner") {
       return <AgentAvatar agent={ownerAsAvatarAgent(ownerProfile)} size="sm" showStatus={false} />;
@@ -874,6 +888,11 @@ export function Conversation({
   async function copyMessageLink(message: Message) {
     await copyText(messageShareLink(message, shareBaseUrl));
     setMessageMenu(null);
+  }
+
+  async function deleteSelectedMessage(message: Message) {
+    setMessageMenu(null);
+    await onDeleteMessage(message);
   }
 
   function toggleChannelMessageExpanded(messageId: string) {
@@ -1461,6 +1480,7 @@ export function Conversation({
                 onToggleMessageTodo(messageMenu.message, !todoMessageIds.has(messageMenu.message.id));
                 setMessageMenu(null);
               }}
+              onDelete={() => deleteSelectedMessage(messageMenu.message)}
               onClose={() => setMessageMenu(null)}
             />
           )}

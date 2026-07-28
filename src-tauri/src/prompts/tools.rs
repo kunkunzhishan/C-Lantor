@@ -43,6 +43,8 @@ LANTOR_EVENT {"type":"profile_update","display_name":"<optional>","role":"<optio
 LANTOR_EVENT {"type":"owner_profile_update","display_name":"<optional>","avatar":"<optional emoji, initials, URL, or dicebear:style[:seed]>","description":"<optional>"}
 LANTOR_EVENT {"type":"reminder_create","when":"<ISO8601 timestamp>","title":"<title>","note":"<optional note>","recurrence":"none|daily|weekly|every:20m"}
 LANTOR_EVENT {"type":"reminder_cancel","reminder_id":"<uuid>"}
+LANTOR_EVENT {"type":"hook_create","title":"<title>","code_body":"return request?.body?.ready === true;","hook_context":{},"external_resources":[{"kind":"github_webhook","id":"<provider id>","url":"<provider console url>","cleanup":"delete provider webhook when deleting this Lantor hook"}],"fixture_request":{"method":"POST","headers":{},"query":{},"body":{"ready":true}},"ingress_enabled":true,"scheduled":false,"schedule_cadence":"every:5m","next_run_at":"<ISO8601 optional>"}
+LANTOR_EVENT {"type":"hook_delete","hook_id":"<uuid>"}
 LANTOR_EVENT {"type":"task_create","channel_id":"<channel uuid>","title":"<short task title>","body":"<root task message>","thread_body":"<first execution update in the task thread>","assign_self":true,"status":"in_progress"}
 LANTOR_EVENT {"type":"task_status","task_number":1,"status":"in_review"}
 LANTOR_EVENT {"type":"task_claim","task_number":1}

@@ -50,8 +50,10 @@ const CALL_SESSION_MODE_WAKE_WORD: &str = "wake_word";
 const DEFAULT_CALL_WAKE_WORDS: &[&str] = &["兰托", "蓝托", "lantor"];
 const CALL_SYSTEM_CHANNEL_NAME: &str = "voice-console";
 const CALL_BOOTSTRAP_SESSION_LIMIT: i64 = 20;
-const CALL_BOOTSTRAP_UTTERANCE_LIMIT: i64 = 600;
+const CALL_BOOTSTRAP_UTTERANCE_LIMIT: i64 = 160;
 const CALL_BOOTSTRAP_DISPATCH_LIMIT: i64 = 160;
+const CALL_BOOTSTRAP_VISIBLE_UTTERANCE_LIMIT: i64 = 120;
+const CALL_BOOTSTRAP_VISIBLE_DISPATCH_LIMIT: i64 = 160;
 const DEFAULT_FETCH_CALL_HISTORY_LIMIT: i64 = 160;
 const MAX_FETCH_CALL_HISTORY_LIMIT: i64 = 300;
 #[derive(Clone, Copy)]
@@ -346,7 +348,10 @@ pub(crate) async fn migrate_call_mode_schema(pool: &SqlitePool) -> Result<(), sq
         "create index if not exists call_sessions_channel_idx on call_sessions(channel_id, started_at desc)",
         "create index if not exists call_utterances_session_sequence_idx on call_utterances(session_id, sequence)",
         "create index if not exists call_utterances_thread_root_idx on call_utterances(session_id, thread_root_utterance_id, sequence)",
+        "create index if not exists call_utterances_created_idx on call_utterances(created_at desc, sequence desc)",
         "create index if not exists call_dispatches_session_created_idx on call_dispatches(session_id, created_at)",
+        "create index if not exists call_dispatches_created_idx on call_dispatches(created_at desc, id desc)",
+        "create index if not exists call_dispatches_utterance_idx on call_dispatches(utterance_id)",
         "create index if not exists call_dispatches_work_item_idx on call_dispatches(work_item_id) where work_item_id is not null",
         "create index if not exists agent_work_items_call_session_idx on agent_work_items(call_session_id, created_at desc) where call_session_id is not null",
     ] {
@@ -474,14 +479,27 @@ pub(crate) async fn load_call_utterances(pool: &SqlitePool) -> CommandResult<Vec
             audio_duration_ms, status, created_at, updated_at
         from (
             select *
-            from call_utterances
-            order by created_at desc, sequence desc
-            limit $1
+            from (
+                select *
+                from call_utterances
+                order by created_at desc, sequence desc
+                limit $1
+            )
+            union
+            select *
+            from (
+                select *
+                from call_utterances
+                where status <> 'ignored'
+                order by created_at desc, sequence desc
+                limit $2
+            )
         ) recent
         order by created_at asc, sequence asc
         "#,
     )
     .bind(CALL_BOOTSTRAP_UTTERANCE_LIMIT)
+    .bind(CALL_BOOTSTRAP_VISIBLE_UTTERANCE_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(to_string)?;
@@ -498,16 +516,31 @@ pub(crate) async fn load_call_dispatches(pool: &SqlitePool) -> CommandResult<Vec
             d.ack_text, d.speech_topic, d.confidence, d.target_agent_id, d.work_item_id,
             d.compensated_work_item_id, d.long_task_id, d.status, d.error, d.created_at, d.updated_at
         from (
-            select *
-            from call_dispatches
-            order by created_at desc, id desc
-            limit $1
-        ) d
+            select id
+            from (
+                select id, created_at
+                from call_dispatches
+                order by created_at desc, id desc
+                limit $1
+            )
+            union
+            select id
+            from (
+                select d.id, d.created_at
+                from call_dispatches d
+                join call_utterances u on u.id = d.utterance_id
+                where u.status <> 'ignored'
+                order by d.created_at desc, d.id desc
+                limit $2
+            )
+        ) selected
+        join call_dispatches d on d.id = selected.id
         join call_utterances u on u.id = d.utterance_id
         order by d.created_at asc, d.id asc
         "#,
     )
     .bind(CALL_BOOTSTRAP_DISPATCH_LIMIT)
+    .bind(CALL_BOOTSTRAP_VISIBLE_DISPATCH_LIMIT)
     .fetch_all(pool)
     .await
     .map_err(to_string)?;
@@ -554,6 +587,7 @@ pub(crate) async fn fetch_call_history_page(
         return Ok(CallHistoryPage {
             utterances,
             dispatches: Vec::new(),
+            work_items: Vec::new(),
         });
     }
 
@@ -587,6 +621,7 @@ pub(crate) async fn fetch_call_history_page(
             .into_iter()
             .map(call_dispatch_from_row)
             .collect(),
+        work_items: Vec::new(),
     })
 }
 
@@ -7731,7 +7766,7 @@ print(json.dumps({"tool":"dispatch_agent_work","target_agent_handle":"Ada","say"
     }
 
     #[tokio::test]
-    async fn bootstrap_loaders_keep_all_call_rows_in_chronological_order() {
+    async fn bootstrap_loaders_keep_recent_call_rows_in_chronological_order() {
         let pool = test_pool().await;
         let session = call_session_start_in_pool(&pool, None, None, Some("Long call".to_owned()))
             .await
@@ -7786,13 +7821,13 @@ print(json.dumps({"tool":"dispatch_agent_work","target_agent_handle":"Ada","say"
         let utterances = load_call_utterances(&pool).await.unwrap();
         let dispatches = load_call_dispatches(&pool).await.unwrap();
 
-        assert_eq!(utterances.len(), 405);
-        assert_eq!(utterances.first().unwrap().sequence, 1);
+        assert_eq!(utterances.len(), 160);
+        assert_eq!(utterances.first().unwrap().sequence, 246);
         assert_eq!(utterances.last().unwrap().sequence, 405);
-        assert_eq!(utterances.first().unwrap().transcript, "utterance 1");
+        assert_eq!(utterances.first().unwrap().transcript, "utterance 246");
         assert_eq!(utterances.last().unwrap().transcript, "utterance 405");
 
-        assert_eq!(dispatches.len(), CALL_BOOTSTRAP_DISPATCH_LIMIT as usize);
+        assert_eq!(dispatches.len(), 160);
         assert_eq!(dispatches.first().unwrap().ack_text, "ack 246");
         assert_eq!(dispatches.last().unwrap().ack_text, "ack 405");
 

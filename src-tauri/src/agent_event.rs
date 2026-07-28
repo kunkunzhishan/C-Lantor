@@ -76,6 +76,28 @@ pub(crate) enum AgentEvent {
     ReminderCancel {
         reminder_id: Uuid,
     },
+    HookCreate {
+        channel: Option<String>,
+        channel_id: Option<Uuid>,
+        thread_root_id: Option<Uuid>,
+        title: String,
+        body_preview: Option<String>,
+        code_language: Option<String>,
+        code_body: String,
+        hook_context: Option<Value>,
+        external_resources: Option<Value>,
+        fixture_request: Option<Value>,
+        ingress_enabled: Option<bool>,
+        scheduled: Option<bool>,
+        schedule_cadence: Option<String>,
+        next_run_at: Option<String>,
+        timeout_ms: Option<i64>,
+        max_output_bytes: Option<i64>,
+        max_fires: Option<i64>,
+    },
+    HookDelete {
+        hook_id: Uuid,
+    },
     Usage {
         #[serde(default)]
         input_tokens: Option<i64>,

@@ -88,7 +88,7 @@ export type Message = {
 export type ThreadReplySummary = {
   count: number;
   latest: Message | null;
-  participants: Message[];
+  participants: ThreadParticipant[];
 };
 
 export type ThreadActivity = {
@@ -97,7 +97,10 @@ export type ThreadActivity = {
   unread_count: number;
   latest_visible_message_id: string | null;
   latest_visible_at: string | null;
+  participants: ThreadParticipant[];
 };
+
+export type ThreadParticipant = Pick<Message, "sender_agent_id" | "sender_name" | "sender_role">;
 
 export type SavedMessage = {
   id: string;
@@ -210,6 +213,27 @@ export type AgentSchedule = {
   next_run_at: string;
   last_run_at: string | null;
   last_work_item_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type EventHook = {
+  id: string;
+  agent_id: string;
+  agent_handle: string;
+  channel_id: string;
+  channel_name: string;
+  thread_root_id: string | null;
+  title: string;
+  body_preview: string;
+  external_resources: unknown[];
+  ingress_token: string | null;
+  scheduled: boolean;
+  schedule_cadence: string;
+  next_run_at: string | null;
+  status: string;
+  fired_count: number;
+  max_fires: number;
   created_at: string;
   updated_at: string;
 };
@@ -335,6 +359,7 @@ export type CallUtteranceSubmitResult = {
 export type CallHistoryPage = {
   utterances: CallUtterance[];
   dispatches: CallDispatch[];
+  work_items: AgentWorkItem[];
 };
 
 export type AgentActivity = {
@@ -390,6 +415,7 @@ export type Bootstrap = {
   long_tasks: LongTask[];
   reminders: Reminder[];
   agent_schedules: AgentSchedule[];
+  event_hooks: EventHook[];
   agent_runs: AgentRun[];
   agent_work_items: AgentWorkItem[];
   call_sessions: CallSession[];
@@ -483,7 +509,16 @@ export type SearchResult = {
   senderRole?: string | null;
 };
 
-export type ActivityFeedKind = "mention" | "dm" | "thread" | "task" | "reminder" | "channel";
+export type ActivityFeedKind =
+  | "mention"
+  | "dm"
+  | "thread"
+  | "task"
+  | "reminder"
+  | "channel"
+  | "schedule"
+  | "hook"
+  | "activity";
 
 export type ActivityFeedItem = {
   id: string;
@@ -502,6 +537,8 @@ export type ActivityFeedItem = {
   messageId: string | null;
   taskId: string | null;
   reminderId: string | null;
+  scheduleId: string | null;
+  hookId: string | null;
   replyCount: number;
   newCount: number;
 };

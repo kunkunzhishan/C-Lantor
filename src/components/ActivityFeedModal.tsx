@@ -1,4 +1,4 @@
-import { ArrowUp, Bell, Check, Hash, Inbox, MessageSquare, UserRound, X } from "lucide-react";
+import { ArrowUp, Bell, CalendarClock, Check, Hash, Inbox, MessageSquare, Radio, UserRound, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent } from "react";
 import type { Agent, ActivityFeedItem, ActivityFeedKind, OwnerProfile } from "../types";
@@ -23,11 +23,12 @@ type ActivityFeedModalProps = {
 const FILTERS: { value: ActivityFeedFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "unread", label: "Unread" },
-  { value: "mention", label: "Mentions" },
+  { value: "channel", label: "Channels" },
   { value: "dm", label: "DMs" },
   { value: "thread", label: "Threads" },
   { value: "task", label: "Tasks" },
   { value: "reminder", label: "Reminders" },
+  { value: "hook", label: "Hooks" },
 ];
 
 const SWIPE_DISMISS_THRESHOLD_PX = 86;
@@ -36,6 +37,8 @@ const ACTIVITY_FEED_INITIAL_VISIBLE = 30;
 const ACTIVITY_FEED_LOAD_MORE_STEP = 30;
 
 function iconFor(kind: ActivityFeedKind) {
+  if (kind === "hook") return Radio;
+  if (kind === "schedule") return CalendarClock;
   if (kind === "reminder") return Bell;
   if (kind === "dm") return UserRound;
   if (kind === "thread" || kind === "mention") return MessageSquare;
@@ -43,7 +46,16 @@ function iconFor(kind: ActivityFeedKind) {
 }
 
 function kindLabel(kind: ActivityFeedKind) {
+  if (kind === "schedule") return "routine";
+  if (kind === "hook") return "hook";
   return kind === "dm" ? "DM" : kind;
+}
+
+function dismissActionLabel(item: ActivityFeedItem) {
+  if (item.kind === "reminder" || item.kind === "schedule" || item.kind === "hook") {
+    return "Delete";
+  }
+  return "Dismiss";
 }
 
 function actorAvatarAgent(item: ActivityFeedItem, agents: Agent[], ownerProfile: OwnerProfile) {
@@ -61,6 +73,13 @@ function sortActivityFeedItems(items: ActivityFeedItem[]) {
     if (left.unread !== right.unread) return left.unread ? -1 : 1;
     return activityTimestampValue(right) - activityTimestampValue(left);
   });
+}
+
+function itemCountForFilter(items: ActivityFeedItem[], filter: ActivityFeedFilter) {
+  if (filter === "all") return items.length;
+  if (filter === "unread") return items.filter((item) => item.unread).length;
+  if (filter === "reminder") return items.filter((item) => item.kind === "reminder" || item.kind === "schedule").length;
+  return items.filter((item) => item.kind === filter).length;
 }
 
 export function ActivityFeedModal({
@@ -99,8 +118,13 @@ export function ActivityFeedModal({
   const filteredItems = useMemo(() => {
     if (filter === "all") return displayItems;
     if (filter === "unread") return displayItems.filter((item) => item.unread);
+    if (filter === "reminder") return displayItems.filter((item) => item.kind === "reminder" || item.kind === "schedule");
     return displayItems.filter((item) => item.kind === filter);
   }, [displayItems, filter]);
+  const visibleFilters = useMemo(() => {
+    return FILTERS
+      .map((item) => ({ ...item, count: itemCountForFilter(displayItems, item.value) }));
+  }, [displayItems]);
   const filteredUnreadCount = filteredItems.filter((item) => item.unread).length;
   const visibleItems = useMemo(
     () => filteredItems.slice(0, visibleCount),
@@ -125,6 +149,9 @@ export function ActivityFeedModal({
   useEffect(() => {
     if (!open) return;
     setDisplayItems((current) => {
+      if (current.length === 0) {
+        return sortActivityFeedItems(items);
+      }
       const latestById = new Map(items.map((item) => [item.id, item]));
       let changed = false;
       const next: ActivityFeedItem[] = [];
@@ -246,13 +273,14 @@ export function ActivityFeedModal({
         </header>
 
         <div className="activity-feed-filters">
-          {FILTERS.map((item) => (
+          {visibleFilters.map((item) => (
             <button
               key={item.value}
               className={filter === item.value ? "active" : ""}
               onClick={() => setFilter(item.value)}
             >
               {item.label}
+              <span>{item.count}</span>
             </button>
           ))}
         </div>
@@ -273,13 +301,14 @@ export function ActivityFeedModal({
             <div className="search-empty">
               <Inbox size={34} />
               <h3>No activity</h3>
-              <p>Mentions, DMs, followed thread updates, active tasks, and due reminders will appear here.</p>
+              <p>DMs, followed thread updates, active tasks, reminders, routines, and hooks will appear here.</p>
             </div>
           )}
 
           {visibleItems.map((item) => {
             const Icon = iconFor(item.kind);
             const avatarAgent = actorAvatarAgent(item, agents, ownerProfile);
+            const dismissLabel = dismissActionLabel(item);
             const swipeOffset = swipeState?.itemId === item.id ? swipeState.offsetX : 0;
             const excerpt = item.excerpt.trim() === item.title.trim() ? "" : item.excerpt;
             const rowClassName = [
@@ -299,7 +328,7 @@ export function ActivityFeedModal({
               >
                 <div className="activity-feed-swipe-action" aria-hidden="true">
                   <X size={18} />
-                  <span>Dismiss</span>
+                  <span>{dismissLabel}</span>
                 </div>
                 <article
                   className={rowClassName}
@@ -342,7 +371,7 @@ export function ActivityFeedModal({
                     ) : null}
                     <button
                       className="activity-feed-dismiss"
-                      title="Dismiss"
+                      title={dismissLabel}
                       onClick={(event) => {
                         event.stopPropagation();
                         onDismissItem(item);

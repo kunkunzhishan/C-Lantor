@@ -19,10 +19,8 @@ import {
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   CALL_TTS_VOICES,
-  CALL_TTS_DEFAULT_GAP_MS,
   CALL_VOICE_LANGUAGES,
   normalizeCallTtsSettings,
-  synthesizeCallTtsAudio,
   voicesForCallTtsProvider,
   type CallTtsProviderId,
   type CallTtsSettings,
@@ -43,6 +41,7 @@ import {
   type VoiceConsoleMode,
   type VoiceWakeSettings,
 } from "../voiceConsoleSettings";
+import { normalizeVoiceSpeechText, useVoiceSpeechOutbox } from "../voiceSpeechOutbox";
 import { AgentAvatar } from "./AgentAvatar";
 import { MessageMarkdown } from "./MessageMarkdown";
 
@@ -59,18 +58,6 @@ type CallConsoleProps = {
   loadOlderCallHistory: () => Promise<number>;
   openMobileSidebar: () => void;
   onOpenWorkItem: (item: AgentWorkItem) => void;
-};
-
-const CALL_SPEECH_CHUNK_CHARS = 160;
-
-type CallSpeechPolicy = "queue" | "barge-in" | "barge-in-resume";
-
-type QueuedCallSpeech = {
-  id: number;
-  speechId: number;
-  text: string;
-  audioUrl: string | null;
-  provider: CallTtsProviderId;
 };
 
 type PendingCallAckSpeech = {
@@ -101,16 +88,6 @@ const SILENT_CALL_DISPATCH_STATUSES = new Set(["queued", "dispatching", "superse
 
 function callConsoleModeLabel(mode: string | null | undefined) {
   return mode === "wake_word" ? "Wake Word" : "Call";
-}
-
-function cancelBrowserCallSpeech() {
-  if (
-    typeof window !== "undefined"
-    && "speechSynthesis" in window
-    && window.speechSynthesis
-  ) {
-    window.speechSynthesis.cancel();
-  }
 }
 
 function formatCallDuration(ms: number) {
@@ -183,32 +160,6 @@ function callWorkerReplySpeechKey(workItem: AgentWorkItem) {
   return workItem.id;
 }
 
-function normalizeCallSpeechText(text: string) {
-  return text.replace(/\s+/g, " ").trim();
-}
-
-function callSpeechChunks(text: string) {
-  const chunks: string[] = [];
-  let rest = text.trim();
-  while (rest.length > CALL_SPEECH_CHUNK_CHARS) {
-    const windowText = rest.slice(0, CALL_SPEECH_CHUNK_CHARS);
-    const breakIndex = Math.max(
-      windowText.lastIndexOf("。"),
-      windowText.lastIndexOf("！"),
-      windowText.lastIndexOf("？"),
-      windowText.lastIndexOf(". "),
-      windowText.lastIndexOf("; "),
-      windowText.lastIndexOf(", "),
-      windowText.lastIndexOf("，"),
-    );
-    const splitAt = breakIndex >= 48 ? breakIndex + 1 : CALL_SPEECH_CHUNK_CHARS;
-    chunks.push(rest.slice(0, splitAt).trim());
-    rest = rest.slice(splitAt).trim();
-  }
-  if (rest) chunks.push(rest);
-  return chunks;
-}
-
 function isNoSpeechTranscriptionText(value: string | null | undefined) {
   const lower = (value ?? "").toLowerCase();
   return lower.includes("no speech")
@@ -236,7 +187,7 @@ function callAckSpeechText(result: CallUtteranceSubmitResult) {
   const ackText = result.ack_text || result.dispatch.ack_text || result.dispatch.status_text;
   if (!ackText) return null;
   if (isRoutineTranscriptionDiagnostic(ackText)) return null;
-  return normalizeCallSpeechText(ackText);
+  return normalizeVoiceSpeechText(ackText);
 }
 
 function isWakeOnlyAckResult(result: CallUtteranceSubmitResult) {
@@ -245,7 +196,7 @@ function isWakeOnlyAckResult(result: CallUtteranceSubmitResult) {
     && result.dispatch.intent === "ack_only"
     && result.dispatch.status === "acknowledged"
     && result.work_item_id === null
-    && normalizeCallSpeechText(result.dispatch.ack_text).length > 0;
+    && normalizeVoiceSpeechText(result.dispatch.ack_text).length > 0;
 }
 
 function callDispatchSpeechText(dispatch: CallDispatch) {
@@ -256,7 +207,7 @@ function callDispatchSpeechText(dispatch: CallDispatch) {
   if (!ackText) return null;
   if (dispatch.intent === "worker_feedback") return null;
   if (isRoutineTranscriptionDiagnostic(ackText)) return null;
-  return normalizeCallSpeechText(ackText);
+  return normalizeVoiceSpeechText(ackText);
 }
 
 function isSpeakableQueuedCallDispatch(dispatch: CallDispatch) {
@@ -531,7 +482,6 @@ export function CallConsole({
     wakeWords: voiceConsoleSettings.wakeWords,
   }), [voiceConsoleSettings.mode, voiceConsoleSettings.wakeWords]);
   const [showCallSettings, setShowCallSettings] = useState(false);
-  const [callTtsStatus, setCallTtsStatus] = useState("");
   const [finalCallSpeechDrainSessionId, setFinalCallSpeechDrainSessionId] = useState<string | null>(null);
   const finalCallSpeechDrainSessionIdRef = useRef<string | null>(null);
   const callMessageListRef = useRef<HTMLDivElement | null>(null);
@@ -573,22 +523,6 @@ export function CallConsole({
   const queuedCallAckKeysRef = useRef<Set<string>>(new Set());
   const pendingCallAckSpeechBySequenceRef = useRef<Map<number, PendingCallAckSpeech>>(new Map());
   const spokenCallWorkerMessageIdsRef = useRef<Set<string> | null>(null);
-  const callSpeechQueueRef = useRef<QueuedCallSpeech[]>([]);
-  const callSpeechReadyByJobIdRef = useRef<Map<number, QueuedCallSpeech>>(new Map());
-  const callSpeechNextReadyJobIdRef = useRef(1);
-  const callSpeechCurrentRef = useRef<QueuedCallSpeech | null>(null);
-  const callSpeechSpeakingRef = useRef(false);
-  const callSpeechDuckingRef = useRef(false);
-  const callSpeechBlockedRef = useRef(false);
-  const callSpeechUtteranceIdRef = useRef(0);
-  const callSpeechAudioRef = useRef<HTMLAudioElement | null>(null);
-  const callSpeechAudioUrlRef = useRef<string | null>(null);
-  const callSpeechGapTimerRef = useRef<number | null>(null);
-  const callSpeechJobIdRef = useRef(0);
-  const callSpeechMessageIdRef = useRef(0);
-  const callSpeechGenerationRef = useRef(0);
-  const callTtsSettingsRef = useRef(callTtsSettings);
-  callTtsSettingsRef.current = callTtsSettings;
   const canPlayCallSpeech = callMode.isLive || (
     callMode.session?.id != null
     && (
@@ -596,15 +530,12 @@ export function CallConsole({
       || finalCallSpeechDrainSessionIdRef.current === callMode.session.id
     )
   );
-  callSpeechDuckingRef.current = callMode.isLive && callRecorder.isListening && !callRecorder.isMuted;
-  callSpeechBlockedRef.current = callMode.isLive && !isCallWakeWordMode && callRecorder.isVoiceActive && !callRecorder.isMuted;
 
   const setCallTtsSettings = (next: CallTtsSettings) => {
     const normalized = normalizeVoiceConsoleSettings({
       ...voiceConsoleSettings,
       tts: normalizeCallTtsSettings(next),
     });
-    callTtsSettingsRef.current = normalized.tts;
     setVoiceConsoleSettingsState(normalized);
     saveVoiceConsoleSettings(normalized);
   };
@@ -618,322 +549,22 @@ export function CallConsole({
     saveVoiceConsoleSettings(normalized);
   };
 
-  const setCallSpeechQueue = (queue: QueuedCallSpeech[]) => {
-    callSpeechQueueRef.current = queue;
-  };
-
-  function clearCallSpeechGapTimer() {
-    if (callSpeechGapTimerRef.current === null || typeof window === "undefined") return;
-    window.clearTimeout(callSpeechGapTimerRef.current);
-    callSpeechGapTimerRef.current = null;
-  }
-
-  function stopCurrentCallAudio(revokeUrl = true) {
-    if (!callSpeechAudioRef.current) return;
-    callSpeechAudioRef.current.onended = null;
-    callSpeechAudioRef.current.onerror = null;
-    callSpeechAudioRef.current.pause();
-    callSpeechAudioRef.current.src = "";
-    callSpeechAudioRef.current = null;
-    if (revokeUrl && callSpeechAudioUrlRef.current) {
-      URL.revokeObjectURL(callSpeechAudioUrlRef.current);
-    }
-    callSpeechAudioUrlRef.current = null;
-  }
-
-  function releaseQueuedCallSpeech(queue: QueuedCallSpeech[]) {
-    for (const item of queue) {
-      if (item.audioUrl) URL.revokeObjectURL(item.audioUrl);
-    }
-  }
-
-  function releasePendingCallSpeech() {
-    releaseQueuedCallSpeech(Array.from(callSpeechReadyByJobIdRef.current.values()));
-    callSpeechReadyByJobIdRef.current.clear();
-    callSpeechNextReadyJobIdRef.current = callSpeechJobIdRef.current + 1;
-  }
-
-  function stopCallSpeech(options: { preserveFinalDrain?: boolean } = {}) {
-    clearCallSpeechGapTimer();
-    releaseQueuedCallSpeech(callSpeechQueueRef.current);
-    releasePendingCallSpeech();
-    setCallSpeechQueue([]);
-    callSpeechSpeakingRef.current = false;
-    callSpeechUtteranceIdRef.current += 1;
-    callSpeechGenerationRef.current += 1;
-    setIsCallAssistantSpeaking(false);
-    stopCurrentCallAudio();
-    callSpeechCurrentRef.current = null;
-    cancelBrowserCallSpeech();
-    if (!options.preserveFinalDrain) {
+  const {
+    status: callTtsStatus,
+    speak: speakVoiceText,
+    stop: stopVoiceSpeech,
+  } = useVoiceSpeechOutbox({
+    settings: callTtsSettings,
+    enabled: canPlayCallSpeech,
+    isLive: callMode.isLive,
+    ducking: callMode.isLive && callRecorder.isListening && !callRecorder.isMuted,
+    blocked: callMode.isLive && !isCallWakeWordMode && callRecorder.isVoiceActive && !callRecorder.isMuted,
+    onDrainComplete: () => {
       finalCallSpeechDrainSessionIdRef.current = null;
       setFinalCallSpeechDrainSessionId(null);
-    }
-  }
-
-  function finishCurrentCallSpeech() {
-    stopCurrentCallAudio();
-    callSpeechCurrentRef.current = null;
-    callSpeechSpeakingRef.current = false;
-    setIsCallAssistantSpeaking(false);
-    if (callSpeechQueueRef.current.length === 0) {
-      if (!callMode.isLive) {
-        finalCallSpeechDrainSessionIdRef.current = null;
-        setFinalCallSpeechDrainSessionId(null);
-      }
-      return;
-    }
-    const gapMs = CALL_TTS_DEFAULT_GAP_MS;
-    if (gapMs <= 0 || typeof window === "undefined") {
-      playNextCallSpeech();
-      return;
-    }
-    clearCallSpeechGapTimer();
-    callSpeechGapTimerRef.current = window.setTimeout(() => {
-      callSpeechGapTimerRef.current = null;
-      playNextCallSpeech();
-    }, gapMs);
-  }
-
-  function playNextCallSpeech() {
-    clearCallSpeechGapTimer();
-    if (callSpeechSpeakingRef.current) return;
-    if (callSpeechBlockedRef.current) return;
-    const next = callSpeechQueueRef.current.shift();
-    if (!next) {
-      if (!callMode.isLive) {
-        finalCallSpeechDrainSessionIdRef.current = null;
-        setFinalCallSpeechDrainSessionId(null);
-      }
-      return;
-    }
-    callSpeechCurrentRef.current = next;
-    callSpeechUtteranceIdRef.current += 1;
-    const utteranceId = callSpeechUtteranceIdRef.current;
-    if (next.audioUrl && typeof Audio !== "undefined") {
-      const audio = new Audio(next.audioUrl);
-      callSpeechAudioRef.current = audio;
-      callSpeechAudioUrlRef.current = next.audioUrl;
-      audio.volume = callSpeechDuckingRef.current ? 0.78 : 1;
-      audio.onended = () => {
-        if (utteranceId === callSpeechUtteranceIdRef.current) finishCurrentCallSpeech();
-      };
-      audio.onerror = () => {
-        if (utteranceId === callSpeechUtteranceIdRef.current) finishCurrentCallSpeech();
-      };
-      callSpeechSpeakingRef.current = true;
-      setIsCallAssistantSpeaking(true);
-      cancelBrowserCallSpeech();
-      void audio.play().catch(() => {
-        if (utteranceId === callSpeechUtteranceIdRef.current) finishCurrentCallSpeech();
-      });
-      return;
-    }
-
-    if (
-      typeof window === "undefined"
-      || !("speechSynthesis" in window)
-      || typeof SpeechSynthesisUtterance === "undefined"
-    ) {
-      return;
-    }
-    const utterance = new SpeechSynthesisUtterance(next.text);
-    utterance.lang = callTtsSettingsRef.current.language;
-    utterance.volume = callSpeechDuckingRef.current ? 0.78 : 1;
-    utterance.rate = callTtsSettingsRef.current.rate;
-    utterance.onend = () => {
-      if (utteranceId === callSpeechUtteranceIdRef.current) finishCurrentCallSpeech();
-    };
-    utterance.onerror = () => {
-      if (utteranceId === callSpeechUtteranceIdRef.current) finishCurrentCallSpeech();
-    };
-    callSpeechSpeakingRef.current = true;
-    setIsCallAssistantSpeaking(true);
-    stopCurrentCallAudio();
-    cancelBrowserCallSpeech();
-    window.speechSynthesis.speak(utterance);
-  }
-
-  function interruptCurrentCallSpeechForVoice(options: { requeueCurrent?: boolean } = {}) {
-    const requeueCurrent = options.requeueCurrent ?? true;
-    const current = callSpeechCurrentRef.current;
-    callSpeechCurrentRef.current = null;
-    callSpeechSpeakingRef.current = false;
-    callSpeechUtteranceIdRef.current += 1;
-    setIsCallAssistantSpeaking(false);
-    if (current && requeueCurrent) {
-      setCallSpeechQueue([current, ...callSpeechQueueRef.current]);
-    }
-    stopCurrentCallAudio(false);
-    cancelBrowserCallSpeech();
-    return current;
-  }
-
-  function queueCallSpeechAtFront(text: string, resumeQueue: QueuedCallSpeech[]) {
-    const trimmed = normalizeCallSpeechText(text);
-    const settings = callTtsSettingsRef.current;
-    const chunks = callSpeechChunks(trimmed);
-    if (
-      chunks.length === 0
-      || typeof window === "undefined"
-      || (settings.provider === "browser" && (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined"))
-    ) {
-      setCallSpeechQueue([...resumeQueue, ...callSpeechQueueRef.current]);
-      playNextCallSpeech();
-      return false;
-    }
-    const speechId = ++callSpeechMessageIdRef.current;
-    if (settings.provider === "browser") {
-      const wakeSpeech = chunks.map((chunk) => ({
-        id: ++callSpeechJobIdRef.current,
-        speechId,
-        text: chunk,
-        audioUrl: null,
-        provider: "browser" as const,
-      }));
-      setCallSpeechQueue([...wakeSpeech, ...resumeQueue, ...callSpeechQueueRef.current]);
-      playNextCallSpeech();
-      return true;
-    }
-    const generation = callSpeechGenerationRef.current;
-    const jobs = chunks.map((chunk) => {
-      const id = ++callSpeechJobIdRef.current;
-      return synthesizeCallTtsAudio(chunk, settings)
-        .then((audio) => ({
-          id,
-          speechId,
-          text: chunk,
-          audioUrl: audio.url,
-          provider: settings.provider,
-        }))
-        .catch((err) => {
-          if (generation !== callSpeechGenerationRef.current) return null;
-          setCallTtsStatus(err instanceof Error ? err.message : "TTS provider failed; using browser voice.");
-          return {
-            id,
-            speechId,
-            text: chunk,
-            audioUrl: null,
-            provider: "browser" as const,
-          };
-        });
-    });
-    void Promise.all(jobs).then((wakeSpeech) => {
-      if (generation !== callSpeechGenerationRef.current) {
-        for (const item of wakeSpeech) {
-          if (item?.audioUrl) URL.revokeObjectURL(item.audioUrl);
-        }
-        return;
-      }
-      if (wakeSpeech.every((item) => item?.provider === settings.provider)) setCallTtsStatus("");
-      setCallSpeechQueue([
-        ...wakeSpeech.filter((item): item is QueuedCallSpeech => item !== null),
-        ...resumeQueue,
-        ...callSpeechQueueRef.current,
-      ]);
-      playNextCallSpeech();
-    });
-    return true;
-  }
-
-  function flushReadyCallSpeech() {
-    const ready: QueuedCallSpeech[] = [];
-    while (true) {
-      const next = callSpeechReadyByJobIdRef.current.get(callSpeechNextReadyJobIdRef.current);
-      if (!next) break;
-      callSpeechReadyByJobIdRef.current.delete(callSpeechNextReadyJobIdRef.current);
-      callSpeechNextReadyJobIdRef.current += 1;
-      ready.push(next);
-    }
-    if (ready.length === 0) return;
-    setCallSpeechQueue([...callSpeechQueueRef.current, ...ready]);
-    playNextCallSpeech();
-  }
-
-  function enqueueReadyCallSpeech(item: QueuedCallSpeech) {
-    callSpeechReadyByJobIdRef.current.set(item.id, item);
-    flushReadyCallSpeech();
-  }
-
-  function enqueueCallSpeech(
-    text: string,
-    policy: CallSpeechPolicy = "queue",
-  ) {
-    const trimmed = normalizeCallSpeechText(text);
-    const settings = callTtsSettingsRef.current;
-    const chunks = callSpeechChunks(trimmed);
-    if (
-      chunks.length === 0
-      || typeof window === "undefined"
-      || (settings.provider === "browser" && (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined"))
-    ) {
-      return false;
-    }
-    if (policy === "barge-in-resume") {
-      interruptCurrentCallSpeechForVoice({ requeueCurrent: false });
-      const resumeQueue = callSpeechQueueRef.current;
-      setCallSpeechQueue([]);
-      return queueCallSpeechAtFront(trimmed, resumeQueue);
-    }
-    if (policy === "barge-in") {
-      stopCallSpeech();
-    }
-    const speechId = ++callSpeechMessageIdRef.current;
-    const speechGeneration = callSpeechGenerationRef.current;
-    if (settings.provider === "browser") {
-      for (const chunk of chunks) {
-        enqueueReadyCallSpeech({
-          id: ++callSpeechJobIdRef.current,
-          speechId,
-          text: chunk,
-          audioUrl: null,
-          provider: "browser" as const,
-        });
-      }
-      return true;
-    }
-
-    for (const chunk of chunks) {
-      const id = ++callSpeechJobIdRef.current;
-      void synthesizeCallTtsAudio(chunk, settings)
-        .then((audio) => {
-          if (speechGeneration !== callSpeechGenerationRef.current) {
-            URL.revokeObjectURL(audio.url);
-            return;
-          }
-          setCallTtsStatus("");
-          enqueueReadyCallSpeech({
-            id,
-            speechId,
-            text: chunk,
-            audioUrl: audio.url,
-            provider: settings.provider,
-          });
-        })
-        .catch((err) => {
-          if (speechGeneration !== callSpeechGenerationRef.current) return;
-          setCallTtsStatus(err instanceof Error ? err.message : "TTS provider failed; using browser voice.");
-          enqueueReadyCallSpeech({
-            id,
-            speechId,
-            text: chunk,
-            audioUrl: null,
-            provider: "browser",
-          });
-        });
-    }
-    return true;
-  }
-
-  useEffect(() => {
-    if (!callMode.isLive) return;
-    if (!callSpeechBlockedRef.current) {
-      if (!callSpeechSpeakingRef.current && callSpeechQueueRef.current.length > 0) playNextCallSpeech();
-      return;
-    }
-    if (!callSpeechSpeakingRef.current) return;
-    interruptCurrentCallSpeechForVoice();
-  }, [callMode.isLive, callRecorder.isMuted, callRecorder.isVoiceActive]);
+    },
+    onSpeakingChange: setIsCallAssistantSpeaking,
+  });
 
   function queueCallAckSpeechResult(result: CallUtteranceSubmitResult) {
     if (queuedCallAckKeysRef.current.has(result.dispatch.id)) return;
@@ -943,7 +574,7 @@ export function CallConsole({
       if (text) {
         queuedCallAckKeysRef.current.add(result.dispatch.id);
         lastSpokenCallAckRef.current = result.dispatch.id;
-        enqueueCallSpeech(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
+        speakVoiceText(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
       }
       return;
     }
@@ -951,7 +582,7 @@ export function CallConsole({
       queuedCallAckKeysRef.current.add(result.dispatch.id);
       if (text) {
         lastSpokenCallAckRef.current = result.dispatch.id;
-        enqueueCallSpeech(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
+        speakVoiceText(text, isWakeOnlyAckResult(result) ? "barge-in-resume" : "queue");
       }
       return;
     }
@@ -975,7 +606,7 @@ export function CallConsole({
       if (next.text) {
         lastSpokenCallAckRef.current = next.key;
         const submitResult = callMode.submitResults.find((result) => result.dispatch.id === next.key);
-        enqueueCallSpeech(
+        speakVoiceText(
           next.text,
           submitResult && isWakeOnlyAckResult(submitResult) ? "barge-in-resume" : "queue",
         );
@@ -1059,7 +690,7 @@ export function CallConsole({
     }
     lastSpokenCallAckRef.current = result.dispatch.id;
     queuedCallAckKeysRef.current.add(result.dispatch.id);
-    enqueueCallSpeech(ackText);
+    speakVoiceText(ackText);
   }, [canPlayCallSpeech, callMode.lastResult, callMode.submitResults]);
 
   useEffect(() => {
@@ -1084,7 +715,7 @@ export function CallConsole({
       const ackText = callDispatchSpeechText(dispatch);
       if (!ackText) continue;
       queuedCallAckKeysRef.current.add(dispatch.id);
-      enqueueCallSpeech(ackText, "queue");
+      speakVoiceText(ackText, "queue");
     }
   }, [
     callDispatches,
@@ -1113,23 +744,9 @@ export function CallConsole({
       .filter((reply) => !seenIds.has(reply.speechKey))
       .sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
     for (const reply of unspokenWorkerReplies) {
-      enqueueCallSpeech(reply.body, "queue");
+      speakVoiceText(reply.body, "queue");
     }
   }, [agentWorkItems, canPlayCallSpeech, callMode.session?.id, messages]);
-
-  useEffect(() => () => {
-    clearCallSpeechGapTimer();
-    releaseQueuedCallSpeech(callSpeechQueueRef.current);
-    releasePendingCallSpeech();
-    callSpeechQueueRef.current = [];
-    callSpeechSpeakingRef.current = false;
-    stopCurrentCallAudio();
-    cancelBrowserCallSpeech();
-  }, []);
-
-  useEffect(() => {
-    if (!canPlayCallSpeech) stopCallSpeech();
-  }, [canPlayCallSpeech]);
 
   const callControlsBusy = callMode.isStarting || callMode.isStopping || callRecorder.isStopping;
   const callModeLabel = callConsoleModeLabel(effectiveCallConsoleMode);
@@ -1267,7 +884,7 @@ export function CallConsole({
     const sessionId = callMode.session?.id ?? null;
     finalCallSpeechDrainSessionIdRef.current = sessionId;
     setFinalCallSpeechDrainSessionId(sessionId);
-    stopCallSpeech({ preserveFinalDrain: true });
+    stopVoiceSpeech({ preserveDrain: true });
     await callRecorder.flushAndStop();
     await callMode.stop();
   }

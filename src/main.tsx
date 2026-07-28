@@ -196,15 +196,15 @@ const MAX_SIDEBAR_WIDTH = 460;
 const MIN_CONVERSATION_WIDTH = 480;
 const MOBILE_BREAKPOINT = 760;
 const UI_REFRESH_DEBOUNCE_MS = 80;
-const EPHEMERAL_FLUSH_FALLBACK_MS = 80;
+const EPHEMERAL_FLUSH_BATCH_MS = 180;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const ACTIVITY_FEED_LIMIT_PER_KIND = 120;
 const ACTIVITY_HISTORY_LIMIT_PER_AGENT = 40;
 const RECENT_NON_CALL_WORK_ITEM_LIMIT = 40;
 const RUN_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "stopped", "exited"]);
 const DEFAULT_OWNER_DISPLAY_NAME = "Me";
 const DEFAULT_OWNER_AVATAR = "dicebear:dylan:owner";
 const DEFAULT_OWNER_DESCRIPTION = "local owner";
-const OWNER_MENTION_HANDLES = ["@Theo", "@Dylan"];
 const CHANNEL_THREAD_MEMORY_STORAGE_KEY = "lantor.channelThreadMemory";
 const THREAD_PANEL_WIDTH_STORAGE_KEY = "lantor.threadPanelWidth";
 const AGENT_DRAWER_WIDTH_STORAGE_KEY = "lantor.agentDrawerWidth";
@@ -341,12 +341,21 @@ function limitActivitiesPerAgent(activities: AgentActivity[]) {
 function retainWorkItemsForUi(workItems: AgentWorkItem[]) {
   const sorted = [...workItems]
     .sort((left, right) => timestampMs(right.created_at) - timestampMs(left.created_at));
-  const callWorkItems = sorted.filter((item) => item.call_session_id);
   const recentNonCallWorkItems = sorted
     .filter((item) => !item.call_session_id)
     .slice(0, RECENT_NON_CALL_WORK_ITEM_LIMIT);
-  return [...callWorkItems, ...recentNonCallWorkItems]
+  return [...sorted.filter((item) => item.call_session_id), ...recentNonCallWorkItems]
     .sort((left, right) => timestampMs(right.created_at) - timestampMs(left.created_at));
+}
+
+function limitActivityFeedItemsPerKind(items: ActivityFeedItem[]) {
+  const counts = new Map<ActivityFeedItem["kind"], number>();
+  return items.filter((item) => {
+    const count = counts.get(item.kind) ?? 0;
+    if (count >= ACTIVITY_FEED_LIMIT_PER_KIND) return false;
+    counts.set(item.kind, count + 1);
+    return true;
+  });
 }
 
 function isTextInput(target: EventTarget | null) {
@@ -668,11 +677,6 @@ function percentile(values: number[], ratio: number) {
   return sorted[index];
 }
 
-function messageMentionsOwner(message: Message) {
-  const body = message.body.toLowerCase();
-  return OWNER_MENTION_HANDLES.some((handle) => body.includes(handle.toLowerCase()));
-}
-
 function budgetMicrosFromForm(value: string) {
   const parsed = Number.parseFloat(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return 0;
@@ -884,7 +888,6 @@ function App() {
   const ephemeralActivityBufferRef = useRef<Map<string, EphemeralActivityBufferItem>>(new Map());
   const ephemeralRunBufferRef = useRef<Map<string, EphemeralRunBufferItem>>(new Map());
   const ephemeralFlushScheduledRef = useRef(false);
-  const ephemeralFlushRafRef = useRef<number | null>(null);
   const ephemeralFlushTimerRef = useRef<number | null>(null);
   const appHistoryReadyRef = useRef(false);
   const appHistoryIndexRef = useRef(0);
@@ -1246,6 +1249,13 @@ function App() {
       .sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime());
   }
 
+  function mergeAgentWorkItems(current: AgentWorkItem[], incoming: AgentWorkItem[]) {
+    if (incoming.length === 0) return current;
+    const byId = new Map(current.map((item) => [item.id, item]));
+    for (const item of incoming) byId.set(item.id, item);
+    return retainWorkItemsForUi(Array.from(byId.values()));
+  }
+
   async function fetchCallHistoryOnce(key: string, before: string) {
     if (callHistoryLoadKeysRef.current.has(key) || callHistoryLoadInFlightRef.current.has(key)) return 0;
     callHistoryLoadInFlightRef.current.add(key);
@@ -1255,10 +1265,11 @@ function App() {
         limit: CALL_HISTORY_PAGE_SIZE,
       });
       callHistoryLoadKeysRef.current.add(key);
-      if (page.utterances.length === 0 && page.dispatches.length === 0) return 0;
+      if (page.utterances.length === 0 && page.dispatches.length === 0 && (page.work_items ?? []).length === 0) return 0;
       setData((current) => current
         ? {
             ...current,
+            agent_work_items: mergeAgentWorkItems(current.agent_work_items ?? [], page.work_items ?? []),
             call_utterances: mergeCallUtterances(current.call_utterances ?? [], page.utterances),
             call_dispatches: mergeCallDispatches(current.call_dispatches ?? [], page.dispatches),
           }
@@ -1345,10 +1356,6 @@ function App() {
   }
 
   function cancelEphemeralFlushTimers() {
-    if (ephemeralFlushRafRef.current !== null) {
-      window.cancelAnimationFrame(ephemeralFlushRafRef.current);
-      ephemeralFlushRafRef.current = null;
-    }
     if (ephemeralFlushTimerRef.current !== null) {
       window.clearTimeout(ephemeralFlushTimerRef.current);
       ephemeralFlushTimerRef.current = null;
@@ -1418,13 +1425,9 @@ function App() {
   function scheduleEphemeralFlush() {
     if (ephemeralFlushScheduledRef.current) return;
     ephemeralFlushScheduledRef.current = true;
-    ephemeralFlushRafRef.current = window.requestAnimationFrame(() => {
-      ephemeralFlushRafRef.current = null;
-      flushEphemeralBuffer();
-    });
     ephemeralFlushTimerRef.current = window.setTimeout(() => {
       flushEphemeralBuffer();
-    }, EPHEMERAL_FLUSH_FALLBACK_MS);
+    }, EPHEMERAL_FLUSH_BATCH_MS);
   }
 
   function bufferActivityEphemeral(activity: AgentActivity, reason: string) {
@@ -2525,7 +2528,7 @@ function App() {
     // Bootstrap thread activity is a fallback; live message upserts/deltas are authoritative.
     for (const activity of data?.thread_activities ?? []) {
       if (summaries[activity.thread_root_id]) continue;
-      const current: ThreadReplySummary = { count: activity.reply_count, latest: null, participants: [] };
+      const current: ThreadReplySummary = { count: activity.reply_count, latest: null, participants: activity.participants ?? [] };
       const latest = activity.latest_visible_message_id
         ? visibleMessageById.get(activity.latest_visible_message_id) ?? null
         : null;
@@ -2587,24 +2590,22 @@ function App() {
     };
     const timestamp = (value: string | null | undefined) => value || new Date(0).toISOString();
     const items: ActivityFeedItem[] = [];
-    const threadRootIdsForActivityFeed = new Set(allThreadRootMessages.map((message) => message.id));
 
     for (const channel of data.channels) {
       const unread = channel.unread_count > 0 || channelAlertIds.has(channel.id);
-      if (!unread) continue;
       const latest = latestByChannel.get(channel.id);
-      if (latest?.thread_root_id && threadRootIdsForActivityFeed.has(latest.thread_root_id)) continue;
+      if (!latest && !unread) continue;
       const dmAgent = channel.kind === "dm" && channel.dm_agent_id ? agentsById.get(channel.dm_agent_id) : null;
       items.push({
         id: `${channel.kind}:${channel.id}`,
         dismissId: `${channel.kind}:${channel.id}`,
         kind: channel.kind === "dm" ? "dm" : "channel",
-        title: channel.kind === "dm" ? `DM with @${dmAgent?.handle ?? "agent"}` : `New activity in #${channel.name}`,
+        title: channel.kind === "dm" ? `DM with @${dmAgent?.handle ?? "agent"}` : `#${channel.name}`,
         excerpt: latest?.body ?? visibleChannelDescription(channel.description),
         surface: channel.kind === "dm" ? "Direct message" : `#${channel.name}`,
         actor: latest ? displayNameForSender(latest, data.owner_profile) : "",
         timestamp: timestamp(latest?.created_at),
-        unread: true,
+        unread,
         actorAgentId: latest?.sender_agent_id ?? dmAgent?.id ?? null,
         actorRole: latest?.sender_role ?? (channel.kind === "dm" ? "agent" : null),
         channelId: channel.id,
@@ -2612,6 +2613,8 @@ function App() {
         messageId: latest?.id ?? null,
         taskId: null,
         reminderId: null,
+        scheduleId: null,
+        hookId: null,
         replyCount: latest?.thread_root_id ? (threadReplyCounts[latest.thread_root_id] ?? 0) : 0,
         newCount: channel.unread_count,
       });
@@ -2642,40 +2645,14 @@ function App() {
         messageId: currentMessage.id,
         taskId: null,
         reminderId: null,
+        scheduleId: null,
+        hookId: null,
         replyCount: threadReplyCounts[root.id] ?? 0,
         newCount: unreadCount,
       });
     }
 
-    visibleMessages
-      .filter((message) => message.sender_role !== "owner" && messageMentionsOwner(message))
-      .sort((left, right) => timestampMs(right.created_at) - timestampMs(left.created_at))
-      .forEach((message) => {
-        const rootId = message.thread_root_id ?? message.id;
-        items.push({
-          id: `mention:${message.id}`,
-          dismissId: `mention:${message.id}`,
-          kind: "mention",
-          title: firstLines(message.body, 1),
-          excerpt: message.body,
-          surface: channelLabel(message.channel_id),
-          actor: message.sender_name,
-          timestamp: message.created_at,
-          unread: channelAlertIds.has(message.channel_id) || (message.thread_root_id ? (threadUnreadCounts[message.thread_root_id] ?? 0) > 0 : false),
-          actorAgentId: message.sender_agent_id,
-          actorRole: message.sender_role,
-          channelId: message.channel_id,
-          threadId: rootId,
-          messageId: message.id,
-          taskId: null,
-          reminderId: null,
-          replyCount: threadReplyCounts[rootId] ?? 0,
-          newCount: message.thread_root_id ? (threadUnreadCounts[message.thread_root_id] ?? 0) : 0,
-        });
-      });
-
     data.tasks
-      .filter((task) => task.status !== "done")
       .forEach((task) => {
         items.push({
           id: `task:${task.id}`,
@@ -2692,14 +2669,16 @@ function App() {
           messageId: task.message_id,
           taskId: task.id,
           reminderId: null,
+          scheduleId: null,
+          hookId: null,
           replyCount: threadReplyCounts[task.message_id] ?? 0,
           newCount: 0,
         });
       });
 
     data.reminders
-      .filter((reminder) => reminder.status === "fired")
       .forEach((reminder) => {
+        const due = reminder.status === "fired";
         items.push({
           id: `reminder:${reminder.id}`,
           dismissId: `reminder:${reminder.id}`,
@@ -2707,16 +2686,70 @@ function App() {
           title: reminder.title,
           excerpt: reminder.note,
           surface: reminder.channel_id ? channelLabel(reminder.channel_id) : "Reminder",
-          actor: "Reminder due",
+          actor: due ? "Reminder due" : reminder.recurrence === "none" ? "Reminder scheduled" : `Reminder ${reminder.recurrence}`,
           timestamp: reminder.fired_at ?? reminder.due_at,
-          unread: true,
+          unread: due,
           channelId: reminder.channel_id,
           threadId: reminder.thread_root_id,
           messageId: reminder.message_id,
           taskId: null,
           reminderId: reminder.id,
+          scheduleId: null,
+          hookId: null,
           replyCount: reminder.thread_root_id ? (threadReplyCounts[reminder.thread_root_id] ?? 0) : 0,
           newCount: 1,
+        });
+      });
+
+    data.agent_schedules
+      .forEach((schedule) => {
+        items.push({
+          id: `schedule:${schedule.id}`,
+          dismissId: `schedule:${schedule.id}`,
+          kind: "schedule",
+          title: schedule.title,
+          excerpt: schedule.prompt,
+          surface: channelLabel(schedule.channel_id),
+          actor: `@${schedule.agent_handle}`,
+          timestamp: schedule.last_run_at ?? schedule.next_run_at,
+          unread: false,
+          actorAgentId: schedule.agent_id,
+          actorRole: "agent",
+          channelId: schedule.channel_id,
+          threadId: schedule.thread_root_id,
+          messageId: null,
+          taskId: null,
+          reminderId: null,
+          scheduleId: schedule.id,
+          hookId: null,
+          replyCount: schedule.thread_root_id ? (threadReplyCounts[schedule.thread_root_id] ?? 0) : 0,
+          newCount: 0,
+        });
+      });
+
+    data.event_hooks
+      .forEach((hook) => {
+        items.push({
+          id: `hook:${hook.id}`,
+          dismissId: `hook:${hook.id}`,
+          kind: "hook",
+          title: hook.title,
+          excerpt: hook.body_preview || "Public hook endpoint",
+          surface: channelLabel(hook.channel_id),
+          actor: `@${hook.agent_handle}`,
+          timestamp: hook.updated_at || hook.created_at,
+          unread: false,
+          actorAgentId: hook.agent_id,
+          actorRole: "agent",
+          channelId: hook.channel_id,
+          threadId: hook.thread_root_id,
+          messageId: null,
+          taskId: null,
+          reminderId: null,
+          scheduleId: null,
+          hookId: hook.id,
+          replyCount: hook.thread_root_id ? (threadReplyCounts[hook.thread_root_id] ?? 0) : 0,
+          newCount: 0,
         });
       });
 
@@ -2724,7 +2757,7 @@ function App() {
   }, [allThreadRootMessages, channelAlertIds, data, threadReplyCounts, threadReplySummaries, threadUnreadCounts, visibleMessages]);
 
   const activityFeedItems = useMemo(() => {
-    return allActivityFeedItems
+    const sortedItems = allActivityFeedItems
       .filter((item) => {
         const dismissedAt = dismissedActivityFeedItems[item.dismissId];
         if (!dismissedAt) return true;
@@ -2740,8 +2773,8 @@ function App() {
       .sort((left, right) => {
         if (left.unread !== right.unread) return left.unread ? -1 : 1;
         return timestampMs(right.timestamp) - timestampMs(left.timestamp);
-      })
-      .slice(0, 120);
+      });
+    return limitActivityFeedItemsPerKind(sortedItems);
   }, [allActivityFeedItems, dismissedActivityFeedItems, readActivityFeedItems]);
 
   const activityFeedUnreadCount = useMemo(() => {
@@ -4096,7 +4129,7 @@ function App() {
     }
     const targetThreadId = item.threadId ?? item.messageId;
     if (item.channelId) selectChannel(item.channelId);
-    setSelectedAgentId(null);
+    setSelectedAgentId(["activity", "schedule", "hook"].includes(item.kind) ? item.actorAgentId ?? null : null);
     setActiveTab("chat");
     if (targetThreadId) {
       revealThread(targetThreadId, item.channelId ?? activeChannelId);
@@ -4138,6 +4171,33 @@ function App() {
   }
 
   async function dismissActivityFeedItem(item: ActivityFeedItem) {
+    if (item.kind === "reminder" && item.reminderId) {
+      setDismissedActivityFeedItems((current) => ({
+        ...current,
+        [item.dismissId]: activityFeedItemCutoff(item),
+      }));
+      await apiInvoke("cancel_reminder", { reminderId: item.reminderId });
+      await refresh({ reason: "mutation:activity_feed_reminder_cancel", source: "mutation" });
+      return;
+    }
+    if (item.kind === "schedule" && item.scheduleId) {
+      setDismissedActivityFeedItems((current) => ({
+        ...current,
+        [item.dismissId]: activityFeedItemCutoff(item),
+      }));
+      await apiInvoke("update_agent_schedule_status", { scheduleId: item.scheduleId, status: "cancelled" });
+      await refresh({ reason: "mutation:activity_feed_schedule_cancel", source: "mutation" });
+      return;
+    }
+    if (item.kind === "hook" && item.hookId) {
+      setDismissedActivityFeedItems((current) => ({
+        ...current,
+        [item.dismissId]: activityFeedItemCutoff(item),
+      }));
+      await apiInvoke("delete_event_hook", { hookId: item.hookId });
+      await refresh({ reason: "mutation:activity_feed_hook_delete", source: "mutation" });
+      return;
+    }
     const dismissedUntil = activityFeedItemCutoff(item);
     setDismissedActivityFeedItems((current) => ({ ...current, [item.dismissId]: dismissedUntil }));
     await persistDismissedActivityFeedItems([item], dismissedUntil);
@@ -4365,6 +4425,35 @@ function App() {
 
   async function setMessageSaved(message: Message, saved: boolean) {
     await mutate("set_message_saved", { messageId: message.id, saved });
+  }
+
+  function deleteMessage(message: Message) {
+    const replyCount = data?.messages.filter((item) => item.thread_root_id === message.id).length ?? 0;
+    const body = replyCount > 0
+      ? `This will delete this message and ${replyCount} thread ${replyCount === 1 ? "reply" : "replies"}. This cannot be undone.`
+      : "This will delete this message. This cannot be undone.";
+    setConfirmRequest({
+      title: "Delete message?",
+      body,
+      confirmLabel: "Delete message",
+      onConfirm: async () => {
+        const deletedMessageIds = new Set([
+          message.id,
+          ...(data?.messages
+            .filter((item) => item.thread_root_id === message.id)
+            .map((item) => item.id) ?? []),
+        ]);
+        setData((current) => current ? {
+          ...current,
+          messages: current.messages.filter((item) => !deletedMessageIds.has(item.id)),
+        } : current);
+        await mutate("delete_message", { messageId: message.id });
+        if (activeThreadId === message.id) {
+          setShowThread(false);
+          setActiveThreadId(null);
+        }
+      },
+    });
   }
 
   async function setMessageTodo(message: Message, todo: boolean) {
@@ -4765,6 +4854,7 @@ function App() {
           focusedMessageId={focusedMessageId}
           onToggleMessageSaved={setMessageSaved}
           onToggleMessageTodo={setMessageTodo}
+          onDeleteMessage={deleteMessage}
         />
       </div>
 
@@ -4835,6 +4925,7 @@ function App() {
           focusedMessageId={focusedMessageId}
           onToggleMessageSaved={setMessageSaved}
           onToggleMessageTodo={setMessageTodo}
+          onDeleteMessage={deleteMessage}
           onLocateRoot={locateThreadRoot}
           onResizeStart={startThreadResize}
         />
