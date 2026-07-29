@@ -5,8 +5,10 @@ import {
   AgentForm,
   CODEX_SERVICE_TIERS,
   RuntimeCheck,
+  RuntimeModelCatalog,
+  isCodexLikeRuntime,
   modelLabel,
-  modelOptionsForRuntime,
+  modelOptionsFromCatalog,
   normalizedReasoningEffortForRuntime,
   reasoningEffortsForRuntime,
 } from "../types";
@@ -20,6 +22,7 @@ type AgentFormModalProps = {
   title: string;
   form: AgentForm;
   runtimeChecks: Record<string, RuntimeCheck>;
+  runtimeModelCatalogs?: RuntimeModelCatalog[] | null;
   submitLabel: string;
   createMode?: boolean;
   showNotes?: boolean;
@@ -58,6 +61,7 @@ export function AgentFormModal({
   title,
   form,
   runtimeChecks,
+  runtimeModelCatalogs,
   submitLabel,
   createMode = false,
   showNotes = false,
@@ -67,8 +71,8 @@ export function AgentFormModal({
   onSubmit,
 }: AgentFormModalProps) {
   const nameInputRef = useRef<HTMLInputElement | null>(null);
-  const isCodex = form.runtime === "codex";
-  const supportsReasoningEffort = form.runtime === "codex" || form.runtime === "claude";
+  const isCodexLike = isCodexLikeRuntime(form.runtime);
+  const supportsReasoningEffort = isCodexLike || form.runtime === "claude";
   const reasoningEfforts = reasoningEffortsForRuntime(form.runtime);
   const previewHandle = (form.handle || form.displayName || "agent").trim().replace(/^@/, "") || "agent";
   const previewName = form.displayName.trim() || form.handle.trim().replace(/^@/, "") || "New agent";
@@ -91,6 +95,7 @@ export function AgentFormModal({
       <div className="agent-select-control">
         <select value={form.runtime} onChange={(event) => onRuntimeChange(event.target.value)}>
           <option value="codex">Codex</option>
+          <option value="traex">Traex</option>
           <option value="claude">Claude</option>
         </select>
         <ChevronDown size={16} aria-hidden="true" />
@@ -105,8 +110,8 @@ export function AgentFormModal({
           value={form.model}
           onChange={(event) => onChange({ ...form, model: event.target.value })}
         >
-          {modelOptionsForRuntime(form.runtime, form.model).map((model) => (
-            <option key={model} value={model}>{modelLabel(model)}</option>
+          {modelOptionsFromCatalog(form.runtime, form.model, runtimeModelCatalogs).map((model) => (
+            <option key={model} value={model}>{modelLabel(model, runtimeModelCatalogs, form.runtime)}</option>
           ))}
         </select>
         <ChevronDown size={16} aria-hidden="true" />
@@ -129,7 +134,7 @@ export function AgentFormModal({
       </div>
     </label>
   );
-  const codexControls = isCodex && (
+  const codexControls = isCodexLike && (
     <>
       {reasoningEffortControl}
       <label className="agent-select-field">
@@ -153,7 +158,7 @@ export function AgentFormModal({
       <AgentAvatar agent={previewAgent} size="lg" showStatus={false} />
       <div>
         <strong>{previewName}</strong>
-        <span>{modelLabel(form.model)}</span>
+        <span>{modelLabel(form.model, runtimeModelCatalogs, form.runtime)}</span>
       </div>
       <button
         type="button"
@@ -202,9 +207,9 @@ export function AgentFormModal({
               </label>
               {runtimeSelect}
             </div>
-            <div className={isCodex ? "three-col" : "two-col"}>
+            <div className={isCodexLike ? "three-col" : "two-col"}>
               {modelSelect}
-              {isCodex ? codexControls : reasoningEffortControl}
+              {isCodexLike ? codexControls : reasoningEffortControl}
             </div>
             <RuntimePreflight check={runtimeChecks[form.runtime]} />
             <details className="agent-advanced-settings">
@@ -243,8 +248,8 @@ export function AgentFormModal({
               {runtimeSelect}
               {modelSelect}
             </div>
-            {isCodex && <div className="two-col">{codexControls}</div>}
-            {!isCodex && supportsReasoningEffort && <div className="two-col">{reasoningEffortControl}</div>}
+            {isCodexLike && <div className="two-col">{codexControls}</div>}
+            {!isCodexLike && supportsReasoningEffort && <div className="two-col">{reasoningEffortControl}</div>}
             <RuntimePreflight check={runtimeChecks[form.runtime]} />
             {showNotes && (
               <label>

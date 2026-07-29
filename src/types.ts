@@ -397,6 +397,23 @@ export type RuntimeCheck = {
   detail: string;
 };
 
+export type RuntimeModelOption = {
+  id: string;
+  label: string;
+  description: string;
+};
+
+export type RuntimeModelCatalog = {
+  runtime: string;
+  command: string;
+  default_model: string;
+  models: RuntimeModelOption[];
+  source: "runtime" | "static" | string;
+  error: string | null;
+  fetched_at: string;
+  expires_at: string;
+};
+
 export type Bootstrap = {
   db_url: string;
   web_base_url: string | null;
@@ -582,7 +599,13 @@ export const RUNTIME_PRESETS: Record<string, { label: string; defaultModel: stri
     label: "Codex",
     defaultModel: "gpt-5.5",
     commandName: "codex",
-    models: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
+    models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
+  },
+  traex: {
+    label: "Traex",
+    defaultModel: "gpt-5.5",
+    commandName: "traex",
+    models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
   },
   claude: {
     label: "Claude",
@@ -593,6 +616,9 @@ export const RUNTIME_PRESETS: Record<string, { label: string; defaultModel: stri
 };
 
 const MODEL_LABELS: Record<string, string> = {
+  "gpt-5.6-sol": "GPT-5.6 Sol",
+  "gpt-5.6-terra": "GPT-5.6 Terra",
+  "gpt-5.6-luna": "GPT-5.6 Luna",
   "gpt-5.5": "GPT-5.5",
   "gpt-5.4": "GPT-5.4",
   "gpt-5.4-mini": "GPT-5.4 Mini",
@@ -613,6 +639,10 @@ export function reasoningEffortsForRuntime(runtime: string) {
   return runtime === "claude" ? CLAUDE_REASONING_EFFORTS : CODEX_REASONING_EFFORTS;
 }
 
+export function isCodexLikeRuntime(runtime: string) {
+  return runtime === "codex" || runtime === "traex";
+}
+
 export function normalizedReasoningEffortForRuntime(runtime: string, value: string) {
   const options = reasoningEffortsForRuntime(runtime);
   const normalized = value.trim() || "medium";
@@ -631,6 +661,35 @@ export function modelOptionsForRuntime(runtime: string, currentModel = "") {
   return [currentModel, ...models];
 }
 
-export function modelLabel(model: string) {
+export function runtimeCatalogFor(
+  catalogs: RuntimeModelCatalog[] | null | undefined,
+  runtime: string,
+) {
+  return catalogs?.find((catalog) => catalog.runtime === runtime) ?? null;
+}
+
+export function runtimeModelIds(
+  runtime: string,
+  catalogs?: RuntimeModelCatalog[] | null,
+) {
+  const catalog = runtimeCatalogFor(catalogs, runtime);
+  const catalogModels = catalog?.models?.map((model) => model.id).filter(Boolean) ?? [];
+  return catalogModels.length > 0 ? catalogModels : RUNTIME_PRESETS[runtime]?.models ?? [];
+}
+
+export function modelOptionsFromCatalog(
+  runtime: string,
+  currentModel = "",
+  catalogs?: RuntimeModelCatalog[] | null,
+) {
+  const models = runtimeModelIds(runtime, catalogs);
+  if (!currentModel || models.includes(currentModel)) return models;
+  return [currentModel, ...models];
+}
+
+export function modelLabel(model: string, catalogs?: RuntimeModelCatalog[] | null, runtime?: string) {
+  const catalog = runtime ? runtimeCatalogFor(catalogs, runtime) : null;
+  const catalogModel = catalog?.models?.find((option) => option.id === model);
+  if (catalogModel?.label) return catalogModel.label;
   return MODEL_LABELS[model] ?? model;
 }
